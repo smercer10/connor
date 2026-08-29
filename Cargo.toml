@@ -7,6 +7,8 @@ description = "A terminal text editor for working alongside a coding agent"
 
 [dependencies]
 crossterm = "0.29"
+ropey = "1.6"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 
 [target."cfg(unix)".dependencies]

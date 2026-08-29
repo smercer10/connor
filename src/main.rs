@@ -1,3 +1,6 @@
+// Wired up over the next few commits.
+#[allow(dead_code)]
+mod grapheme;
 mod screen;
 mod term;
 

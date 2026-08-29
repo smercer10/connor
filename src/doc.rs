@@ -56,6 +56,11 @@ impl Document {
         }
     }
 
+    #[cfg(test)]
+    pub fn set_lossy(&mut self, lossy: bool) {
+        self.lossy = lossy;
+    }
+
     pub fn rope(&self) -> &Rope {
         &self.rope
     }

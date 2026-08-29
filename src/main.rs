@@ -2,6 +2,8 @@
 #[allow(dead_code)]
 mod doc;
 #[allow(dead_code)]
+mod draw;
+#[allow(dead_code)]
 mod grapheme;
 mod screen;
 mod term;

@@ -39,6 +39,16 @@ fn classify(ch: char) -> CharClass {
 }
 
 impl View {
+    #[cfg(test)]
+    pub fn test_at(cursor: usize, scroll_line: usize, scroll_col: usize) -> View {
+        View {
+            cursor,
+            goal_col: None,
+            scroll_line,
+            scroll_col,
+        }
+    }
+
     pub fn line(&self, doc: &Document) -> usize {
         doc.rope().char_to_line(self.cursor)
     }

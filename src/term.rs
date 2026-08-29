@@ -66,10 +66,11 @@ impl Terminal {
     }
 
     /// Diffs `back` against what is on screen and writes only the changed
-    /// runs, wrapped in a synchronized update and flushed as a single write.
-    /// Allocation-free: everything is formatted into the reusable scratch
-    /// buffer, whose capacity is provisioned at construction and resize.
-    pub fn present(&mut self, back: &Screen) -> io::Result<()> {
+    /// runs, wrapped in a synchronized update and flushed as a single write,
+    /// leaving the terminal cursor visible at `cursor`. Allocation-free:
+    /// everything is formatted into the reusable scratch buffer, whose
+    /// capacity is provisioned at construction and resize.
+    pub fn present(&mut self, back: &Screen, cursor: (u16, u16)) -> io::Result<()> {
         let Self {
             front,
             scratch,
@@ -77,16 +78,26 @@ impl Terminal {
         } = self;
         scratch.clear();
         let _ = terminal::BeginSynchronizedUpdate.write_ansi(scratch);
+        let _ = cursor::Hide.write_ansi(scratch);
         if *needs_clear {
             let _ = terminal::Clear(terminal::ClearType::All).write_ansi(scratch);
             *needs_clear = false;
         }
         back.for_each_changed_run(front, |x, y, run| {
+            // A wide glyph changing always changes its leader, so a run can
+            // never begin on a continuation cell.
+            debug_assert!(!run[0].is_continuation());
             let _ = cursor::MoveTo(x, y).write_ansi(scratch);
             for cell in run {
-                scratch.push_str(cell.str());
+                // The terminal advanced two columns at the leader; emitting
+                // anything for the continuation would shift the row.
+                if !cell.is_continuation() {
+                    scratch.push_str(cell.str());
+                }
             }
         });
+        let _ = cursor::MoveTo(cursor.0, cursor.1).write_ansi(scratch);
+        let _ = cursor::Show.write_ansi(scratch);
         let _ = terminal::EndSynchronizedUpdate.write_ansi(scratch);
         let mut out = io::stdout().lock();
         out.write_all(scratch.as_bytes())?;
@@ -122,7 +133,7 @@ impl Terminal {
 
     fn reserve_scratch(&mut self) {
         let (width, height) = self.front.size();
-        let target = usize::from(width) * usize::from(height) * 4 + 1024;
+        let target = usize::from(width) * usize::from(height) * 16 + 1024;
         self.scratch
             .reserve(target.saturating_sub(self.scratch.len()));
     }

@@ -21,7 +21,7 @@ fn main() -> io::Result<()> {
     loop {
         back.clear();
         draw_scene(&mut back, &size_label, &last_key);
-        terminal.present(&back)?;
+        terminal.present(&back, (0, 0))?;
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {

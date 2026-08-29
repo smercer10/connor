@@ -1,12 +1,66 @@
-/// One terminal cell. Assumes every glyph occupies exactly one column; wide
-/// characters are not yet handled and will misrender rather than crash.
+use unicode_width::UnicodeWidthChar;
+
+/// One terminal cell: a grapheme cluster stored inline (no heap) plus its
+/// display width. A two-column glyph occupies a leader cell followed by one
+/// `CONTINUATION` cell; emission skips continuations because the terminal
+/// advances two columns when the leader is written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cell {
-    pub ch: char,
+    bytes: [u8; 14],
+    len: u8,
+    width: u8,
 }
 
 impl Cell {
-    pub const BLANK: Cell = Cell { ch: ' ' };
+    pub const BLANK: Cell = Cell::from_ascii(b' ');
+    /// The column occupied by the wide glyph to its left.
+    pub const CONTINUATION: Cell = Cell {
+        bytes: [0; 14],
+        len: 0,
+        width: 0,
+    };
+    /// U+FFFD; stands in for clusters too long to store inline.
+    const REPLACEMENT: Cell = Cell {
+        bytes: [0xEF, 0xBF, 0xBD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        len: 3,
+        width: 1,
+    };
+
+    const fn from_ascii(byte: u8) -> Cell {
+        let mut bytes = [0; 14];
+        bytes[0] = byte;
+        Cell {
+            bytes,
+            len: 1,
+            width: 1,
+        }
+    }
+
+    pub fn new(grapheme: &str, width: u8) -> Cell {
+        if grapheme.len() > 14 {
+            return Cell::REPLACEMENT;
+        }
+        let mut bytes = [0; 14];
+        bytes[..grapheme.len()].copy_from_slice(grapheme.as_bytes());
+        Cell {
+            bytes,
+            len: grapheme.len() as u8,
+            width: width.max(1),
+        }
+    }
+
+    pub fn str(&self) -> &str {
+        str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("\u{FFFD}")
+    }
+
+    #[cfg(test)]
+    pub fn width(&self) -> u8 {
+        self.width
+    }
+
+    pub fn is_continuation(&self) -> bool {
+        self.width == 0
+    }
 }
 
 /// A grid of cells sized to the terminal. Scenes draw into one grid while
@@ -44,24 +98,62 @@ impl Screen {
         self.cells.fill(Cell::BLANK);
     }
 
+    /// Convenience for single-scalar glyphs (UI chrome, box drawing).
+    pub fn set(&mut self, x: u16, y: u16, ch: char) {
+        let mut buf = [0; 4];
+        let width = ch.width().unwrap_or(1).max(1) as u8;
+        self.set_grapheme(x, y, ch.encode_utf8(&mut buf), width);
+    }
+
+    /// Writes one grapheme cluster of the given display width. A two-column
+    /// glyph also claims the cell to its right as a continuation; one that
+    /// doesn't fit (at the grid's right edge) is blanked instead of torn.
     /// Out-of-bounds writes are ignored: a scene drawn against a stale size
     /// (e.g. mid-resize) must clip, not crash.
-    pub fn set(&mut self, x: u16, y: u16, ch: char) {
-        if x < self.width && y < self.height {
+    pub fn set_grapheme(&mut self, x: u16, y: u16, grapheme: &str, width: u8) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        self.repair(x, y);
+        let index = self.index(x, y);
+        if width == 2 {
+            if x + 1 >= self.width {
+                self.cells[index] = Cell::BLANK;
+                return;
+            }
+            self.repair(x + 1, y);
             let index = self.index(x, y);
-            self.cells[index] = Cell { ch };
+            self.cells[index] = Cell::new(grapheme, 2);
+            self.cells[index + 1] = Cell::CONTINUATION;
+        } else {
+            self.cells[index] = Cell::new(grapheme, width);
         }
     }
 
+    /// Makes (x, y) safe to overwrite: severing half of a wide glyph blanks
+    /// the other half rather than leaving an orphaned leader or continuation.
+    fn repair(&mut self, x: u16, y: u16) {
+        let index = self.index(x, y);
+        if self.cells[index].is_continuation() {
+            self.cells[index - 1] = Cell::BLANK;
+        } else if self.cells[index].width == 2 {
+            self.cells[index + 1] = Cell::BLANK;
+        }
+    }
+
+    /// Writes scalar-per-glyph text (UI chrome), advancing by display width.
     pub fn set_text(&mut self, x: u16, y: u16, text: &str) {
-        for (offset, ch) in text.chars().enumerate() {
-            let Ok(offset) = u16::try_from(offset) else {
+        let mut x = x;
+        for ch in text.chars() {
+            if x >= self.width {
                 return;
-            };
-            let Some(x) = x.checked_add(offset) else {
-                return;
-            };
+            }
+            let width = ch.width().unwrap_or(1).max(1) as u16;
             self.set(x, y, ch);
+            let Some(next) = x.checked_add(width) else {
+                return;
+            };
+            x = next;
         }
     }
 
@@ -112,7 +204,7 @@ mod tests {
     fn runs(next: &Screen, prev: &Screen) -> Vec<(u16, u16, String)> {
         let mut out = Vec::new();
         next.for_each_changed_run(prev, |x, y, run| {
-            out.push((x, y, run.iter().map(|c| c.ch).collect()));
+            out.push((x, y, run.iter().map(Cell::str).collect()));
         });
         out
     }
@@ -197,6 +289,76 @@ mod tests {
         buf.set_text(2, 0, "long text past the edge");
         let blank = Screen::new(4, 2);
         assert_eq!(runs(&buf, &blank), vec![(2, 0, "lo".into())]);
+    }
+
+    #[test]
+    fn wide_glyph_claims_leader_and_continuation() {
+        let mut screen = Screen::new(6, 1);
+        screen.set_grapheme(1, 0, "日", 2);
+        assert_eq!(screen.get(1, 0).unwrap().str(), "日");
+        assert_eq!(screen.get(1, 0).unwrap().width(), 2);
+        assert!(screen.get(2, 0).unwrap().is_continuation());
+    }
+
+    #[test]
+    fn wide_glyph_at_last_column_becomes_blank() {
+        let mut screen = Screen::new(4, 1);
+        screen.set_grapheme(3, 0, "日", 2);
+        assert_eq!(screen.get(3, 0), Some(Cell::BLANK));
+    }
+
+    #[test]
+    fn overwriting_either_half_of_a_wide_glyph_blanks_the_other() {
+        let mut screen = Screen::new(6, 1);
+        screen.set_grapheme(1, 0, "日", 2);
+        screen.set(1, 0, 'a');
+        assert_eq!(screen.get(2, 0), Some(Cell::BLANK));
+
+        screen.set_grapheme(1, 0, "日", 2);
+        screen.set(2, 0, 'b');
+        assert_eq!(screen.get(1, 0), Some(Cell::BLANK));
+        assert_eq!(screen.get(2, 0).unwrap().str(), "b");
+    }
+
+    #[test]
+    fn overlapping_wide_glyphs_repair_each_other() {
+        let mut screen = Screen::new(6, 1);
+        screen.set_grapheme(1, 0, "日", 2);
+        screen.set_grapheme(2, 0, "本", 2);
+        assert_eq!(screen.get(1, 0), Some(Cell::BLANK));
+        assert_eq!(screen.get(2, 0).unwrap().str(), "本");
+        assert!(screen.get(3, 0).unwrap().is_continuation());
+    }
+
+    #[test]
+    fn combining_cluster_fits_one_cell() {
+        let mut screen = Screen::new(4, 1);
+        screen.set_grapheme(0, 0, "e\u{301}", 1);
+        assert_eq!(screen.get(0, 0).unwrap().str(), "e\u{301}");
+        assert_eq!(screen.get(0, 0).unwrap().width(), 1);
+    }
+
+    #[test]
+    fn oversized_cluster_clips_to_replacement() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        assert!(family.len() > 14);
+        let cell = Cell::new(family, 2);
+        assert_eq!(cell.str(), "\u{FFFD}");
+        assert_eq!(cell.width(), 1);
+    }
+
+    #[test]
+    fn wide_glyph_change_always_starts_its_run_at_the_leader() {
+        let mut prev = Screen::new(6, 1);
+        prev.set_grapheme(2, 0, "日", 2);
+        let mut next = Screen::new(6, 1);
+        next.set_grapheme(2, 0, "本", 2);
+        assert_eq!(runs(&next, &prev), vec![(2, 0, "本".into())]);
+
+        let mut narrow = Screen::new(6, 1);
+        narrow.set_text(2, 0, "ab");
+        assert_eq!(runs(&narrow, &prev), vec![(2, 0, "ab".into())]);
+        assert_eq!(runs(&prev, &narrow), vec![(2, 0, "日".into())]);
     }
 
     #[test]

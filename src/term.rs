@@ -84,7 +84,7 @@ impl Terminal {
         back.for_each_changed_run(front, |x, y, run| {
             let _ = cursor::MoveTo(x, y).write_ansi(scratch);
             for cell in run {
-                scratch.push(cell.ch);
+                scratch.push_str(cell.str());
             }
         });
         let _ = terminal::EndSynchronizedUpdate.write_ansi(scratch);

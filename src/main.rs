@@ -129,7 +129,7 @@ mod tests {
     use super::*;
 
     fn cell(buf: &Screen, x: u16, y: u16) -> char {
-        buf.get(x, y).unwrap().ch
+        buf.get(x, y).unwrap().str().chars().next().unwrap()
     }
 
     fn row(buf: &Screen, y: u16) -> String {

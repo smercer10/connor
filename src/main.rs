@@ -5,6 +5,8 @@ mod doc;
 mod grapheme;
 mod screen;
 mod term;
+#[allow(dead_code)]
+mod view;
 
 use std::fmt::Write as _;
 use std::io;

@@ -6,3 +6,7 @@ license = "MIT"
 description = "A terminal text editor for working alongside a coding agent"
 
 [dependencies]
+crossterm = "0.29"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"

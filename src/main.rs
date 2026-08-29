@@ -175,14 +175,16 @@ mod tests {
         }
     }
 
+    // KeyCode's Display names vary by platform (Enter is "Return" on macOS),
+    // so only the modifier prefixing — the part we own — is pinned here.
     #[test]
     fn describe_key_formats_modifiers_and_code() {
         let mut label = String::new();
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
         describe_key(&mut label, &key);
         assert_eq!(label, "Ctrl+x");
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         describe_key(&mut label, &key);
-        assert_eq!(label, "Enter");
+        assert_eq!(label, "x");
     }
 }

@@ -1,4 +1,4 @@
-mod buffer;
+mod screen;
 mod term;
 
 use std::fmt::Write as _;
@@ -6,14 +6,14 @@ use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use buffer::Buffer;
+use screen::Screen;
 use term::Terminal;
 
 fn main() -> io::Result<()> {
     term::init_panic_hook();
     let mut terminal = Terminal::new()?;
     let (width, height) = terminal.size();
-    let mut back = Buffer::new(width, height);
+    let mut back = Screen::new(width, height);
     let mut size_label = String::new();
     let mut last_key = String::new();
     write_size_label(&mut size_label, width, height);
@@ -73,7 +73,7 @@ fn describe_key(label: &mut String, key: &KeyEvent) {
 /// Draws the placeholder frame: a border, the current size, and the last key
 /// pressed (a small localized change that exercises the diff). Clips rather
 /// than panics at degenerate sizes.
-fn draw_scene(buf: &mut Buffer, size_label: &str, last_key: &str) {
+fn draw_scene(buf: &mut Screen, size_label: &str, last_key: &str) {
     let (width, height) = buf.size();
     if width == 0 || height == 0 {
         return;
@@ -114,7 +114,7 @@ fn draw_scene(buf: &mut Buffer, size_label: &str, last_key: &str) {
     );
 }
 
-fn set_centered(buf: &mut Buffer, y: u16, text: &str) {
+fn set_centered(buf: &mut Screen, y: u16, text: &str) {
     let (width, _) = buf.size();
     buf.set_text(centered_x(width, text.chars().count()), y, text);
 }
@@ -128,18 +128,18 @@ fn centered_x(width: u16, len: usize) -> u16 {
 mod tests {
     use super::*;
 
-    fn cell(buf: &Buffer, x: u16, y: u16) -> char {
+    fn cell(buf: &Screen, x: u16, y: u16) -> char {
         buf.get(x, y).unwrap().ch
     }
 
-    fn row(buf: &Buffer, y: u16) -> String {
+    fn row(buf: &Screen, y: u16) -> String {
         let (width, _) = buf.size();
         (0..width).map(|x| cell(buf, x, y)).collect()
     }
 
     #[test]
     fn border_corners_and_edges() {
-        let mut buf = Buffer::new(20, 10);
+        let mut buf = Screen::new(20, 10);
         draw_scene(&mut buf, "20x10", "");
         assert_eq!(cell(&buf, 0, 0), '┌');
         assert_eq!(cell(&buf, 19, 0), '┐');
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn title_size_and_hint_are_placed() {
-        let mut buf = Buffer::new(40, 12);
+        let mut buf = Screen::new(40, 12);
         draw_scene(&mut buf, "40x12", "");
         assert!(row(&buf, 4).contains("connor"));
         assert!(row(&buf, 6).contains("40x12"));
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn last_key_readout_appears() {
-        let mut buf = Buffer::new(40, 12);
+        let mut buf = Screen::new(40, 12);
         draw_scene(&mut buf, "40x12", "Ctrl+X");
         assert!(row(&buf, 8).contains("last key: Ctrl+X"));
     }
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn degenerate_sizes_do_not_panic() {
         for (w, h) in [(0, 0), (0, 5), (5, 0), (1, 1), (2, 2), (3, 1), (1, 3)] {
-            let mut buf = Buffer::new(w, h);
+            let mut buf = Screen::new(w, h);
             draw_scene(&mut buf, "1x1", "Ctrl+X");
         }
     }

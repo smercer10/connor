@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::{Command as _, cursor, execute, terminal};
 
-use crate::buffer::Buffer;
+use crate::screen::Screen;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -37,7 +37,7 @@ pub fn init_panic_hook() {
 /// Owns the terminal: raw mode and the alternate screen are entered on
 /// construction and restored on drop.
 pub struct Terminal {
-    front: Buffer,
+    front: Screen,
     scratch: String,
     needs_clear: bool,
 }
@@ -46,7 +46,7 @@ impl Terminal {
     pub fn new() -> io::Result<Self> {
         let (width, height) = terminal::size()?;
         let mut term = Self {
-            front: Buffer::new(width, height),
+            front: Screen::new(width, height),
             scratch: String::new(),
             needs_clear: true,
         };
@@ -69,7 +69,7 @@ impl Terminal {
     /// runs, wrapped in a synchronized update and flushed as a single write.
     /// Allocation-free: everything is formatted into the reusable scratch
     /// buffer, whose capacity is provisioned at construction and resize.
-    pub fn present(&mut self, back: &Buffer) -> io::Result<()> {
+    pub fn present(&mut self, back: &Screen) -> io::Result<()> {
         let Self {
             front,
             scratch,

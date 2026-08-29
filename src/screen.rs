@@ -9,16 +9,16 @@ impl Cell {
     pub const BLANK: Cell = Cell { ch: ' ' };
 }
 
-/// A grid of cells sized to the terminal. Scenes draw into one buffer while
+/// A grid of cells sized to the terminal. Scenes draw into one grid while
 /// another holds what is currently on screen; diffing the two yields the
 /// minimal set of cells to rewrite.
-pub struct Buffer {
+pub struct Screen {
     width: u16,
     height: u16,
     cells: Vec<Cell>,
 }
 
-impl Buffer {
+impl Screen {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             width,
@@ -31,7 +31,7 @@ impl Buffer {
         (self.width, self.height)
     }
 
-    /// Re-dimensions and blanks the buffer. Not called on the render path.
+    /// Re-dimensions and blanks the grid. Not called on the render path.
     pub fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
@@ -70,15 +70,15 @@ impl Buffer {
         (x < self.width && y < self.height).then(|| self.cells[self.index(x, y)])
     }
 
-    /// Copies the contents of an equally-sized buffer without allocating.
-    pub fn copy_from(&mut self, other: &Buffer) {
+    /// Copies the contents of an equally-sized grid without allocating.
+    pub fn copy_from(&mut self, other: &Screen) {
         debug_assert_eq!(self.size(), other.size());
         self.cells.copy_from_slice(&other.cells);
     }
 
     /// Calls `f(x, y, run)` once per maximal horizontal run of cells that
     /// differ from `prev`. Both buffers must be the same size. Allocation-free.
-    pub fn for_each_changed_run(&self, prev: &Buffer, mut f: impl FnMut(u16, u16, &[Cell])) {
+    pub fn for_each_changed_run(&self, prev: &Screen, mut f: impl FnMut(u16, u16, &[Cell])) {
         debug_assert_eq!(self.size(), prev.size());
         let width = usize::from(self.width);
         for y in 0..self.height {
@@ -109,7 +109,7 @@ impl Buffer {
 mod tests {
     use super::*;
 
-    fn runs(next: &Buffer, prev: &Buffer) -> Vec<(u16, u16, String)> {
+    fn runs(next: &Screen, prev: &Screen) -> Vec<(u16, u16, String)> {
         let mut out = Vec::new();
         next.for_each_changed_run(prev, |x, y, run| {
             out.push((x, y, run.iter().map(|c| c.ch).collect()));
@@ -119,31 +119,31 @@ mod tests {
 
     #[test]
     fn identical_buffers_yield_no_runs() {
-        let a = Buffer::new(10, 4);
-        let b = Buffer::new(10, 4);
+        let a = Screen::new(10, 4);
+        let b = Screen::new(10, 4);
         assert!(runs(&a, &b).is_empty());
     }
 
     #[test]
     fn single_changed_cell_yields_one_run() {
-        let prev = Buffer::new(10, 4);
-        let mut next = Buffer::new(10, 4);
+        let prev = Screen::new(10, 4);
+        let mut next = Screen::new(10, 4);
         next.set(3, 2, 'x');
         assert_eq!(runs(&next, &prev), vec![(3, 2, "x".into())]);
     }
 
     #[test]
     fn adjacent_changes_coalesce() {
-        let prev = Buffer::new(10, 4);
-        let mut next = Buffer::new(10, 4);
+        let prev = Screen::new(10, 4);
+        let mut next = Screen::new(10, 4);
         next.set_text(2, 1, "abc");
         assert_eq!(runs(&next, &prev), vec![(2, 1, "abc".into())]);
     }
 
     #[test]
     fn gap_splits_runs() {
-        let prev = Buffer::new(10, 4);
-        let mut next = Buffer::new(10, 4);
+        let prev = Screen::new(10, 4);
+        let mut next = Screen::new(10, 4);
         next.set(1, 0, 'a');
         next.set(3, 0, 'b');
         assert_eq!(
@@ -154,8 +154,8 @@ mod tests {
 
     #[test]
     fn row_boundary_splits_runs() {
-        let prev = Buffer::new(3, 2);
-        let mut next = Buffer::new(3, 2);
+        let prev = Screen::new(3, 2);
+        let mut next = Screen::new(3, 2);
         next.set(2, 0, 'a');
         next.set(0, 1, 'b');
         assert_eq!(
@@ -166,23 +166,23 @@ mod tests {
 
     #[test]
     fn last_cell_of_grid_is_diffed() {
-        let prev = Buffer::new(5, 3);
-        let mut next = Buffer::new(5, 3);
+        let prev = Screen::new(5, 3);
+        let mut next = Screen::new(5, 3);
         next.set(4, 2, 'z');
         assert_eq!(runs(&next, &prev), vec![(4, 2, "z".into())]);
     }
 
     #[test]
     fn clear_against_previous_content_covers_it() {
-        let mut prev = Buffer::new(6, 1);
+        let mut prev = Screen::new(6, 1);
         prev.set_text(1, 0, "old");
-        let next = Buffer::new(6, 1);
+        let next = Screen::new(6, 1);
         assert_eq!(runs(&next, &prev), vec![(1, 0, "   ".into())]);
     }
 
     #[test]
     fn resize_blanks_and_redimensions() {
-        let mut buf = Buffer::new(4, 2);
+        let mut buf = Screen::new(4, 2);
         buf.set(0, 0, 'x');
         buf.resize(3, 5);
         assert_eq!(buf.size(), (3, 5));
@@ -191,21 +191,21 @@ mod tests {
 
     #[test]
     fn out_of_bounds_set_is_ignored() {
-        let mut buf = Buffer::new(4, 2);
+        let mut buf = Screen::new(4, 2);
         buf.set(4, 0, 'x');
         buf.set(0, 2, 'x');
         buf.set_text(2, 0, "long text past the edge");
-        let blank = Buffer::new(4, 2);
+        let blank = Screen::new(4, 2);
         assert_eq!(runs(&buf, &blank), vec![(2, 0, "lo".into())]);
     }
 
     #[test]
     fn zero_sized_buffers_diff_without_panicking() {
-        let a = Buffer::new(0, 3);
-        let b = Buffer::new(0, 3);
+        let a = Screen::new(0, 3);
+        let b = Screen::new(0, 3);
         assert!(runs(&a, &b).is_empty());
-        let c = Buffer::new(3, 0);
-        let d = Buffer::new(3, 0);
+        let c = Screen::new(3, 0);
+        let d = Screen::new(3, 0);
         assert!(runs(&c, &d).is_empty());
     }
 }

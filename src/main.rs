@@ -371,7 +371,11 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
             Some(Prompt::Search(edit)) => Some(edit.caret_chars()),
             _ => None,
         };
-        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret);
+        let search = match &prompt {
+            Some(Prompt::Search(edit)) => Some(edit.highlights()),
+            _ => None,
+        };
+        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret, search);
         terminal.present(&back, cursor)?;
 
         // Page movement wants the text area as it was when the key arrived.

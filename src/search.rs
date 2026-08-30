@@ -20,6 +20,16 @@ pub enum Outcome {
     Cancel,
 }
 
+/// Borrowed view of the match set for the draw pass.
+pub struct Highlights<'a> {
+    /// Ascending char indices of match starts.
+    pub starts: &'a [usize],
+    /// Every match's char length.
+    pub len: usize,
+    /// Index into `starts` of the match the cursor sits on.
+    pub current: Option<usize>,
+}
+
 pub struct SearchPrompt {
     query: String,
     /// Where the search began: what Esc restores, and where query edits
@@ -98,6 +108,14 @@ impl SearchPrompt {
     /// query, with the counter and hints trailing after.
     pub fn caret_chars(&self) -> usize {
         FIND_LABEL.chars().count() + self.query.chars().count()
+    }
+
+    pub fn highlights(&self) -> Highlights<'_> {
+        Highlights {
+            starts: &self.matches,
+            len: self.qlen,
+            current: self.current,
+        }
     }
 
     /// Re-derives the match set after the document changed underneath the

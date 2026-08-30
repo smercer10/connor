@@ -1,16 +1,17 @@
 use unicode_width::UnicodeWidthChar;
 
 /// One terminal cell: a grapheme cluster stored inline (no heap) plus its
-/// display width and whether it renders in reverse video. A two-column glyph
-/// occupies a leader cell followed by one `CONTINUATION` cell; emission skips
-/// continuations because the terminal advances two columns when the leader is
-/// written.
+/// display width and whether it renders in reverse video or underlined. A
+/// two-column glyph occupies a leader cell followed by one `CONTINUATION`
+/// cell; emission skips continuations because the terminal advances two
+/// columns when the leader is written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cell {
     bytes: [u8; 14],
     len: u8,
     width: u8,
     reversed: bool,
+    underlined: bool,
 }
 
 impl Cell {
@@ -21,6 +22,7 @@ impl Cell {
         len: 0,
         width: 0,
         reversed: false,
+        underlined: false,
     };
     /// U+FFFD; stands in for clusters too long to store inline.
     const REPLACEMENT: Cell = Cell {
@@ -28,6 +30,7 @@ impl Cell {
         len: 3,
         width: 1,
         reversed: false,
+        underlined: false,
     };
 
     const fn from_ascii(byte: u8) -> Cell {
@@ -38,6 +41,7 @@ impl Cell {
             len: 1,
             width: 1,
             reversed: false,
+            underlined: false,
         }
     }
 
@@ -52,6 +56,7 @@ impl Cell {
             len: grapheme.len() as u8,
             width: width.max(1),
             reversed: false,
+            underlined: false,
         }
     }
 
@@ -70,6 +75,10 @@ impl Cell {
 
     pub fn reversed(&self) -> bool {
         self.reversed
+    }
+
+    pub fn underlined(&self) -> bool {
+        self.underlined
     }
 }
 
@@ -161,6 +170,16 @@ impl Screen {
         }
         let index = self.index(x, y);
         self.cells[index].reversed = on;
+    }
+
+    /// Flips one cell's underline flag; the same rationale as
+    /// `set_reversed`.
+    pub fn set_underlined(&mut self, x: u16, y: u16, on: bool) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let index = self.index(x, y);
+        self.cells[index].underlined = on;
     }
 
     /// Writes scalar-per-glyph text (UI chrome), advancing by display width.
@@ -407,6 +426,18 @@ mod tests {
         screen.set_reversed(0, 0, true);
         screen.clear();
         assert!(!screen.get(0, 0).unwrap().reversed());
+    }
+
+    #[test]
+    fn underline_flag_sets_diffs_and_clears() {
+        let mut screen = Screen::new(4, 1);
+        screen.set_underlined(1, 0, true);
+        screen.set_underlined(4, 0, true); // out of bounds: ignored
+        assert!(screen.get(1, 0).unwrap().underlined());
+        let blank = Screen::new(4, 1);
+        assert_eq!(runs(&screen, &blank), vec![(1, 0, " ".into())]);
+        screen.clear();
+        assert!(!screen.get(1, 0).unwrap().underlined());
     }
 
     #[test]

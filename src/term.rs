@@ -84,9 +84,10 @@ impl Terminal {
             let _ = terminal::Clear(terminal::ClearType::All).write_ansi(scratch);
             *needs_clear = false;
         }
-        // Reverse video is toggled only when it changes and always switched
-        // off by frame end, so each frame starts from a known plain state.
+        // Styles are toggled only when they change and always switched off
+        // by frame end, so each frame starts from a known plain state.
         let mut reversed = false;
+        let mut underlined = false;
         back.for_each_changed_run(front, |x, y, run| {
             // A wide glyph changing always changes its leader, so a run can
             // never begin on a continuation cell.
@@ -105,12 +106,24 @@ impl Terminal {
                         };
                         let _ = SetAttribute(attr).write_ansi(scratch);
                     }
+                    if cell.underlined() != underlined {
+                        underlined = cell.underlined();
+                        let attr = if underlined {
+                            Attribute::Underlined
+                        } else {
+                            Attribute::NoUnderline
+                        };
+                        let _ = SetAttribute(attr).write_ansi(scratch);
+                    }
                     scratch.push_str(cell.str());
                 }
             }
         });
         if reversed {
             let _ = SetAttribute(Attribute::NoReverse).write_ansi(scratch);
+        }
+        if underlined {
+            let _ = SetAttribute(Attribute::NoUnderline).write_ansi(scratch);
         }
         let _ = cursor::MoveTo(cursor.0, cursor.1).write_ansi(scratch);
         let _ = cursor::Show.write_ansi(scratch);
@@ -135,9 +148,9 @@ impl Terminal {
 
     fn reserve_scratch(&mut self) {
         let (width, height) = self.front.size();
-        // 24 bytes per cell: the glyph plus cursor moves and reverse-video
-        // toggles that can appear inside runs.
-        let target = usize::from(width) * usize::from(height) * 24 + 1024;
+        // 32 bytes per cell: the glyph plus cursor moves and the reverse and
+        // underline toggles that can appear inside runs.
+        let target = usize::from(width) * usize::from(height) * 32 + 1024;
         self.scratch
             .reserve(target.saturating_sub(self.scratch.len()));
     }

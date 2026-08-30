@@ -50,6 +50,16 @@ impl Tabs {
         &mut self.tabs[self.active]
     }
 
+    /// Activates the tab to the right, wrapping.
+    pub fn next(&mut self) {
+        self.active = (self.active + 1) % self.tabs.len();
+    }
+
+    /// Activates the tab to the left, wrapping.
+    pub fn prev(&mut self) {
+        self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+    }
+
     #[cfg(test)]
     pub fn test_activate(&mut self, index: usize) {
         self.active = index;
@@ -59,6 +69,31 @@ impl Tabs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_wraps_in_both_directions() {
+        let mut tabs = Tabs::new(vec![
+            Document::empty(),
+            Document::empty(),
+            Document::empty(),
+        ]);
+        tabs.next();
+        assert_eq!(tabs.active_index(), 1);
+        tabs.next();
+        tabs.next();
+        assert_eq!(tabs.active_index(), 0);
+        tabs.prev();
+        assert_eq!(tabs.active_index(), 2);
+    }
+
+    #[test]
+    fn switching_a_lone_tab_stays_put() {
+        let mut tabs = Tabs::new(vec![Document::empty()]);
+        tabs.next();
+        assert_eq!(tabs.active_index(), 0);
+        tabs.prev();
+        assert_eq!(tabs.active_index(), 0);
+    }
 
     #[test]
     fn first_document_is_active() {

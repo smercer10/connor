@@ -138,9 +138,9 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                let Tab { doc, view } = tabs.active_mut();
                 if let Some(pending) = prompt.take() {
-                    let (next, quit) = prompt_key(pending, key.code, doc, &mut notice);
+                    let (next, quit) =
+                        prompt_key(pending, key.code, &mut tabs.active_mut().doc, &mut notice);
                     prompt = next;
                     if quit {
                         break;
@@ -149,76 +149,98 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                 }
                 notice.clear();
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                let movement = matches!(
-                    key.code,
-                    KeyCode::Left
-                        | KeyCode::Right
-                        | KeyCode::Up
-                        | KeyCode::Down
-                        | KeyCode::Home
-                        | KeyCode::End
-                        | KeyCode::PageUp
-                        | KeyCode::PageDown
-                );
-                if movement {
-                    // Shift extends a selection through any movement key;
-                    // Char keys never land here, so shifted typing is safe.
-                    view.begin_or_clear_selection(key.modifiers.contains(KeyModifiers::SHIFT));
-                    doc.break_undo_group();
-                }
-                match key.code {
-                    KeyCode::Char('q') if ctrl => {
-                        if doc.dirty() {
-                            prompt = open_prompt(Prompt::Quit, doc, &mut notice);
-                        } else {
-                            break;
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                // Tab chords are claimed before the buffer keys: their base
+                // keys are movement keys, and the movement path below would
+                // clear the selection and move the wrong tab's cursor.
+                let prev_tab =
+                    (ctrl && key.code == KeyCode::PageUp) || (alt && key.code == KeyCode::Left);
+                let next_tab =
+                    (ctrl && key.code == KeyCode::PageDown) || (alt && key.code == KeyCode::Right);
+                if prev_tab || next_tab {
+                    tabs.active_mut().doc.break_undo_group();
+                    if prev_tab {
+                        tabs.prev();
+                    } else {
+                        tabs.next();
+                    }
+                    // No continue: the loop tail re-clamps the incoming
+                    // view, which may have missed resizes while hidden.
+                } else {
+                    let Tab { doc, view } = tabs.active_mut();
+                    let movement = matches!(
+                        key.code,
+                        KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Home
+                            | KeyCode::End
+                            | KeyCode::PageUp
+                            | KeyCode::PageDown
+                    );
+                    if movement {
+                        // Shift extends a selection through any movement key;
+                        // Char keys never land here, so shifted typing is safe.
+                        view.begin_or_clear_selection(key.modifiers.contains(KeyModifiers::SHIFT));
+                        doc.break_undo_group();
+                    }
+                    match key.code {
+                        KeyCode::Char('q') if ctrl => {
+                            if doc.dirty() {
+                                prompt = open_prompt(Prompt::Quit, doc, &mut notice);
+                            } else {
+                                break;
+                            }
                         }
-                    }
-                    KeyCode::Char('s') if ctrl => {
-                        if doc.lossy() {
-                            prompt = open_prompt(
-                                Prompt::LossySave { then_quit: false },
-                                doc,
-                                &mut notice,
-                            );
-                        } else {
-                            try_save(doc, &mut notice);
+                        KeyCode::Char('s') if ctrl => {
+                            if doc.lossy() {
+                                prompt = open_prompt(
+                                    Prompt::LossySave { then_quit: false },
+                                    doc,
+                                    &mut notice,
+                                );
+                            } else {
+                                try_save(doc, &mut notice);
+                            }
                         }
-                    }
-                    KeyCode::Char('z') if ctrl => {
-                        if let Some(caret) = doc.undo() {
-                            view.set_caret(caret);
+                        KeyCode::Char('z') if ctrl => {
+                            if let Some(caret) = doc.undo() {
+                                view.set_caret(caret);
+                            }
                         }
-                    }
-                    KeyCode::Char('y') if ctrl => {
-                        if let Some(caret) = doc.redo() {
-                            view.set_caret(caret);
+                        KeyCode::Char('y') if ctrl => {
+                            if let Some(caret) = doc.redo() {
+                                view.set_caret(caret);
+                            }
                         }
+                        #[cfg(debug_assertions)]
+                        KeyCode::Char('p') if ctrl => panic!("deliberate panic (Ctrl+P)"),
+                        KeyCode::Left if ctrl => view.move_word_left(doc),
+                        KeyCode::Right if ctrl => view.move_word_right(doc),
+                        KeyCode::Home if ctrl => view.move_doc_start(),
+                        KeyCode::End if ctrl => view.move_doc_end(doc),
+                        KeyCode::Left => view.move_left(doc),
+                        KeyCode::Right => view.move_right(doc),
+                        KeyCode::Up => view.move_up(doc),
+                        KeyCode::Down => view.move_down(doc),
+                        KeyCode::Home => view.move_home(doc),
+                        KeyCode::End => view.move_end(doc),
+                        KeyCode::PageUp => view.page_up(doc, text_h),
+                        KeyCode::PageDown => view.page_down(doc, text_h),
+                        // Alt-modified letters are terminal escape chords, not
+                        // text to insert.
+                        KeyCode::Char(ch)
+                            if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            view.insert_char(doc, ch)
+                        }
+                        KeyCode::Enter => view.insert_newline(doc),
+                        KeyCode::Tab => view.insert_tab(doc),
+                        KeyCode::Backspace => view.backspace(doc),
+                        KeyCode::Delete => view.delete(doc),
+                        _ => {}
                     }
-                    #[cfg(debug_assertions)]
-                    KeyCode::Char('p') if ctrl => panic!("deliberate panic (Ctrl+P)"),
-                    KeyCode::Left if ctrl => view.move_word_left(doc),
-                    KeyCode::Right if ctrl => view.move_word_right(doc),
-                    KeyCode::Home if ctrl => view.move_doc_start(),
-                    KeyCode::End if ctrl => view.move_doc_end(doc),
-                    KeyCode::Left => view.move_left(doc),
-                    KeyCode::Right => view.move_right(doc),
-                    KeyCode::Up => view.move_up(doc),
-                    KeyCode::Down => view.move_down(doc),
-                    KeyCode::Home => view.move_home(doc),
-                    KeyCode::End => view.move_end(doc),
-                    KeyCode::PageUp => view.page_up(doc, text_h),
-                    KeyCode::PageDown => view.page_down(doc, text_h),
-                    // Alt-modified letters are terminal escape chords, not
-                    // text to insert.
-                    KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                        view.insert_char(doc, ch)
-                    }
-                    KeyCode::Enter => view.insert_newline(doc),
-                    KeyCode::Tab => view.insert_tab(doc),
-                    KeyCode::Backspace => view.backspace(doc),
-                    KeyCode::Delete => view.delete(doc),
-                    _ => {}
                 }
             }
             Event::Resize(width, height) => {

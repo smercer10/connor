@@ -14,9 +14,11 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 
 use doc::{Caret, DiskCheck, Document};
 use prompt::{LinePrompt, Outcome, PathPrompt};
@@ -53,6 +55,12 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// Two presses on the same cell within this window select the word.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// Lines the viewport moves per wheel notch.
+const WHEEL_LINES: usize = 3;
 
 /// What a prompt-gated save was clearing the way for.
 #[derive(Clone, Copy)]
@@ -368,8 +376,10 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
         }
     };
     let mut debounce = Debounce::default();
+    let mut last_click: Option<(Instant, u16, u16)> = None;
 
     loop {
+        let mut follow_cursor = true;
         back.clear();
         let status_caret = match &prompt {
             Some(Prompt::Path { .. } | Prompt::GoTo(_)) => Some(notice.chars().count()),
@@ -562,6 +572,50 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                 terminal.resize(width, height);
                 back.resize(width, height);
             }
+            Ok(AppEvent::Input(Event::Mouse(m))) => match m.kind {
+                // The wheel works during prompts too: it only moves the
+                // viewport, which the prompts don't own.
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let delta = if m.kind == MouseEventKind::ScrollUp {
+                        -(WHEEL_LINES as isize)
+                    } else {
+                        WHEEL_LINES as isize
+                    };
+                    let Tab { doc, view } = tabs.active_mut();
+                    view.scroll_wheel(doc, delta);
+                    follow_cursor = false;
+                }
+                // A click while searching accepts the search — the viewport
+                // and cursor stay — then lands like any click. The other
+                // prompts keep the screen: a stray click must not dismiss a
+                // save confirmation.
+                MouseEventKind::Down(MouseButton::Left)
+                    if (1..=text_h).contains(&usize::from(m.row))
+                        && matches!(prompt, None | Some(Prompt::Search(_))) =>
+                {
+                    prompt = None;
+                    notice.clear();
+                    let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+                    let double = !shift
+                        && last_click.is_some_and(|(t, x, y)| {
+                            t.elapsed() <= DOUBLE_CLICK && (x, y) == (m.column, m.row)
+                        });
+                    last_click = Some((Instant::now(), m.column, m.row));
+                    let Tab { doc, view } = tabs.active_mut();
+                    doc.break_undo_group();
+                    let gutter_w = draw::gutter_width(doc);
+                    view.click(doc, gutter_w, text_h, m.column, m.row, shift);
+                    if double {
+                        view.select_word(doc);
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) if prompt.is_none() => {
+                    let Tab { doc, view } = tabs.active_mut();
+                    let gutter_w = draw::gutter_width(doc);
+                    view.drag(doc, gutter_w, text_h, m.column, m.row);
+                }
+                _ => {}
+            },
             Ok(AppEvent::Input(_)) => {}
         }
 
@@ -569,11 +623,14 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
             watcher.sync(tabs);
         }
 
-        // Re-fetch the size: a resize may have changed it.
-        let (width, height) = back.size();
-        let Tab { doc, view } = tabs.active_mut();
-        let text_w = usize::from(width).saturating_sub(draw::gutter_width(doc));
-        view.scroll_to_cursor(doc, text_w, draw::text_height(height));
+        // Re-fetch the size: a resize may have changed it. A wheel scroll
+        // opts out of the snap, or it would scroll straight back.
+        if follow_cursor {
+            let (width, height) = back.size();
+            let Tab { doc, view } = tabs.active_mut();
+            let text_w = usize::from(width).saturating_sub(draw::gutter_width(doc));
+            view.scroll_to_cursor(doc, text_w, draw::text_height(height));
+        }
     }
     Ok(())
 }

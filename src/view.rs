@@ -209,6 +209,75 @@ impl View {
         self.cursor = doc.line_start(line.clamp(1, doc.line_count()) - 1);
     }
 
+    /// A mouse press: places the cursor like a movement key, extending the
+    /// selection when shift is held.
+    pub fn click(
+        &mut self,
+        doc: &Document,
+        gutter_w: usize,
+        text_h: usize,
+        x: u16,
+        y: u16,
+        extend: bool,
+    ) {
+        self.goal_col = None;
+        self.begin_or_clear_selection(extend);
+        self.cursor = self.hit(doc, gutter_w, text_h, x, y, false);
+    }
+
+    /// A drag with the button held: the press's anchor stays, the cursor
+    /// follows the pointer.
+    pub fn drag(&mut self, doc: &Document, gutter_w: usize, text_h: usize, x: u16, y: u16) {
+        self.goal_col = None;
+        self.begin_or_clear_selection(true);
+        self.cursor = self.hit(doc, gutter_w, text_h, x, y, true);
+    }
+
+    /// Double-click: selects the run of like-classed clusters under the
+    /// cursor.
+    pub fn select_word(&mut self, doc: &Document) {
+        let range = word_at(doc, self.cursor);
+        self.goal_col = None;
+        self.anchor = Some(range.start);
+        self.cursor = range.end;
+    }
+
+    /// The wheel moves the viewport, not the cursor; the caller must skip
+    /// the cursor snap for this event or it scrolls straight back.
+    pub fn scroll_wheel(&mut self, doc: &Document, delta: isize) {
+        self.scroll_line = self
+            .scroll_line
+            .saturating_add_signed(delta)
+            .min(doc.line_count() - 1);
+    }
+
+    /// Maps a screen cell to a char index against the viewport as drawn.
+    /// A drag overshoots one line past the text area's top and bottom edges,
+    /// so a drag held there keeps advancing the selection and the caller's
+    /// `scroll_to_cursor` pulls the viewport along — autoscroll with no
+    /// timers.
+    fn hit(
+        &self,
+        doc: &Document,
+        gutter_w: usize,
+        text_h: usize,
+        x: u16,
+        y: u16,
+        drag: bool,
+    ) -> usize {
+        let y = usize::from(y);
+        let overshoot = usize::from(drag);
+        let line = if y == 0 {
+            self.scroll_line.saturating_sub(overshoot)
+        } else if y <= text_h {
+            self.scroll_line + y - 1
+        } else {
+            self.scroll_line + text_h.saturating_sub(1) + overshoot
+        };
+        let goal = self.scroll_col + usize::from(x).saturating_sub(gutter_w);
+        char_at_vcol(doc, line.min(doc.line_count() - 1), goal)
+    }
+
     /// Restores a caret handed back by undo or redo.
     pub fn set_caret(&mut self, caret: Caret) {
         self.goal_col = None;
@@ -393,6 +462,38 @@ fn char_at_vcol(doc: &Document, line: usize, goal: usize) -> usize {
         col += width;
     }
     end
+}
+
+/// The run of like-classed clusters containing `pos`, clamped to its line so
+/// a whitespace run never swallows the terminator; at a line's end, the run
+/// just before it. Empty on an empty line.
+fn word_at(doc: &Document, pos: usize) -> Range<usize> {
+    let line = doc.rope().char_to_line(pos);
+    let line_start = doc.line_start(line);
+    let line_end = doc.line_end(line);
+    if line_start == line_end {
+        return pos..pos;
+    }
+    let slice = doc.rope().slice(..);
+    let seed = if pos < line_end {
+        pos
+    } else {
+        grapheme::prev_grapheme_boundary(slice, line_end)
+    };
+    let class = classify(slice.char(seed));
+    let mut start = seed;
+    while start > line_start {
+        let prev = grapheme::prev_grapheme_boundary(slice, start);
+        if classify(slice.char(prev)) != class {
+            break;
+        }
+        start = prev;
+    }
+    let mut end = seed;
+    while end < line_end && classify(slice.char(end)) == class {
+        end = grapheme::next_grapheme_boundary(slice, end);
+    }
+    start..end
 }
 
 #[cfg(test)]
@@ -820,5 +921,154 @@ mod tests {
         view.remap_after_reload(&old, &new, &span);
         assert_eq!(view.selection(), None);
         assert!(view.cursor <= new.len_chars());
+    }
+
+    #[test]
+    fn click_maps_screen_cell_through_scroll_and_gutter() {
+        let doc = Document::from_str("zero\none\ntwo\nthree\nfour\n");
+        let mut view = View::test_at(0, 2, 1);
+        // Row 2 of the text area is line 3; x 5 past a 3-wide gutter with
+        // the leftmost column scrolled off is visual column 3.
+        view.click(&doc, 3, 10, 5, 2, false);
+        assert_eq!(view.cursor, 16); // "three" starts at 13
+    }
+
+    #[test]
+    fn click_below_the_last_line_lands_on_it() {
+        let doc = Document::from_str("a\nb");
+        let mut view = View::default();
+        view.click(&doc, 2, 10, 2, 9, false);
+        assert_eq!(view.cursor, 2);
+    }
+
+    #[test]
+    fn click_past_line_end_clamps_to_line_end() {
+        let doc = Document::from_str("ab\ncdef");
+        let mut view = View::default();
+        view.click(&doc, 2, 10, 40, 1, false);
+        assert_eq!(view.cursor, 2);
+    }
+
+    #[test]
+    fn click_in_the_gutter_lands_at_the_leftmost_visible_column() {
+        let doc = Document::from_str("abcdef");
+        let mut view = View::test_at(0, 0, 2);
+        view.click(&doc, 3, 10, 1, 1, false);
+        assert_eq!(view.cursor, 2);
+    }
+
+    #[test]
+    fn click_on_a_wide_cluster_or_tab_lands_on_its_start() {
+        let doc = Document::from_str("日本\n\tx");
+        let mut view = View::default();
+        view.click(&doc, 2, 10, 3, 1, false); // second column of 日
+        assert_eq!(view.cursor, 0);
+        view.click(&doc, 2, 10, 7, 2, false); // inside the tab's 8 columns
+        assert_eq!(view.cursor, 3);
+    }
+
+    #[test]
+    fn shift_click_extends_and_plain_click_dissolves_the_selection() {
+        let doc = Document::from_str("hello");
+        let mut view = view_at(1);
+        view.click(&doc, 2, 10, 6, 1, true);
+        assert_eq!(view.selection(), Some(1..4));
+        view.click(&doc, 2, 10, 2, 1, false);
+        assert_eq!(view.selection(), None);
+        assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn click_resets_the_goal_column() {
+        let doc = Document::from_str("abcd\nx\nabcd");
+        let mut view = view_at(3);
+        view.move_down(&doc); // goal column 3, clamped to "x"'s end
+        assert_eq!(view.cursor, 6);
+        view.click(&doc, 2, 10, 2, 2, false); // start of "x"
+        view.move_down(&doc);
+        assert_eq!(view.cursor, 7); // aims for the clicked column, not 3
+    }
+
+    #[test]
+    fn drag_keeps_the_anchor_and_follows_the_pointer() {
+        let doc = Document::from_str("hello\nworld");
+        let mut view = View::default();
+        view.click(&doc, 2, 10, 3, 1, false);
+        view.drag(&doc, 2, 10, 5, 2);
+        assert_eq!(view.selection(), Some(1..9));
+        view.drag(&doc, 2, 10, 4, 1);
+        assert_eq!(view.selection(), Some(1..2));
+    }
+
+    #[test]
+    fn drag_at_the_edges_overshoots_one_line() {
+        let doc = Document::from_str("a\nb\nc\nd\ne\nf");
+        let mut view = View::test_at(4, 2, 0); // lines 2..=3 visible
+        view.drag(&doc, 2, 2, 2, 0);
+        assert_eq!(view.cursor, 2); // one line above the viewport
+        view.scroll_to_cursor(&doc, 10, 2);
+        assert_eq!(view.scroll_line, 1);
+        view.drag(&doc, 2, 2, 2, 3);
+        assert_eq!(view.cursor, 6); // one line below it
+        view.scroll_to_cursor(&doc, 10, 2);
+        assert_eq!(view.scroll_line, 2);
+    }
+
+    #[test]
+    fn select_word_takes_word_punct_and_whitespace_runs() {
+        let doc = Document::from_str("foo_bar, baz");
+        for (cursor, range) in [(2, 0..7), (7, 7..8), (8, 8..9), (10, 9..12)] {
+            let mut view = view_at(cursor);
+            view.select_word(&doc);
+            assert_eq!(view.selection(), Some(range));
+        }
+    }
+
+    #[test]
+    fn select_word_at_line_end_takes_the_word_before() {
+        let doc = Document::from_str("foo bar\nx");
+        let mut view = view_at(7);
+        view.select_word(&doc);
+        assert_eq!(view.selection(), Some(4..7));
+    }
+
+    #[test]
+    fn select_word_on_an_empty_line_selects_nothing() {
+        let doc = Document::from_str("a\n\nb");
+        let mut view = view_at(2);
+        view.select_word(&doc);
+        assert_eq!(view.selection(), None);
+    }
+
+    #[test]
+    fn word_selection_stays_on_its_line() {
+        let doc = Document::from_str("a \n b");
+        let mut view = view_at(1);
+        view.select_word(&doc);
+        assert_eq!(view.selection(), Some(1..2));
+    }
+
+    #[test]
+    fn scroll_wheel_moves_viewport_only_and_clamps() {
+        let doc = Document::from_str("a\nb\nc\nd\ne");
+        let mut view = View::default();
+        view.scroll_wheel(&doc, 3);
+        assert_eq!(view.scroll_line, 3);
+        assert_eq!(view.cursor, 0);
+        view.scroll_wheel(&doc, 100);
+        assert_eq!(view.scroll_line, 4);
+        view.scroll_wheel(&doc, -100);
+        assert_eq!(view.scroll_line, 0);
+    }
+
+    #[test]
+    fn typing_replaces_a_mouse_selection() {
+        let mut doc = Document::from_str("hello");
+        let mut view = View::default();
+        view.click(&doc, 2, 10, 3, 1, false);
+        view.drag(&doc, 2, 10, 6, 1);
+        view.insert_char(&mut doc, 'x');
+        assert_eq!(doc.rope().to_string(), "hxo");
+        assert_eq!(view.selection(), None);
     }
 }

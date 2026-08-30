@@ -320,8 +320,9 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
 
     loop {
         back.clear();
-        let caret_in_status = matches!(prompt, Some(Prompt::Path { .. }));
-        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, caret_in_status);
+        let status_caret =
+            matches!(prompt, Some(Prompt::Path { .. })).then(|| notice.chars().count());
+        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret);
         terminal.present(&back, cursor)?;
 
         // Page movement wants the text area as it was when the key arrived.

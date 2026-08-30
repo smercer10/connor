@@ -26,14 +26,14 @@ pub fn text_height(screen_height: u16) -> usize {
 /// viewport's right edge. `scratch` is reused across frames so steady-state
 /// drawing never heap-allocates. A non-empty `notice` — a message or a
 /// mini-prompt — takes over the status line until the next keypress;
-/// `caret_in_status` parks the cursor at the notice's end while a prompt
-/// is editing there.
+/// `status_caret` parks the cursor after that many of the notice's chars
+/// while a prompt is editing there.
 pub fn draw(
     screen: &mut Screen,
     tabs: &Tabs,
     scratch: &mut String,
     notice: &str,
-    caret_in_status: bool,
+    status_caret: Option<usize>,
 ) -> (u16, u16) {
     let (width, height) = screen.size();
     if width == 0 || height == 0 {
@@ -131,8 +131,8 @@ pub fn draw(
         screen.set_text(0, height - 1, notice);
     }
 
-    if caret_in_status {
-        let col: usize = notice.chars().map(char_cols).sum();
+    if let Some(chars) = status_caret {
+        let col: usize = notice.chars().take(chars).map(char_cols).sum();
         return (col.min(width - 1) as u16, height - 1);
     }
     let cx = (gutter_w + vcol.saturating_sub(view.scroll_col)).min(width - 1) as u16;
@@ -258,7 +258,7 @@ mod tests {
     fn render_tabs(tabs: &Tabs, width: u16, height: u16) -> (Screen, (u16, u16)) {
         let mut screen = Screen::new(width, height);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, tabs, &mut scratch, "", false);
+        let cursor = draw(&mut screen, tabs, &mut scratch, "", None);
         (screen, cursor)
     }
 
@@ -362,7 +362,7 @@ mod tests {
         let tabs = tabs_of(Document::from_str("ab"), View::default());
         let mut screen = Screen::new(12, 3);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "saved ab", false);
+        draw(&mut screen, &tabs, &mut scratch, "saved ab", None);
         assert_eq!(row(&screen, 2), "saved ab    ");
     }
 
@@ -371,12 +371,28 @@ mod tests {
         let tabs = tabs_of(Document::from_str("ab"), View::default());
         let mut screen = Screen::new(12, 3);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, &tabs, &mut scratch, "open: sr", true);
+        let cursor = draw(&mut screen, &tabs, &mut scratch, "open: sr", Some(8));
         assert_eq!(cursor, (8, 2));
 
         // The caret clips at the right edge rather than leaving the screen.
-        let cursor = draw(&mut screen, &tabs, &mut scratch, "open: src/main.rs", true);
+        let cursor = draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "open: src/main.rs",
+            Some(17),
+        );
         assert_eq!(cursor, (11, 2));
+    }
+
+    #[test]
+    fn prompt_caret_can_park_inside_the_notice() {
+        let tabs = tabs_of(Document::from_str("ab"), View::default());
+        let mut screen = Screen::new(24, 3);
+        let mut scratch = String::new();
+        // Caret after "find: 日" — hint text follows the edited field.
+        let cursor = draw(&mut screen, &tabs, &mut scratch, "find: 日 · esc", Some(7));
+        assert_eq!(cursor, (8, 2));
     }
 
     #[test]

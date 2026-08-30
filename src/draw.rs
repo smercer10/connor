@@ -123,6 +123,9 @@ pub fn draw(
         if doc.lossy() {
             scratch.push_str(" [lossy]");
         }
+        if doc.conflict() {
+            scratch.push_str(" [disk changed]");
+        }
         screen.set_text(0, height - 1, scratch);
     } else {
         screen.set_text(0, height - 1, notice);
@@ -162,6 +165,9 @@ fn draw_tab_bar(screen: &mut Screen, tabs: &Tabs, scratch: &mut String, width: u
         if tab.doc.dirty() {
             scratch.push('+');
         }
+        if tab.doc.conflict() {
+            scratch.push('!');
+        }
         scratch.push(' ');
         screen.set_text(x as u16, 0, scratch);
         let label_w = label_width(tab);
@@ -178,9 +184,11 @@ fn draw_tab_bar(screen: &mut Screen, tabs: &Tabs, scratch: &mut String, width: u
 }
 
 /// The screen columns one tab's label occupies: padding, the shown name,
-/// and the dirty mark.
+/// and the dirty and conflict marks.
 fn label_width(tab: &Tab) -> usize {
-    2 + shown_name_cols(&tab.doc.name()) + usize::from(tab.doc.dirty())
+    2 + shown_name_cols(&tab.doc.name())
+        + usize::from(tab.doc.dirty())
+        + usize::from(tab.doc.conflict())
 }
 
 fn shown_name_cols(name: &str) -> usize {
@@ -337,6 +345,16 @@ mod tests {
         let (screen, cursor) = render_tabs(&tabs_of(doc, view), 24, 4);
         assert_eq!(row(&screen, 3), "[No Name] · 2:2 [lossy] ");
         assert_eq!(cursor, (3, 2));
+    }
+
+    #[test]
+    fn status_and_tab_bar_mark_a_disk_conflict() {
+        let mut doc = dirtied(named("a.rs", "x"));
+        doc.set_conflict(true);
+        let tabs = tabs_of(doc, View::default());
+        let (screen, _) = render_tabs(&tabs, 32, 4);
+        assert_eq!(row(&screen, 0), " a.rs+!                         ");
+        assert_eq!(row(&screen, 3), "a.rs · 1:1 [+] [disk changed]   ");
     }
 
     #[test]

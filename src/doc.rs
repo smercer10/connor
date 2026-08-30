@@ -316,6 +316,11 @@ impl Document {
         self.lossy = lossy;
     }
 
+    #[cfg(test)]
+    pub fn set_conflict(&mut self, conflict: bool) {
+        self.conflict = conflict;
+    }
+
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -367,7 +372,6 @@ impl Document {
         Ok(())
     }
 
-    #[allow(dead_code)] // Wired up when the watcher lands.
     pub fn conflict(&self) -> bool {
         self.conflict
     }

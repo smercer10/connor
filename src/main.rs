@@ -609,6 +609,18 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                         view.select_word(doc);
                     }
                 }
+                // A click on a tab label activates it, accepting any open
+                // search on the way out.
+                MouseEventKind::Down(MouseButton::Left)
+                    if m.row == 0 && matches!(prompt, None | Some(Prompt::Search(_))) =>
+                {
+                    if let Some(i) = draw::tab_at(tabs, usize::from(back.size().0), m.column) {
+                        prompt = None;
+                        notice.clear();
+                        tabs.active_mut().doc.break_undo_group();
+                        tabs.activate(i);
+                    }
+                }
                 MouseEventKind::Drag(MouseButton::Left) if prompt.is_none() => {
                     let Tab { doc, view } = tabs.active_mut();
                     let gutter_w = draw::gutter_width(doc);

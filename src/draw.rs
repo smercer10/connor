@@ -152,6 +152,9 @@ pub fn draw(
         if doc.conflict() {
             scratch.push_str(" [disk changed]");
         }
+        if doc.recovered() {
+            scratch.push_str(" [recovered]");
+        }
         screen.set_text(0, height - 1, scratch);
     } else {
         screen.set_text(0, height - 1, notice);

@@ -55,19 +55,36 @@ fn main() -> ExitCode {
     }
     let mut tabs = Tabs::new(docs);
     let result = run(&mut tabs, &mut journal, notice);
-    if result.is_err() {
-        // The terminal died out from under a possibly dirty buffer; a last
-        // snapshot before abandoning the session dir keeps it current.
+    // Only a user quit deletes the session dir; a terminal error or a
+    // termination signal keeps it (after a last snapshot) so unsaved work
+    // survives to the next start.
+    let clean = matches!(result, Ok(Exit::Quit));
+    if !clean {
         journal.flush(&tabs);
     }
-    journal.finish(result.is_ok());
+    journal.finish(clean);
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Exit::Quit) => ExitCode::SUCCESS,
+        #[cfg(unix)]
+        Ok(Exit::Signal(sig)) => {
+            // Re-raise with default disposition: the shell sees signal
+            // death (143 for TERM), not a made-up exit code.
+            let _ = signal_hook::low_level::emulate_default_handler(sig);
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("connor: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// How the session ended: a user quit, or a termination signal that `main`
+/// re-raises after cleanup so the process dies with signal status.
+enum Exit {
+    Quit,
+    #[cfg(unix)]
+    Signal(i32),
 }
 
 /// Folds crash-recovered buffers into the docs the args opened: an entry
@@ -483,7 +500,7 @@ fn close_active_or_quit(tabs: &mut Tabs) -> bool {
     false
 }
 
-fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()> {
+fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exit> {
     term::init_panic_hook();
     let mut terminal = Terminal::new()?;
     let (width, height) = terminal.size();
@@ -495,6 +512,14 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()>
     let mut prompt: Option<Prompt> = None;
     let (tx, rx) = mpsc::channel();
     watch::spawn_input_thread(tx.clone());
+    // Losing signal handling costs graceful suspend and terminate, not the
+    // editor.
+    #[cfg(unix)]
+    if let Err(e) = watch::spawn_signal_thread(tx.clone())
+        && notice.is_empty()
+    {
+        let _ = write!(notice, "signal handling unavailable: {e}");
+    }
     // Losing the watcher (inotify limits, say) costs reloads, not the
     // editor.
     let mut watcher = match DirWatcher::new(tx) {
@@ -747,6 +772,20 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()>
                 terminal.resize(width, height);
                 back.resize(width, height);
             }
+            #[cfg(unix)]
+            Ok(AppEvent::Signal(sig)) => match sig {
+                signal_hook::consts::SIGTSTP => {
+                    let (width, height) = terminal.suspend()?;
+                    back.resize(width, height);
+                }
+                // Also fires after an uncatchable external SIGSTOP; after
+                // our own suspend it is a redundant repaint.
+                signal_hook::consts::SIGCONT => {
+                    let (width, height) = terminal.resync_size()?;
+                    back.resize(width, height);
+                }
+                _ => return Ok(Exit::Signal(sig)),
+            },
             Ok(AppEvent::Input(Event::Mouse(m))) => match m.kind {
                 // The wheel works during prompts too: it only moves the
                 // viewport, which the prompts don't own.
@@ -834,7 +873,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()>
             view.scroll_to_cursor(doc, text_w, draw::text_height(height));
         }
     }
-    Ok(())
+    Ok(Exit::Quit)
 }
 
 /// The debounce expired: reconcile every touched tab with its file. Paths

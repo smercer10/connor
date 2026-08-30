@@ -17,8 +17,8 @@ const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 /// Puts the terminal back the way the shell expects it. Idempotent, so the
-/// panic hook and `Drop` can both call it without coordination, and it must
-/// never panic — hence `let _ =` on every write.
+/// panic hook, `Drop` and suspend can all call it without coordination, and
+/// it must never panic — hence `let _ =` on every write.
 fn restore() {
     if ACTIVE.swap(false, Ordering::SeqCst) {
         // End any pending synchronized update first: a panic between begin and
@@ -74,6 +74,28 @@ impl Terminal {
         self.front.resize(width, height);
         self.reserve_scratch();
         self.needs_clear = true;
+    }
+
+    /// Restores the terminal, stops the process the way an unhandled
+    /// SIGTSTP would, and re-enters on resume. Returns the fresh size: no
+    /// Resize event is delivered while stopped.
+    #[cfg(unix)]
+    pub fn suspend(&mut self) -> io::Result<(u16, u16)> {
+        restore();
+        // Raises SIGSTOP; the whole process stops on this line until
+        // SIGCONT.
+        let _ = signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTSTP);
+        self.enter()?;
+        self.resync_size()
+    }
+
+    /// Re-queries the size and forces a full repaint, for resuming when
+    /// resizes went undelivered and the screen contents are unknown.
+    #[cfg(unix)]
+    pub fn resync_size(&mut self) -> io::Result<(u16, u16)> {
+        let (width, height) = terminal::size()?;
+        self.resize(width, height);
+        Ok((width, height))
     }
 
     /// Diffs `back` against what is on screen and writes only the changed

@@ -21,6 +21,7 @@ dependencies = [
  "crossterm",
  "notify",
  "ropey",
+ "signal-hook",
  "unicode-segmentation",
  "unicode-width",
 ]

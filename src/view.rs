@@ -8,7 +8,6 @@ use crate::grapheme::{self, RopeGraphemes};
 /// Where a char position lands after a reload: positions in the common
 /// prefix stay, positions in the common suffix shift with the length delta,
 /// and positions inside the changed region clamp to its start.
-#[allow(dead_code)] // Wired up when the watcher lands.
 fn remap(pos: usize, span: &ChangeSpan) -> usize {
     if pos <= span.prefix {
         pos
@@ -215,7 +214,6 @@ impl View {
     /// disk: `old` is the text as it stood, `new` the document's rope now.
     /// The scroll anchor follows the same mapping as the cursor, so an
     /// agent edit above the viewport doesn't shift what's on screen.
-    #[allow(dead_code)] // Wired up when the watcher lands.
     pub fn remap_after_reload(&mut self, old: &Rope, new: &Rope, span: &ChangeSpan) {
         self.goal_col = None;
         self.cursor = grapheme::snap_to_boundary(new.slice(..), remap(self.cursor, span));

@@ -114,7 +114,6 @@ pub struct Caret {
 /// of the old text became `[prefix, new_suffix_start)` of the new — the
 /// bounds views need to re-anchor positions by content.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // Wired up when the watcher lands.
 pub struct ChangeSpan {
     pub prefix: usize,
     pub old_suffix_start: usize,
@@ -122,7 +121,6 @@ pub struct ChangeSpan {
 }
 
 /// What `check_disk` found and did.
-#[allow(dead_code)] // Wired up when the watcher lands.
 pub enum DiskCheck {
     /// Self-save, spurious event, or unreadable file; buffer untouched.
     Unchanged,
@@ -385,7 +383,6 @@ impl Document {
     /// the viewing caret as it stands, recorded so undoing the reload
     /// restores it. A conflicted buffer undone back to clean stays stale
     /// until the next disk event or save — accepted gap.
-    #[allow(dead_code)] // Wired up when the watcher lands.
     pub fn check_disk(&mut self, caret: Caret) -> DiskCheck {
         let Some(path) = self.path.as_deref() else {
             return DiskCheck::Unchanged;

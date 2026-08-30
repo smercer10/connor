@@ -10,7 +10,7 @@ Named for Sarah Connor of *Terminator* — the human the machine works alongside
 
 ## Status
 
-Early days — nothing usable yet. Follow the [roadmap](https://github.com/smercer10/connor/milestones) to see where it's headed.
+The core editor is complete and usable for everyday editing. Follow the [roadmap](https://github.com/smercer10/connor/milestones) to see where it's headed.
 
 ## License
 

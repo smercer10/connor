@@ -129,9 +129,8 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
     let mut prompt: Option<Prompt> = None;
 
     loop {
-        let Tab { doc, view } = tabs.active_mut();
         back.clear();
-        let cursor = draw::draw(&mut back, doc, view, &mut scratch, &notice);
+        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice);
         terminal.present(&back, cursor)?;
 
         // Page movement wants the text area as it was when the key arrived.
@@ -139,6 +138,7 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let Tab { doc, view } = tabs.active_mut();
                 if let Some(pending) = prompt.take() {
                     let (next, quit) = prompt_key(pending, key.code, doc, &mut notice);
                     prompt = next;
@@ -230,6 +230,7 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
 
         // Re-fetch the size: a resize may have changed it.
         let (width, height) = back.size();
+        let Tab { doc, view } = tabs.active_mut();
         let text_w = usize::from(width).saturating_sub(draw::gutter_width(doc));
         view.scroll_to_cursor(doc, text_w, draw::text_height(height));
     }

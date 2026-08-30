@@ -275,6 +275,11 @@ impl Document {
         self.lossy = lossy;
     }
 
+    #[cfg(test)]
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
     pub fn rope(&self) -> &Rope {
         &self.rope
     }

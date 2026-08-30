@@ -34,8 +34,25 @@ impl Tabs {
         }
     }
 
+    pub fn all(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn active(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
     pub fn active_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    #[cfg(test)]
+    pub fn test_activate(&mut self, index: usize) {
+        self.active = index;
     }
 }
 

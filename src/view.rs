@@ -1,7 +1,23 @@
 use std::ops::Range;
 
-use crate::doc::{Caret, Document, EditKind};
+use ropey::Rope;
+
+use crate::doc::{Caret, ChangeSpan, Document, EditKind};
 use crate::grapheme::{self, RopeGraphemes};
+
+/// Where a char position lands after a reload: positions in the common
+/// prefix stay, positions in the common suffix shift with the length delta,
+/// and positions inside the changed region clamp to its start.
+#[allow(dead_code)] // Wired up when the watcher lands.
+fn remap(pos: usize, span: &ChangeSpan) -> usize {
+    if pos <= span.prefix {
+        pos
+    } else if pos >= span.old_suffix_start {
+        pos - span.old_suffix_start + span.new_suffix_start
+    } else {
+        span.prefix
+    }
+}
 
 /// Everything that belongs to one view of a document rather than to the
 /// document itself: cursor, selection, sticky column, and scroll position.
@@ -193,6 +209,23 @@ impl View {
         self.goal_col = None;
         self.cursor = caret.cursor;
         self.anchor = caret.anchor;
+    }
+
+    /// Re-anchors this view by content after its document reloaded from
+    /// disk: `old` is the text as it stood, `new` the document's rope now.
+    /// The scroll anchor follows the same mapping as the cursor, so an
+    /// agent edit above the viewport doesn't shift what's on screen.
+    #[allow(dead_code)] // Wired up when the watcher lands.
+    pub fn remap_after_reload(&mut self, old: &Rope, new: &Rope, span: &ChangeSpan) {
+        self.goal_col = None;
+        self.cursor = grapheme::snap_to_boundary(new.slice(..), remap(self.cursor, span));
+        // A selection straddling the change collapses to equal ends, which
+        // selection() already reads as none.
+        self.anchor = self
+            .anchor
+            .map(|a| grapheme::snap_to_boundary(new.slice(..), remap(a, span)));
+        let line = self.scroll_line.min(old.len_lines() - 1);
+        self.scroll_line = new.char_to_line(remap(old.line_to_char(line), span));
     }
 
     /// The range a pending edit replaces: the selection, or nothing at the
@@ -699,5 +732,67 @@ mod tests {
         view.scroll_to_cursor(&doc, 0, 0);
         assert_eq!(view.scroll_line, 0);
         assert_eq!(view.scroll_col, 0);
+    }
+
+    #[test]
+    fn remap_keeps_prefix_shifts_suffix_clamps_middle() {
+        let span = ChangeSpan {
+            prefix: 2,
+            old_suffix_start: 5,
+            new_suffix_start: 7,
+        };
+        assert_eq!(remap(0, &span), 0);
+        assert_eq!(remap(2, &span), 2);
+        assert_eq!(remap(3, &span), 2); // inside the change: clamps
+        assert_eq!(remap(5, &span), 7);
+        assert_eq!(remap(6, &span), 8);
+    }
+
+    #[test]
+    fn remap_after_reload_re_anchors_the_cursor_by_content() {
+        // Two lines inserted above: the cursor and viewport follow their
+        // line's content down.
+        let old = Rope::from_str("a\nb\nc\nd\n");
+        let new = Rope::from_str("x\ny\na\nb\nc\nd\n");
+        let span = ChangeSpan {
+            prefix: 0,
+            old_suffix_start: 0,
+            new_suffix_start: 4,
+        };
+        let mut view = View::test_at(4, 2, 0); // cursor on "c", "c" at top
+        view.remap_after_reload(&old, &new, &span);
+        assert_eq!(new.char_to_line(view.cursor), 4); // still on "c"
+        assert_eq!(view.scroll_line, 4);
+    }
+
+    #[test]
+    fn remap_after_reload_snaps_to_a_cluster_boundary() {
+        // The reload appended a combining mark that merges with the char
+        // before the cursor; the cursor may not stay inside the cluster.
+        let old = Rope::from_str("ae");
+        let new = Rope::from_str("ae\u{301}");
+        let span = ChangeSpan {
+            prefix: 2,
+            old_suffix_start: 2,
+            new_suffix_start: 3,
+        };
+        let mut view = View::test_at(2, 0, 0);
+        view.remap_after_reload(&old, &new, &span);
+        assert_eq!(view.cursor, 3);
+    }
+
+    #[test]
+    fn selection_straddling_the_change_dissolves() {
+        let old = Rope::from_str("aXYZb");
+        let new = Rope::from_str("ab");
+        let span = ChangeSpan {
+            prefix: 1,
+            old_suffix_start: 4,
+            new_suffix_start: 1,
+        };
+        let mut view = View::test_at(3, 0, 0).with_anchor(2);
+        view.remap_after_reload(&old, &new, &span);
+        assert_eq!(view.selection(), None);
+        assert!(view.cursor <= new.len_chars());
     }
 }

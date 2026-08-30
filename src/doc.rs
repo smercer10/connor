@@ -110,6 +110,29 @@ pub struct Caret {
     pub anchor: Option<usize>,
 }
 
+/// The region a reload replaced, in char indices: `[prefix, old_suffix_start)`
+/// of the old text became `[prefix, new_suffix_start)` of the new — the
+/// bounds views need to re-anchor positions by content.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // Wired up when the watcher lands.
+pub struct ChangeSpan {
+    pub prefix: usize,
+    pub old_suffix_start: usize,
+    pub new_suffix_start: usize,
+}
+
+/// What `check_disk` found and did.
+#[allow(dead_code)] // Wired up when the watcher lands.
+pub enum DiskCheck {
+    /// Self-save, spurious event, or unreadable file; buffer untouched.
+    Unchanged,
+    /// Clean buffer swapped to the disk content; `old` is the text as it
+    /// stood, for re-anchoring views.
+    Reloaded { old: Rope, span: ChangeSpan },
+    /// Dirty buffer kept its text; the conflict flag is up.
+    Conflict,
+}
+
 /// The user gesture behind an edit — the hint coalescing uses to fold a
 /// burst of typing into one undo step. `Other` never coalesces.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -219,6 +242,13 @@ pub struct Document {
     line_ending: LineEnding,
     indent: IndentStyle,
     history: History,
+    /// FNV-1a of the bytes last seen on disk (loaded or saved); `None` when
+    /// nothing is on disk yet. Lets a watch event tell an external change
+    /// from our own save or a spurious wake.
+    disk_hash: Option<u64>,
+    /// Disk changed under a dirty buffer; cleared when buffer and disk
+    /// reconverge (a save, or disk restored to the baseline).
+    conflict: bool,
 }
 
 impl Document {
@@ -230,6 +260,8 @@ impl Document {
             line_ending: LineEnding::Lf,
             indent: IndentStyle::Spaces(4),
             history: History::default(),
+            disk_hash: None,
+            conflict: false,
         }
     }
 
@@ -237,16 +269,23 @@ impl Document {
     /// path, so saving can create it. Invalid UTF-8 loads lossily (bad bytes
     /// become U+FFFD) and is flagged so the status line can say so.
     pub fn open(path: PathBuf) -> io::Result<Self> {
-        let (rope, lossy) = match File::open(&path) {
+        let (rope, lossy, disk_hash) = match File::open(&path) {
             Ok(file) => match Rope::from_reader(BufReader::new(file)) {
-                Ok(rope) => (rope, false),
+                // The load is verbatim, so the rope's chunks are the file's
+                // bytes and hashing them here skips a second read.
+                Ok(rope) => {
+                    let hash = fnv1a(rope.chunks().map(str::as_bytes));
+                    (rope, false, Some(hash))
+                }
                 Err(e) if e.kind() == ErrorKind::InvalidData => {
                     let bytes = std::fs::read(&path)?;
-                    (Rope::from_str(&String::from_utf8_lossy(&bytes)), true)
+                    let hash = fnv1a(std::iter::once(bytes.as_slice()));
+                    let rope = Rope::from_str(&String::from_utf8_lossy(&bytes));
+                    (rope, true, Some(hash))
                 }
                 Err(e) => return Err(e),
             },
-            Err(e) if e.kind() == ErrorKind::NotFound => (Rope::new(), false),
+            Err(e) if e.kind() == ErrorKind::NotFound => (Rope::new(), false, None),
             Err(e) => return Err(e),
         };
         Ok(Document {
@@ -256,6 +295,8 @@ impl Document {
             path: Some(path),
             lossy,
             history: History::default(),
+            disk_hash,
+            conflict: false,
         })
     }
 
@@ -319,7 +360,71 @@ impl Document {
         // would report clean with post-save edits applied.
         self.history.open_kind = None;
         self.lossy = false;
+        // The rope's chunks are exactly the bytes write_atomic just put on
+        // disk, and the buffer now matches the file.
+        self.disk_hash = Some(fnv1a(self.rope.chunks().map(str::as_bytes)));
+        self.conflict = false;
         Ok(())
+    }
+
+    #[allow(dead_code)] // Wired up when the watcher lands.
+    pub fn conflict(&self) -> bool {
+        self.conflict
+    }
+
+    /// Re-reads the file after a watch event and reconciles the buffer with
+    /// it. Never loses buffer text: a clean buffer reloads in place (as an
+    /// undoable edit spanning just the changed region), a dirty one keeps
+    /// its text and raises the conflict flag instead. Read errors leave
+    /// everything untouched — deletion is usually a transient step of a
+    /// rewrite, and the buffer is the user's copy of the data. `caret` is
+    /// the viewing caret as it stands, recorded so undoing the reload
+    /// restores it. A conflicted buffer undone back to clean stays stale
+    /// until the next disk event or save — accepted gap.
+    #[allow(dead_code)] // Wired up when the watcher lands.
+    pub fn check_disk(&mut self, caret: Caret) -> DiskCheck {
+        let Some(path) = self.path.as_deref() else {
+            return DiskCheck::Unchanged;
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return DiskCheck::Unchanged;
+        };
+        let hash = fnv1a(std::iter::once(bytes.as_slice()));
+        if Some(hash) == self.disk_hash {
+            self.conflict = false;
+            return DiskCheck::Unchanged;
+        }
+        if self.dirty() {
+            self.conflict = true;
+            return DiskCheck::Conflict;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lossy = matches!(text, Cow::Owned(_));
+        let span = change_span(&self.rope, &text);
+        let old = self.rope.clone();
+        let middle: String = text
+            .chars()
+            .skip(span.prefix)
+            .take(span.new_suffix_start - span.prefix)
+            .collect();
+        // Distinct bytes can decode to identical chars (two lossy loads,
+        // say); an empty edit would still open a no-op undo step.
+        if span.prefix != span.old_suffix_start || !middle.is_empty() {
+            self.edit(
+                span.prefix..span.old_suffix_start,
+                &middle,
+                caret,
+                EditKind::Other,
+            );
+            self.history.saved_index = self.history.index;
+            self.history.open_kind = None;
+        }
+        self.line_ending = detect_line_ending(&self.rope);
+        self.indent = detect_indent(&self.rope);
+        self.lossy = lossy;
+        self.disk_hash = Some(hash);
+        self.conflict = false;
+        DiskCheck::Reloaded { old, span }
     }
 
     /// Replaces `range` with `text` — the single mutation entry point, so
@@ -407,6 +512,49 @@ impl Document {
             }
         }
         end
+    }
+}
+
+/// FNV-1a 64. Hand-rolled because the baseline comparison needs a hash
+/// that folds byte-at-a-time — the same bytes must hash equally whether fed
+/// as rope chunks or one read buffer, which `std::hash::Hasher` does not
+/// promise across chunkings. The input isn't adversarial.
+fn fnv1a<'a>(chunks: impl Iterator<Item = &'a [u8]>) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for chunk in chunks {
+        for &byte in chunk {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// The common prefix and suffix between the buffer and freshly read text,
+/// as a `ChangeSpan` in chars. The suffix scan is capped so the regions
+/// never overlap when text was purely inserted or deleted.
+fn change_span(old: &Rope, new: &str) -> ChangeSpan {
+    let old_len = old.len_chars();
+    let new_len = new.chars().count();
+    let mut prefix = 0;
+    for (a, b) in old.chars().zip(new.chars()) {
+        if a != b {
+            break;
+        }
+        prefix += 1;
+    }
+    let limit = old_len.min(new_len) - prefix;
+    let mut suffix = 0;
+    for (a, b) in old.chars_at(old_len).reversed().zip(new.chars().rev()) {
+        if a != b || suffix == limit {
+            break;
+        }
+        suffix += 1;
+    }
+    ChangeSpan {
+        prefix,
+        old_suffix_start: old_len - suffix,
+        new_suffix_start: new_len - suffix,
     }
 }
 
@@ -851,6 +999,165 @@ mod tests {
         assert_eq!(doc.rope().to_string(), "ok\u{FFFD}\u{FFFD}bad\n");
         assert!(!doc.dirty());
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fnv1a_is_chunk_invariant() {
+        let whole = fnv1a(std::iter::once(b"abcd".as_slice()));
+        let split = fnv1a([b"a".as_slice(), b"bc".as_slice(), b"d".as_slice()].into_iter());
+        assert_eq!(whole, split);
+        assert_ne!(whole, fnv1a(std::iter::once(b"abce".as_slice())));
+    }
+
+    fn span(old: &str, new: &str) -> ChangeSpan {
+        change_span(&Rope::from_str(old), new)
+    }
+
+    #[test]
+    fn change_span_finds_the_replaced_middle() {
+        assert_eq!(
+            span("axxxb", "ayb"),
+            ChangeSpan {
+                prefix: 1,
+                old_suffix_start: 4,
+                new_suffix_start: 2
+            }
+        );
+        assert_eq!(
+            span("abc", "xyz"),
+            ChangeSpan {
+                prefix: 0,
+                old_suffix_start: 3,
+                new_suffix_start: 3
+            }
+        );
+    }
+
+    #[test]
+    fn change_span_handles_pure_insertion_and_deletion() {
+        // "hello world" -> "hello brave world": the suffix scan would match
+        // six chars but is capped so the regions never overlap.
+        assert_eq!(
+            span("hello world", "hello brave world"),
+            ChangeSpan {
+                prefix: 6,
+                old_suffix_start: 6,
+                new_suffix_start: 12
+            }
+        );
+        assert_eq!(
+            span("abcabc", "abc"),
+            ChangeSpan {
+                prefix: 3,
+                old_suffix_start: 6,
+                new_suffix_start: 3
+            }
+        );
+        assert_eq!(
+            span("aba", "aa"),
+            ChangeSpan {
+                prefix: 1,
+                old_suffix_start: 2,
+                new_suffix_start: 1
+            }
+        );
+    }
+
+    #[test]
+    fn check_disk_reloads_a_clean_buffer_in_place() {
+        let dir = scratch_dir("reload-clean");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        std::fs::write(&path, "one\nrewritten\ntwo\n").unwrap();
+        let check = doc.check_disk(caret(0));
+        assert!(matches!(check, DiskCheck::Reloaded { .. }));
+        assert_eq!(doc.rope().to_string(), "one\nrewritten\ntwo\n");
+        assert!(!doc.dirty());
+        assert!(!doc.conflict());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_disk_redetects_conventions_and_lossiness() {
+        let dir = scratch_dir("reload-detect");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        assert_eq!(doc.line_ending(), LineEnding::Lf);
+        std::fs::write(&path, b"a\r\nb\r\n\xFF\r\n").unwrap();
+        assert!(matches!(
+            doc.check_disk(caret(0)),
+            DiskCheck::Reloaded { .. }
+        ));
+        assert_eq!(doc.line_ending(), LineEnding::Crlf);
+        assert!(doc.lossy());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_disk_flags_a_dirty_buffer_instead_of_reloading() {
+        let dir = scratch_dir("reload-dirty");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.edit(0..0, "mine ", caret(0), EditKind::Insert);
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Conflict));
+        assert_eq!(doc.rope().to_string(), "mine base\n");
+        assert!(doc.conflict());
+        // Disk restored to the baseline: the conflict dissolves.
+        std::fs::write(&path, "base\n").unwrap();
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Unchanged));
+        assert!(!doc.conflict());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_clears_the_conflict_and_suppresses_its_own_event() {
+        let dir = scratch_dir("reload-save");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.edit(0..0, "mine ", caret(0), EditKind::Insert);
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Conflict));
+        doc.save().unwrap();
+        assert!(!doc.conflict());
+        // The watch event our own save fires must find nothing to do.
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Unchanged));
+        assert_eq!(doc.rope().to_string(), "mine base\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_disk_reload_is_undoable_back_to_the_buffer_text() {
+        let dir = scratch_dir("reload-undo");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        std::fs::write(&path, "two\n").unwrap();
+        assert!(matches!(
+            doc.check_disk(caret(0)),
+            DiskCheck::Reloaded { .. }
+        ));
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), "one\n");
+        assert!(doc.dirty()); // recovered text no longer matches disk
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_disk_leaves_a_deleted_file_alone() {
+        let dir = scratch_dir("reload-deleted");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "keep\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Unchanged));
+        assert_eq!(doc.rope().to_string(), "keep\n");
+        assert!(!doc.conflict());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

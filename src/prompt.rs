@@ -49,6 +49,12 @@ impl PathPrompt {
         Outcome::Pending
     }
 
+    /// Appends a paste flattened to a single line: control characters,
+    /// line breaks included, are dropped.
+    pub fn paste(&mut self, text: &str) {
+        self.buf.extend(text.chars().filter(|ch| !ch.is_control()));
+    }
+
     /// Writes the prompt into the notice; the caret sits at its end.
     pub fn render(&self, notice: &mut String) {
         notice.clear();
@@ -91,6 +97,12 @@ impl LinePrompt {
             _ => {}
         }
         Outcome::Pending
+    }
+
+    /// Appends only the digits of a paste, matching what typing accepts.
+    pub fn paste(&mut self, text: &str) {
+        self.buf
+            .extend(text.chars().filter(|ch| ch.is_ascii_digit()));
     }
 
     /// Writes the prompt into the notice; the caret sits at its end.
@@ -261,6 +273,17 @@ mod tests {
             prompt.key(&press(KeyCode::Char('9')));
         }
         assert_eq!(prompt.line(), Some(usize::MAX));
+    }
+
+    #[test]
+    fn paste_flattens_to_a_single_line() {
+        let mut prompt = PathPrompt::new("open: ");
+        prompt.paste("src/\nmain.rs\r\n");
+        assert_eq!(prompt.into_path(), PathBuf::from("src/main.rs"));
+
+        let mut prompt = LinePrompt::new();
+        prompt.paste(" 4\n2 ");
+        assert_eq!(prompt.line(), Some(42));
     }
 
     #[test]

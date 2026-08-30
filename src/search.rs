@@ -131,6 +131,20 @@ impl SearchPrompt {
         Outcome::Pending
     }
 
+    /// Pastes into the focused field, flattened to a single line (control
+    /// characters dropped); a paste into the query re-runs the search.
+    pub fn paste(&mut self, text: &str, doc: &mut Document, view: &mut View) {
+        let field = match self.focus {
+            Focus::Find => &mut self.query,
+            Focus::Replace => &mut self.replacement,
+        };
+        let before = field.len();
+        field.extend(text.chars().filter(|ch| !ch.is_control()));
+        if field.len() != before && self.focus == Focus::Find {
+            self.research(doc, view);
+        }
+    }
+
     /// Writes the focused field, the match counter, and the key hints.
     pub fn render(&self, notice: &mut String) {
         notice.clear();
@@ -408,6 +422,21 @@ mod tests {
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         assert_eq!(view.cursor, 6); // third "ab": first at/after origin 4
         assert_eq!(prompt.current, Some(2));
+    }
+
+    #[test]
+    fn paste_lands_in_the_focused_field_and_researches() {
+        let mut doc = Document::from_str("hello world");
+        let mut view = View::test_at(0, 0, 0);
+        let mut prompt = SearchPrompt::new(&view);
+        prompt.paste("wor\nld", &mut doc, &mut view);
+        assert_eq!(prompt.query, "world");
+        assert_eq!(prompt.current, Some(0));
+        assert_eq!(view.cursor, 6);
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        prompt.paste("uni\nverse", &mut doc, &mut view);
+        assert_eq!(prompt.replacement, "universe");
+        assert_eq!(prompt.query, "world");
     }
 
     #[test]

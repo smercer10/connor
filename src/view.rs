@@ -358,6 +358,34 @@ impl View {
         self.apply_edit(doc, range, &text, EditKind::Other);
     }
 
+    /// The selected text, left selected; `None` without a selection.
+    pub fn selected_text(&self, doc: &Document) -> Option<String> {
+        self.selection()
+            .map(|range| doc.rope().slice(range).to_string())
+    }
+
+    /// Removes and returns the selected text as one undo step; `None`
+    /// (and no edit) without a selection.
+    pub fn cut(&mut self, doc: &mut Document) -> Option<String> {
+        let range = self.selection()?;
+        let text = doc.rope().slice(range.clone()).to_string();
+        self.apply_edit(doc, range, "", EditKind::Other);
+        Some(text)
+    }
+
+    /// Inserts pasted text over the selection (or at the cursor) as one
+    /// edit, so any paste is a single undo step. Terminators are normalized
+    /// first: terminals send `\r` for line breaks in a bracketed paste, and
+    /// a bare `\r` is not a line break in this rope.
+    pub fn paste(&mut self, doc: &mut Document, text: &str) {
+        let range = self.edit_range();
+        if text.is_empty() && range.is_empty() {
+            return;
+        }
+        let text = normalize_eol(text, doc.line_ending().as_str());
+        self.apply_edit(doc, range, &text, EditKind::Other);
+    }
+
     pub fn backspace(&mut self, doc: &mut Document) {
         let (range, kind) = match self.selection() {
             Some(sel) => (sel, EditKind::Other),
@@ -494,6 +522,24 @@ fn word_at(doc: &Document, pos: usize) -> Range<usize> {
         end = grapheme::next_grapheme_boundary(slice, end);
     }
     start..end
+}
+
+/// Rewrites `\r\n`, bare `\r` and `\n` to `eol`, leaving everything else
+/// untouched.
+fn normalize_eol(text: &str, eol: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push_str(eol);
+            }
+            '\n' => out.push_str(eol),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -796,6 +842,81 @@ mod tests {
         view.set_caret(doc.redo().unwrap());
         assert_eq!(doc.rope().to_string(), "hi!");
         assert_eq!(view.cursor, 3);
+    }
+
+    #[test]
+    fn selected_text_reads_the_selection_and_leaves_it_standing() {
+        let doc = Document::from_str("hello world");
+        let mut view = view_at(5).with_anchor(0);
+        assert_eq!(view.selected_text(&doc).as_deref(), Some("hello"));
+        assert_eq!(view.selection(), Some(0..5));
+        view.anchor = None;
+        assert_eq!(view.selected_text(&doc), None);
+    }
+
+    #[test]
+    fn cut_removes_the_selection_as_one_undo_step() {
+        let mut doc = Document::from_str("hello world");
+        let mut view = view_at(0).with_anchor(5);
+        assert_eq!(view.cut(&mut doc).as_deref(), Some("hello"));
+        assert_eq!(doc.rope().to_string(), " world");
+        assert_eq!(view.cursor, 0);
+        view.set_caret(doc.undo().unwrap());
+        assert_eq!(doc.rope().to_string(), "hello world");
+        assert_eq!(view.selection(), Some(0..5));
+        assert!(doc.undo().is_none());
+    }
+
+    #[test]
+    fn cut_without_a_selection_does_nothing() {
+        let mut doc = Document::from_str("ab");
+        let mut view = view_at(1);
+        assert_eq!(view.cut(&mut doc), None);
+        assert_eq!(doc.rope().to_string(), "ab");
+        assert!(doc.undo().is_none());
+    }
+
+    #[test]
+    fn paste_at_the_cursor_inserts() {
+        let mut doc = Document::from_str("ad");
+        let mut view = view_at(1);
+        view.paste(&mut doc, "bc");
+        assert_eq!(doc.rope().to_string(), "abcd");
+        assert_eq!(view.cursor, 3);
+    }
+
+    #[test]
+    fn paste_replaces_the_selection_as_one_undo_step() {
+        let mut doc = Document::from_str("hello world");
+        let mut view = view_at(5).with_anchor(0);
+        view.paste(&mut doc, "goodbye\ncruel");
+        assert_eq!(doc.rope().to_string(), "goodbye\ncruel world");
+        assert_eq!(view.selection(), None);
+        view.set_caret(doc.undo().unwrap());
+        assert_eq!(doc.rope().to_string(), "hello world");
+        assert_eq!(view.selection(), Some(0..5)); // undo revives the selection
+        assert!(doc.undo().is_none());
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings_to_the_documents() {
+        let mut doc = Document::from_str("a\nb\n");
+        let mut view = View::default();
+        view.paste(&mut doc, "x\r\ny\rz\n");
+        assert_eq!(doc.rope().to_string(), "x\ny\nz\na\nb\n");
+
+        let mut doc = Document::from_str("a\r\nb\r\n");
+        let mut view = View::default();
+        view.paste(&mut doc, "x\ny\r");
+        assert_eq!(doc.rope().to_string(), "x\r\ny\r\na\r\nb\r\n");
+    }
+
+    #[test]
+    fn an_empty_paste_leaves_no_undo_step() {
+        let mut doc = Document::from_str("ab");
+        let mut view = view_at(1);
+        view.paste(&mut doc, "");
+        assert!(doc.undo().is_none());
     }
 
     #[test]

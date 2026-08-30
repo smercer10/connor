@@ -1,3 +1,4 @@
+mod clip;
 mod doc;
 mod draw;
 mod grapheme;
@@ -140,14 +141,47 @@ fn try_save(doc: &mut Document, notice: &mut String) -> bool {
     }
 }
 
+/// Pastes into a pending prompt's field, flattened to one line. The
+/// confirmation prompts ignore it: bracketed paste guarantees pasted text
+/// arrives as a paste rather than keystrokes, so a pasted "y" can never
+/// confirm a destructive prompt.
+fn prompt_paste(prompt: &mut Prompt, text: &str, tabs: &mut Tabs, notice: &mut String) {
+    match prompt {
+        Prompt::Search(edit) => {
+            let Tab { doc, view } = tabs.active_mut();
+            edit.paste(text, doc, view);
+            edit.render(notice);
+        }
+        Prompt::GoTo(edit) => {
+            edit.paste(text);
+            edit.render(notice);
+        }
+        Prompt::Path { edit, .. } => {
+            edit.paste(text);
+            edit.render(notice);
+        }
+        Prompt::Quit | Prompt::Close | Prompt::LossySave { .. } => {}
+    }
+}
+
 /// Feeds one keypress to a pending prompt. Returns the prompt still pending
 /// (unrecognized keys leave it up) and whether the editor should quit.
 fn prompt_key(
     prompt: Prompt,
     key: &KeyEvent,
     tabs: &mut Tabs,
+    register: &str,
     notice: &mut String,
 ) -> (Option<Prompt>, bool) {
+    // Ctrl+V pastes the register into the prompt's field; the prompts' own
+    // key handlers never see modified chords.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
+        let mut prompt = prompt;
+        if !register.is_empty() {
+            prompt_paste(&mut prompt, register, tabs, notice);
+        }
+        return (Some(prompt), false);
+    }
     // A search prompt consumes every key itself, and may move the cursor
     // and edit the document.
     if let Prompt::Search(mut edit) = prompt {
@@ -347,6 +381,24 @@ fn save_as(
     }
 }
 
+/// Forwards a fresh copy to the system clipboard via OSC 52 and says what
+/// happened; an oversized copy stays register-only.
+fn share_copy(
+    terminal: &mut Terminal,
+    register: &str,
+    in_tmux: bool,
+    notice: &mut String,
+) -> io::Result<()> {
+    match clip::osc52(register, in_tmux) {
+        Some(seq) => {
+            terminal.write_raw(&seq)?;
+            notice.push_str("copied");
+        }
+        None => notice.push_str("copied (too large for the system clipboard)"),
+    }
+    Ok(())
+}
+
 /// Closing the last tab is quitting; returns whether to quit.
 fn close_active_or_quit(tabs: &mut Tabs) -> bool {
     if tabs.count() == 1 {
@@ -377,6 +429,10 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
     };
     let mut debounce = Debounce::default();
     let mut last_click: Option<(Instant, u16, u16)> = None;
+    // The internal clipboard: keeps the full text even when a copy is too
+    // large for OSC 52, and works in terminals that ignore OSC 52 entirely.
+    let mut register = String::new();
+    let in_tmux = std::env::var_os("TMUX").is_some();
 
     loop {
         let mut follow_cursor = true;
@@ -422,7 +478,7 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                 // A pending prompt owns the key; the loop tail still runs,
                 // because prompts are allowed to move the cursor.
                 if let Some(pending) = prompt.take() {
-                    let (next, quit) = prompt_key(pending, &key, tabs, &mut notice);
+                    let (next, quit) = prompt_key(pending, &key, tabs, &register, &mut notice);
                     prompt = next;
                     if quit {
                         break;
@@ -528,6 +584,23 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                                     try_save(doc, &mut notice);
                                 }
                             }
+                            KeyCode::Char('c') if ctrl => {
+                                if let Some(text) = view.selected_text(doc) {
+                                    register = text;
+                                    share_copy(&mut terminal, &register, in_tmux, &mut notice)?;
+                                }
+                            }
+                            KeyCode::Char('x') if ctrl => {
+                                if let Some(text) = view.cut(doc) {
+                                    register = text;
+                                    share_copy(&mut terminal, &register, in_tmux, &mut notice)?;
+                                }
+                            }
+                            KeyCode::Char('v') if ctrl => {
+                                if !register.is_empty() {
+                                    view.paste(doc, &register);
+                                }
+                            }
                             KeyCode::Char('z') if ctrl => {
                                 if let Some(caret) = doc.undo() {
                                     view.set_caret(caret);
@@ -628,6 +701,15 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                 }
                 _ => {}
             },
+            Ok(AppEvent::Input(Event::Paste(text))) => {
+                if let Some(pending) = &mut prompt {
+                    prompt_paste(pending, &text, tabs, &mut notice);
+                } else {
+                    notice.clear();
+                    let Tab { doc, view } = tabs.active_mut();
+                    view.paste(doc, &text);
+                }
+            }
             Ok(AppEvent::Input(_)) => {}
         }
 

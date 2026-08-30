@@ -20,6 +20,10 @@ pub enum AppEvent {
     InputFailed(io::Error),
     /// A path inside a watched directory was touched; raw and un-debounced.
     Fs(PathBuf),
+    /// An external signal arrived; the loop decides whether to suspend,
+    /// resync, or exit.
+    #[cfg(unix)]
+    Signal(i32),
 }
 
 /// Forwards terminal input into `tx` from a dedicated thread that owns no
@@ -40,6 +44,24 @@ pub fn spawn_input_thread(tx: Sender<AppEvent>) {
             }
         }
     });
+}
+
+/// Forwards TSTP/CONT/TERM/HUP into `tx` from a dedicated thread. Like the
+/// input thread it owns no state; at quit it stays parked in the iterator,
+/// and process exit reaps it. The handlers stay installed through main's
+/// cleanup, so a repeat SIGTERM cannot interrupt the final journal flush.
+#[cfg(unix)]
+pub fn spawn_signal_thread(tx: Sender<AppEvent>) -> io::Result<()> {
+    use signal_hook::consts::{SIGCONT, SIGHUP, SIGTERM, SIGTSTP};
+    let mut signals = signal_hook::iterator::Signals::new([SIGTSTP, SIGCONT, SIGTERM, SIGHUP])?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            if tx.send(AppEvent::Signal(sig)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(())
 }
 
 /// One save fires a burst of events within milliseconds; this coalesces

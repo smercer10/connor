@@ -2,6 +2,7 @@ mod doc;
 mod draw;
 mod grapheme;
 mod screen;
+mod tabs;
 mod term;
 mod view;
 
@@ -14,29 +15,29 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use doc::Document;
 use screen::Screen;
+use tabs::{Tab, Tabs};
 use term::Terminal;
-use view::View;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
     let _ = args.next();
-    let path = args.next().map(PathBuf::from);
-    if args.next().is_some() {
-        eprintln!("usage: connor [FILE]");
-        return ExitCode::FAILURE;
-    }
     // Open before touching the terminal so errors print on the normal screen.
-    let mut doc = match path {
-        Some(path) => match Document::open(path.clone()) {
-            Ok(doc) => doc,
+    let mut docs = Vec::new();
+    for arg in args {
+        let path = PathBuf::from(arg);
+        match Document::open(path.clone()) {
+            Ok(doc) => docs.push(doc),
             Err(e) => {
                 eprintln!("connor: {}: {e}", path.display());
                 return ExitCode::FAILURE;
             }
-        },
-        None => Document::empty(),
-    };
-    match run(&mut doc) {
+        }
+    }
+    if docs.is_empty() {
+        docs.push(Document::empty());
+    }
+    let mut tabs = Tabs::new(docs);
+    match run(&mut tabs) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("connor: {e}");
@@ -118,19 +119,19 @@ fn prompt_key(
     }
 }
 
-fn run(doc: &mut Document) -> io::Result<()> {
+fn run(tabs: &mut Tabs) -> io::Result<()> {
     term::init_panic_hook();
     let mut terminal = Terminal::new()?;
     let (width, height) = terminal.size();
     let mut back = Screen::new(width, height);
-    let mut view = View::default();
     let mut scratch = String::new();
     let mut notice = String::new();
     let mut prompt: Option<Prompt> = None;
 
     loop {
+        let Tab { doc, view } = tabs.active_mut();
         back.clear();
-        let cursor = draw::draw(&mut back, doc, &view, &mut scratch, &notice);
+        let cursor = draw::draw(&mut back, doc, view, &mut scratch, &notice);
         terminal.present(&back, cursor)?;
 
         // Page movement wants the text area as it was when the key arrived.

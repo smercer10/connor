@@ -145,6 +145,15 @@ impl Terminal {
         Ok(())
     }
 
+    /// Writes a standalone escape sequence (e.g. an OSC 52 clipboard set)
+    /// straight to the terminal, outside the frame diff. It touches no
+    /// cells, so the front buffer stays valid.
+    pub fn write_raw(&mut self, seq: &str) -> io::Result<()> {
+        let mut out = io::stdout().lock();
+        out.write_all(seq.as_bytes())?;
+        out.flush()
+    }
+
     fn enter(&mut self) -> io::Result<()> {
         // Mark active before touching the terminal so a partial entry (raw
         // mode on, alternate screen failed) is still restored by Drop.

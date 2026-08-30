@@ -1,3 +1,4 @@
+mod clip;
 mod doc;
 mod draw;
 mod grapheme;
@@ -347,6 +348,24 @@ fn save_as(
     }
 }
 
+/// Forwards a fresh copy to the system clipboard via OSC 52 and says what
+/// happened; an oversized copy stays register-only.
+fn share_copy(
+    terminal: &mut Terminal,
+    register: &str,
+    in_tmux: bool,
+    notice: &mut String,
+) -> io::Result<()> {
+    match clip::osc52(register, in_tmux) {
+        Some(seq) => {
+            terminal.write_raw(&seq)?;
+            notice.push_str("copied");
+        }
+        None => notice.push_str("copied (too large for the system clipboard)"),
+    }
+    Ok(())
+}
+
 /// Closing the last tab is quitting; returns whether to quit.
 fn close_active_or_quit(tabs: &mut Tabs) -> bool {
     if tabs.count() == 1 {
@@ -377,6 +396,10 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
     };
     let mut debounce = Debounce::default();
     let mut last_click: Option<(Instant, u16, u16)> = None;
+    // The internal clipboard: keeps the full text even when a copy is too
+    // large for OSC 52, and works in terminals that ignore OSC 52 entirely.
+    let mut register = String::new();
+    let in_tmux = std::env::var_os("TMUX").is_some();
 
     loop {
         let mut follow_cursor = true;
@@ -526,6 +549,23 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                                     );
                                 } else {
                                     try_save(doc, &mut notice);
+                                }
+                            }
+                            KeyCode::Char('c') if ctrl => {
+                                if let Some(text) = view.selected_text(doc) {
+                                    register = text;
+                                    share_copy(&mut terminal, &register, in_tmux, &mut notice)?;
+                                }
+                            }
+                            KeyCode::Char('x') if ctrl => {
+                                if let Some(text) = view.cut(doc) {
+                                    register = text;
+                                    share_copy(&mut terminal, &register, in_tmux, &mut notice)?;
+                                }
+                            }
+                            KeyCode::Char('v') if ctrl => {
+                                if !register.is_empty() {
+                                    view.paste(doc, &register);
                                 }
                             }
                             KeyCode::Char('z') if ctrl => {

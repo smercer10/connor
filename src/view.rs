@@ -358,6 +358,21 @@ impl View {
         self.apply_edit(doc, range, &text, EditKind::Other);
     }
 
+    /// The selected text, left selected; `None` without a selection.
+    pub fn selected_text(&self, doc: &Document) -> Option<String> {
+        self.selection()
+            .map(|range| doc.rope().slice(range).to_string())
+    }
+
+    /// Removes and returns the selected text as one undo step; `None`
+    /// (and no edit) without a selection.
+    pub fn cut(&mut self, doc: &mut Document) -> Option<String> {
+        let range = self.selection()?;
+        let text = doc.rope().slice(range.clone()).to_string();
+        self.apply_edit(doc, range, "", EditKind::Other);
+        Some(text)
+    }
+
     /// Inserts pasted text over the selection (or at the cursor) as one
     /// edit, so any paste is a single undo step. Terminators are normalized
     /// first: terminals send `\r` for line breaks in a bracketed paste, and
@@ -827,6 +842,38 @@ mod tests {
         view.set_caret(doc.redo().unwrap());
         assert_eq!(doc.rope().to_string(), "hi!");
         assert_eq!(view.cursor, 3);
+    }
+
+    #[test]
+    fn selected_text_reads_the_selection_and_leaves_it_standing() {
+        let doc = Document::from_str("hello world");
+        let mut view = view_at(5).with_anchor(0);
+        assert_eq!(view.selected_text(&doc).as_deref(), Some("hello"));
+        assert_eq!(view.selection(), Some(0..5));
+        view.anchor = None;
+        assert_eq!(view.selected_text(&doc), None);
+    }
+
+    #[test]
+    fn cut_removes_the_selection_as_one_undo_step() {
+        let mut doc = Document::from_str("hello world");
+        let mut view = view_at(0).with_anchor(5);
+        assert_eq!(view.cut(&mut doc).as_deref(), Some("hello"));
+        assert_eq!(doc.rope().to_string(), " world");
+        assert_eq!(view.cursor, 0);
+        view.set_caret(doc.undo().unwrap());
+        assert_eq!(doc.rope().to_string(), "hello world");
+        assert_eq!(view.selection(), Some(0..5));
+        assert!(doc.undo().is_none());
+    }
+
+    #[test]
+    fn cut_without_a_selection_does_nothing() {
+        let mut doc = Document::from_str("ab");
+        let mut view = view_at(1);
+        assert_eq!(view.cut(&mut doc), None);
+        assert_eq!(doc.rope().to_string(), "ab");
+        assert!(doc.undo().is_none());
     }
 
     #[test]

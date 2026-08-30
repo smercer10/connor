@@ -177,14 +177,8 @@ const NAME_COLS: usize = 20;
 fn draw_tab_bar(screen: &mut Screen, tabs: &Tabs, scratch: &mut String, width: usize) {
     let all = tabs.all();
     let active = tabs.active_index();
-    let mut first = active;
-    let mut used = label_width(&all[active]);
-    while first > 0 && used + label_width(&all[first - 1]) <= width {
-        first -= 1;
-        used += label_width(&all[first]);
-    }
     let mut x = 0;
-    for (i, tab) in all.iter().enumerate().skip(first) {
+    for (i, tab) in all.iter().enumerate().skip(first_shown(tabs, width)) {
         scratch.clear();
         scratch.push(' ');
         push_shown_name(&tab.doc.name(), scratch);
@@ -207,6 +201,36 @@ fn draw_tab_bar(screen: &mut Screen, tabs: &Tabs, scratch: &mut String, width: u
             break;
         }
     }
+}
+
+/// The leftmost tab the bar shows: labels scroll off the left until the
+/// active one fits fully on screen.
+fn first_shown(tabs: &Tabs, width: usize) -> usize {
+    let all = tabs.all();
+    let mut first = tabs.active_index();
+    let mut used = label_width(&all[first]);
+    while first > 0 && used + label_width(&all[first - 1]) <= width {
+        first -= 1;
+        used += label_width(&all[first]);
+    }
+    first
+}
+
+/// The tab whose label covers column `x` of the bar as drawn, if any.
+pub fn tab_at(tabs: &Tabs, width: usize, x: u16) -> Option<usize> {
+    let all = tabs.all();
+    let mut left = 0;
+    for (i, tab) in all.iter().enumerate().skip(first_shown(tabs, width)) {
+        let right = left + label_width(tab);
+        if (left..right).contains(&usize::from(x)) {
+            return Some(i);
+        }
+        left = right;
+        if left >= width {
+            break;
+        }
+    }
+    None
 }
 
 /// The screen columns one tab's label occupies: padding, the shown name,
@@ -469,6 +493,32 @@ mod tests {
         let (screen, _) = render_tabs(&tabs, 15, 3);
         assert_eq!(row(&screen, 0), " bb.rs  cc.rs  ");
         assert_eq!(sel_row(&screen, 0), "       ####### ");
+    }
+
+    #[test]
+    fn tab_at_maps_label_spans_and_misses_the_gap() {
+        let tabs = Tabs::new(vec![named("a.rs", ""), dirtied(named("b.rs", ""))]);
+        // Drawn as " a.rs  b.rs+    ": labels span 0..6 and 6..13.
+        assert_eq!(tab_at(&tabs, 16, 0), Some(0));
+        assert_eq!(tab_at(&tabs, 16, 5), Some(0));
+        assert_eq!(tab_at(&tabs, 16, 6), Some(1));
+        assert_eq!(tab_at(&tabs, 16, 12), Some(1));
+        assert_eq!(tab_at(&tabs, 16, 13), None);
+    }
+
+    #[test]
+    fn tab_at_matches_an_overflowed_bar() {
+        let mut tabs = Tabs::new(vec![
+            named("aa.rs", ""),
+            named("bb.rs", ""),
+            named("cc.rs", ""),
+        ]);
+        tabs.activate(2);
+        // Drawn as " bb.rs  cc.rs  ": aa.rs scrolled off the left.
+        assert_eq!(tab_at(&tabs, 15, 0), Some(1));
+        assert_eq!(tab_at(&tabs, 15, 7), Some(2));
+        assert_eq!(tab_at(&tabs, 15, 13), Some(2));
+        assert_eq!(tab_at(&tabs, 15, 14), None);
     }
 
     /// The reverse-video flags of a row: `#` where set, space where not.

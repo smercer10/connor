@@ -153,6 +153,11 @@ fn prompt_key(
                 notice.clear();
                 (None, false)
             }
+            search::Outcome::ReplacedAll(n) => {
+                notice.clear();
+                let _ = write!(notice, "replaced {n}");
+                (None, false)
+            }
         };
     }
     // A go-to-line prompt consumes every key itself.

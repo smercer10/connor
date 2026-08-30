@@ -1,16 +1,18 @@
-//! Incremental smart-case search, driven from the status-line prompt.
-//! Owns the query, the match set, and the caret to restore on cancel.
+//! Incremental smart-case search and replace, driven from the status-line
+//! prompt. Owns the query, the match set, and the caret to restore on
+//! cancel.
 
 use std::fmt::Write as _;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ropey::Rope;
 
-use crate::doc::{Caret, Document};
+use crate::doc::{Caret, Document, EditKind};
 use crate::grapheme;
 use crate::view::View;
 
 const FIND_LABEL: &str = "find: ";
+const REPLACE_LABEL: &str = "replace with: ";
 
 pub enum Outcome {
     Pending,
@@ -18,6 +20,14 @@ pub enum Outcome {
     Accept,
     /// Esc: close, the origin caret and scroll are restored.
     Cancel,
+    /// Alt+A replaced this many matches: close, report the count.
+    ReplacedAll(usize),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    Find,
+    Replace,
 }
 
 /// Borrowed view of the match set for the draw pass.
@@ -32,6 +42,9 @@ pub struct Highlights<'a> {
 
 pub struct SearchPrompt {
     query: String,
+    replacement: String,
+    /// Which field Tab has the keys editing.
+    focus: Focus,
     /// Where the search began: what Esc restores, and where query edits
     /// re-anchor from — so shrinking the query jumps back naturally.
     origin: Caret,
@@ -50,6 +63,8 @@ impl SearchPrompt {
     pub fn new(view: &View) -> SearchPrompt {
         SearchPrompt {
             query: String::new(),
+            replacement: String::new(),
+            focus: Focus::Find,
             origin: Caret {
                 cursor: view.cursor,
                 anchor: view.anchor,
@@ -61,19 +76,39 @@ impl SearchPrompt {
         }
     }
 
-    /// Feeds one keypress; navigation and cancel move the view. Unrecognized
-    /// keys are ignored so a stray chord can't dismiss the prompt.
+    /// Feeds one keypress; navigation and cancel move the view, the replace
+    /// keys edit the document. Unrecognized keys are ignored so a stray
+    /// chord can't dismiss the prompt.
     pub fn key(&mut self, key: &KeyEvent, doc: &mut Document, view: &mut View) -> Outcome {
         match key.code {
-            KeyCode::Enter => return Outcome::Accept,
+            KeyCode::Enter => match self.focus {
+                Focus::Find => return Outcome::Accept,
+                Focus::Replace => self.replace_one(doc, view),
+            },
             KeyCode::Esc => {
                 self.restore_origin(doc, view);
                 return Outcome::Cancel;
             }
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Focus::Find => Focus::Replace,
+                    Focus::Replace => Focus::Find,
+                };
+            }
             KeyCode::Up => self.step(doc, view, self.matches.len().wrapping_sub(1)),
             KeyCode::Down => self.step(doc, view, 1),
+            KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::ALT) => {
+                let n = self.replace_all(doc, view);
+                if n > 0 {
+                    return Outcome::ReplacedAll(n);
+                }
+            }
             KeyCode::Backspace => {
-                if self.query.pop().is_some() {
+                let field = match self.focus {
+                    Focus::Find => &mut self.query,
+                    Focus::Replace => &mut self.replacement,
+                };
+                if field.pop().is_some() && self.focus == Focus::Find {
                     self.research(doc, view);
                 }
             }
@@ -83,31 +118,51 @@ impl SearchPrompt {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.query.push(ch);
-                self.research(doc, view);
+                match self.focus {
+                    Focus::Find => {
+                        self.query.push(ch);
+                        self.research(doc, view);
+                    }
+                    Focus::Replace => self.replacement.push(ch),
+                }
             }
             _ => {}
         }
         Outcome::Pending
     }
 
-    /// Writes the prompt, the match counter, and the key hints.
+    /// Writes the focused field, the match counter, and the key hints.
     pub fn render(&self, notice: &mut String) {
         notice.clear();
-        notice.push_str(FIND_LABEL);
-        notice.push_str(&self.query);
+        match self.focus {
+            Focus::Find => {
+                notice.push_str(FIND_LABEL);
+                notice.push_str(&self.query);
+            }
+            Focus::Replace => {
+                notice.push_str(REPLACE_LABEL);
+                notice.push_str(&self.replacement);
+            }
+        }
         if let Some(i) = self.current {
             let _ = write!(notice, " · {}/{}", i + 1, self.matches.len());
         } else if !self.query.is_empty() {
             notice.push_str(" · no matches");
         }
-        notice.push_str(" · ↑↓ next/prev · esc");
+        notice.push_str(match self.focus {
+            Focus::Find => " · ↑↓ next/prev · tab replace · esc",
+            Focus::Replace => " · enter one · alt+a all · tab find · esc",
+        });
     }
 
     /// Chars of the rendered notice before the caret: the label plus the
-    /// query, with the counter and hints trailing after.
+    /// focused field, with the counter and hints trailing after.
     pub fn caret_chars(&self) -> usize {
-        FIND_LABEL.chars().count() + self.query.chars().count()
+        let (label, field) = match self.focus {
+            Focus::Find => (FIND_LABEL, &self.query),
+            Focus::Replace => (REPLACE_LABEL, &self.replacement),
+        };
+        label.chars().count() + field.chars().count()
     }
 
     pub fn highlights(&self) -> Highlights<'_> {
@@ -149,6 +204,73 @@ impl SearchPrompt {
         };
         self.current = Some((i + delta) % self.matches.len());
         self.goto_current(doc, view);
+    }
+
+    /// Replaces the current match (its own undo step) and advances to the
+    /// first match at or after the inserted text's end — so a replacement
+    /// containing the query can't revisit itself — wrapping past the last.
+    fn replace_one(&mut self, doc: &mut Document, view: &mut View) {
+        let Some(i) = self.current else {
+            return;
+        };
+        let start = self.matches[i];
+        let caret = Caret {
+            cursor: view.cursor,
+            anchor: view.anchor,
+        };
+        let after = doc.edit(
+            start..start + self.qlen,
+            &self.replacement,
+            caret,
+            EditKind::Other,
+        );
+        view.set_caret(Caret {
+            cursor: after,
+            anchor: None,
+        });
+        find_matches(doc.rope(), &self.query, &mut self.matches);
+        if self.matches.is_empty() {
+            self.current = None;
+            return;
+        }
+        self.current = Some(self.matches.partition_point(|&s| s < after) % self.matches.len());
+        self.goto_current(doc, view);
+    }
+
+    /// Replaces every match with one `edit` spanning first to last — one
+    /// undo step, no per-match history — and returns the count. The cursor
+    /// lands where the current match was, remapped through the edit.
+    fn replace_all(&mut self, doc: &mut Document, view: &mut View) -> usize {
+        let n = self.matches.len();
+        if n == 0 {
+            return 0;
+        }
+        let rlen = self.replacement.chars().count();
+        let first = self.matches[0];
+        let last_end = self.matches[n - 1] + self.qlen;
+        let mut text = String::new();
+        let mut from = first;
+        for &s in &self.matches {
+            text.extend(doc.rope().slice(from..s).chars());
+            text.push_str(&self.replacement);
+            from = s + self.qlen;
+        }
+        let caret = Caret {
+            cursor: view.cursor,
+            anchor: view.anchor,
+        };
+        doc.edit(first..last_end, &text, caret, EditKind::Other);
+        // Non-overlapping ascending matches make matches[k] ≥ k·qlen, so
+        // the remap can't underflow.
+        let k = self.current.unwrap_or(0);
+        let target = self.matches[k] - k * self.qlen + k * rlen;
+        view.set_caret(Caret {
+            cursor: grapheme::snap_to_boundary(doc.rope().slice(..), target),
+            anchor: None,
+        });
+        self.matches.clear();
+        self.current = None;
+        n
     }
 
     fn goto_current(&self, doc: &Document, view: &mut View) {
@@ -326,7 +448,10 @@ mod tests {
         assert_eq!(view.cursor, 3); // "abz" misses: no jump anywhere
         let mut notice = String::new();
         prompt.render(&mut notice);
-        assert_eq!(notice, "find: abz · no matches · ↑↓ next/prev · esc");
+        assert_eq!(
+            notice,
+            "find: abz · no matches · ↑↓ next/prev · tab replace · esc"
+        );
     }
 
     #[test]
@@ -363,11 +488,11 @@ mod tests {
         let mut prompt = SearchPrompt::new(&view);
         let mut notice = String::new();
         prompt.render(&mut notice);
-        assert_eq!(notice, "find:  · ↑↓ next/prev · esc");
+        assert_eq!(notice, "find:  · ↑↓ next/prev · tab replace · esc");
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         prompt.key(&press(KeyCode::Down), &mut doc, &mut view);
         prompt.render(&mut notice);
-        assert_eq!(notice, "find: ab · 2/3 · ↑↓ next/prev · esc");
+        assert_eq!(notice, "find: ab · 2/3 · ↑↓ next/prev · tab replace · esc");
         assert_eq!(prompt.caret_chars(), 8);
     }
 
@@ -386,6 +511,145 @@ mod tests {
         assert_eq!(prompt.matches, vec![0, 6, 9]);
         assert_eq!(prompt.current, Some(1)); // first match at/after cursor 4
         assert_eq!(view.cursor, 4);
+    }
+
+    fn alt(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn tab_routes_typing_to_the_replace_field_and_back() {
+        let mut doc = Document::from_str("ab ab");
+        let mut view = View::test_at(0, 0, 0);
+        let mut prompt = SearchPrompt::new(&view);
+        type_query(&mut prompt, &mut doc, &mut view, "ab");
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        type_query(&mut prompt, &mut doc, &mut view, "xy");
+        assert_eq!(prompt.query, "ab");
+        assert_eq!(prompt.replacement, "xy");
+        let mut notice = String::new();
+        prompt.render(&mut notice);
+        assert_eq!(
+            notice,
+            "replace with: xy · 1/2 · enter one · alt+a all · tab find · esc"
+        );
+        assert_eq!(prompt.caret_chars(), 16);
+
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        type_query(&mut prompt, &mut doc, &mut view, "c");
+        assert_eq!(prompt.query, "abc");
+        assert_eq!(prompt.replacement, "xy");
+    }
+
+    #[test]
+    fn replace_one_replaces_advances_and_wraps() {
+        let mut doc = Document::from_str("ab cd ab ab");
+        let mut view = View::test_at(0, 0, 0);
+        let mut prompt = SearchPrompt::new(&view);
+        type_query(&mut prompt, &mut doc, &mut view, "ab");
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        type_query(&mut prompt, &mut doc, &mut view, "xyz");
+
+        prompt.key(&press(KeyCode::Enter), &mut doc, &mut view);
+        assert_eq!(doc.rope().to_string(), "xyz cd ab ab");
+        assert_eq!(view.cursor, 7); // advanced to the next match
+
+        // Skip to the last match, replace it: the advance wraps around.
+        prompt.key(&press(KeyCode::Up), &mut doc, &mut view);
+        prompt.key(&press(KeyCode::Enter), &mut doc, &mut view);
+        assert_eq!(doc.rope().to_string(), "xyz cd ab xyz");
+        assert_eq!(view.cursor, 7);
+
+        // Each replace is its own undo step.
+        assert!(doc.undo().is_some());
+        assert_eq!(doc.rope().to_string(), "xyz cd ab ab");
+        assert!(doc.undo().is_some());
+        assert_eq!(doc.rope().to_string(), "ab cd ab ab");
+    }
+
+    #[test]
+    fn replacing_the_last_match_reports_no_matches_and_stays_open() {
+        let mut doc = Document::from_str("ab");
+        let mut view = View::test_at(0, 0, 0);
+        let mut prompt = SearchPrompt::new(&view);
+        type_query(&mut prompt, &mut doc, &mut view, "ab");
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        // An empty replacement deletes.
+        assert!(matches!(
+            prompt.key(&press(KeyCode::Enter), &mut doc, &mut view),
+            Outcome::Pending
+        ));
+        assert_eq!(doc.rope().to_string(), "");
+        let mut notice = String::new();
+        prompt.render(&mut notice);
+        assert_eq!(
+            notice,
+            "replace with:  · no matches · enter one · alt+a all · tab find · esc"
+        );
+    }
+
+    #[test]
+    fn a_replacement_containing_the_query_cannot_loop() {
+        let mut doc = Document::from_str("a b");
+        let mut view = View::test_at(0, 0, 0);
+        let mut prompt = SearchPrompt::new(&view);
+        type_query(&mut prompt, &mut doc, &mut view, "a");
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        type_query(&mut prompt, &mut doc, &mut view, "aa");
+        prompt.key(&press(KeyCode::Enter), &mut doc, &mut view);
+        assert_eq!(doc.rope().to_string(), "aa b");
+        // The freshly inserted "aa" is behind the advance point: current
+        // wrapped back to it rather than running away forward.
+        assert_eq!(view.cursor, 0);
+        prompt.key(&press(KeyCode::Enter), &mut doc, &mut view);
+        assert_eq!(doc.rope().to_string(), "aaa b");
+    }
+
+    #[test]
+    fn replace_all_is_one_undo_step_and_reports_the_count() {
+        let mut doc = Document::from_str("ab x ab y ab");
+        let mut view = View::test_at(0, 0, 0);
+        let mut prompt = SearchPrompt::new(&view);
+        type_query(&mut prompt, &mut doc, &mut view, "ab");
+        prompt.key(&press(KeyCode::Down), &mut doc, &mut view); // current: 2nd
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        type_query(&mut prompt, &mut doc, &mut view, "long");
+        assert!(matches!(
+            prompt.key(&alt('a'), &mut doc, &mut view),
+            Outcome::ReplacedAll(3)
+        ));
+        assert_eq!(doc.rope().to_string(), "long x long y long");
+        assert_eq!(view.cursor, 7); // where the current match was, remapped
+
+        assert!(doc.undo().is_some());
+        assert_eq!(doc.rope().to_string(), "ab x ab y ab");
+        assert!(doc.undo().is_none()); // one step reverted everything
+    }
+
+    #[test]
+    fn replace_all_with_no_matches_is_a_quiet_no_op() {
+        let mut doc = Document::from_str("cd");
+        let mut view = View::test_at(1, 0, 0);
+        let mut prompt = SearchPrompt::new(&view);
+        type_query(&mut prompt, &mut doc, &mut view, "ab");
+        assert!(matches!(
+            prompt.key(&alt('a'), &mut doc, &mut view),
+            Outcome::Pending
+        ));
+        assert_eq!(doc.rope().to_string(), "cd");
+        assert_eq!(view.cursor, 1);
+    }
+
+    #[test]
+    fn esc_after_replacements_clamps_the_restored_caret() {
+        let mut doc = Document::from_str("xx ab");
+        let mut view = View::test_at(5, 0, 0); // at the document's end
+        let mut prompt = SearchPrompt::new(&view);
+        type_query(&mut prompt, &mut doc, &mut view, "ab");
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        prompt.key(&press(KeyCode::Enter), &mut doc, &mut view); // delete "ab"
+        prompt.key(&press(KeyCode::Esc), &mut doc, &mut view);
+        assert_eq!(view.cursor, 3); // origin 5 clamped into the shorter doc
     }
 
     #[test]

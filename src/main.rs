@@ -3,6 +3,7 @@ mod draw;
 mod grapheme;
 mod prompt;
 mod screen;
+mod search;
 mod tabs;
 mod term;
 mod view;
@@ -20,6 +21,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use doc::{Caret, DiskCheck, Document};
 use prompt::{LinePrompt, Outcome, PathPrompt};
 use screen::Screen;
+use search::SearchPrompt;
 use tabs::{Tab, Tabs};
 use term::Terminal;
 use watch::{AppEvent, Debounce, DirWatcher};
@@ -82,6 +84,8 @@ enum Prompt {
     },
     /// Ctrl+G: a line number being typed.
     GoTo(LinePrompt),
+    /// Ctrl+F: incremental search.
+    Search(SearchPrompt),
 }
 
 fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
@@ -102,6 +106,7 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
         }
         Prompt::Path { edit, .. } => edit.render(notice),
         Prompt::GoTo(edit) => edit.render(notice),
+        Prompt::Search(edit) => edit.render(notice),
     }
     Some(prompt)
 }
@@ -135,6 +140,21 @@ fn prompt_key(
     tabs: &mut Tabs,
     notice: &mut String,
 ) -> (Option<Prompt>, bool) {
+    // A search prompt consumes every key itself, and may move the cursor
+    // and edit the document.
+    if let Prompt::Search(mut edit) = prompt {
+        let Tab { doc, view } = tabs.active_mut();
+        return match edit.key(key, doc, view) {
+            search::Outcome::Pending => {
+                edit.render(notice);
+                (Some(Prompt::Search(edit)), false)
+            }
+            search::Outcome::Accept | search::Outcome::Cancel => {
+                notice.clear();
+                (None, false)
+            }
+        };
+    }
     // A go-to-line prompt consumes every key itself.
     if let Prompt::GoTo(mut edit) = prompt {
         return match edit.key(key) {
@@ -346,8 +366,11 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
 
     loop {
         back.clear();
-        let status_caret = matches!(prompt, Some(Prompt::Path { .. } | Prompt::GoTo(_)))
-            .then(|| notice.chars().count());
+        let status_caret = match &prompt {
+            Some(Prompt::Path { .. } | Prompt::GoTo(_)) => Some(notice.chars().count()),
+            Some(Prompt::Search(edit)) => Some(edit.caret_chars()),
+            _ => None,
+        };
         let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret);
         terminal.present(&back, cursor)?;
 
@@ -361,7 +384,16 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
             Some(t) => rx.recv_timeout(t.saturating_duration_since(Instant::now())),
         };
         match received {
-            Err(mpsc::RecvTimeoutError::Timeout) => reload_changed(tabs, &mut debounce),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                reload_changed(tabs, &mut debounce);
+                // A reload may have shifted or removed matches; a stale set
+                // must never reach navigation or a replace.
+                if let Some(Prompt::Search(edit)) = &mut prompt {
+                    let Tab { doc, view } = tabs.active_mut();
+                    edit.refresh(doc, view);
+                    edit.render(&mut notice);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other("event channel closed"));
             }
@@ -414,6 +446,15 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                             &tabs.active_mut().doc,
                             &mut notice,
                         );
+                    } else if ctrl && key.code == KeyCode::Char('f') {
+                        let Tab { doc, view } = tabs.active_mut();
+                        doc.break_undo_group();
+                        let edit = SearchPrompt::new(view);
+                        // The current match renders in reverse video, which
+                        // must not fight a reverse-video selection; the
+                        // origin keeps the anchor for Esc to restore.
+                        view.anchor = None;
+                        prompt = open_prompt(Prompt::Search(edit), doc, &mut notice);
                     } else if ctrl && key.code == KeyCode::Char('g') {
                         prompt = open_prompt(
                             Prompt::GoTo(LinePrompt::new()),

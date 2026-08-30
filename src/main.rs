@@ -1,6 +1,7 @@
 mod doc;
 mod draw;
 mod grapheme;
+mod prompt;
 mod screen;
 mod tabs;
 mod term;
@@ -11,9 +12,10 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use doc::Document;
+use prompt::{Outcome, PathPrompt};
 use screen::Screen;
 use tabs::{Tab, Tabs};
 use term::Terminal;
@@ -54,6 +56,12 @@ enum AfterSave {
     Close,
 }
 
+/// What a path typed into the prompt is for.
+enum PathAction {
+    Open,
+    SaveAs { then: AfterSave },
+}
+
 /// A mini-prompt owning the next keypress; its question sits in the notice.
 enum Prompt {
     /// Ctrl+Q with unsaved changes in any tab: save all / discard / cancel.
@@ -63,11 +71,16 @@ enum Prompt {
     /// The file loaded lossily, so writing it back mangles the bytes the
     /// U+FFFD marks stand for — overwriting must be deliberate.
     LossySave { then: AfterSave },
+    /// A path being typed, for opening a file or naming a buffer.
+    Path {
+        edit: PathPrompt,
+        action: PathAction,
+    },
 }
 
 fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
     notice.clear();
-    match prompt {
+    match &prompt {
         Prompt::Quit => {
             notice.push_str("unsaved changes — save before quitting? (y)es · (n)o · (esc) cancel");
         }
@@ -81,8 +94,16 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
                 doc.name()
             );
         }
+        Prompt::Path { edit, .. } => edit.render(notice),
     }
     Some(prompt)
+}
+
+fn save_as_prompt(then: AfterSave) -> Prompt {
+    Prompt::Path {
+        edit: PathPrompt::new("save as: "),
+        action: PathAction::SaveAs { then },
+    }
 }
 
 fn try_save(doc: &mut Document, notice: &mut String) -> bool {
@@ -103,16 +124,48 @@ fn try_save(doc: &mut Document, notice: &mut String) -> bool {
 /// (unrecognized keys leave it up) and whether the editor should quit.
 fn prompt_key(
     prompt: Prompt,
-    key: KeyCode,
+    key: &KeyEvent,
     tabs: &mut Tabs,
     notice: &mut String,
 ) -> (Option<Prompt>, bool) {
-    match (prompt, key) {
+    // A path prompt consumes every key itself.
+    if let Prompt::Path { mut edit, action } = prompt {
+        return match edit.key(key) {
+            Outcome::Pending => {
+                edit.render(notice);
+                (Some(Prompt::Path { edit, action }), false)
+            }
+            Outcome::Cancel => {
+                notice.clear();
+                (None, false)
+            }
+            Outcome::Submit => {
+                notice.clear();
+                let path = edit.into_path();
+                if path.as_os_str().is_empty() {
+                    return (None, false);
+                }
+                match action {
+                    PathAction::Open => {
+                        open_path(tabs, path, notice);
+                        (None, false)
+                    }
+                    PathAction::SaveAs { then } => save_as(tabs, path, then, notice),
+                }
+            }
+        };
+    }
+    match (prompt, key.code) {
         (Prompt::Quit, KeyCode::Char('y' | 'Y')) => quit_saving(tabs, notice),
         (Prompt::Quit, KeyCode::Char('n' | 'N')) => (None, true),
         (Prompt::Close, KeyCode::Char('y' | 'Y')) => {
             let doc = &mut tabs.active_mut().doc;
-            if doc.lossy() {
+            if doc.path().is_none() {
+                (
+                    open_prompt(save_as_prompt(AfterSave::Close), doc, notice),
+                    false,
+                )
+            } else if doc.lossy() {
                 (
                     open_prompt(
                         Prompt::LossySave {
@@ -160,6 +213,17 @@ fn quit_saving(tabs: &mut Tabs, notice: &mut String) -> (Option<Prompt>, bool) {
         if !doc.dirty() {
             continue;
         }
+        if doc.path().is_none() {
+            tabs.activate(i);
+            return (
+                open_prompt(
+                    save_as_prompt(AfterSave::Quit),
+                    &tabs.active_mut().doc,
+                    notice,
+                ),
+                false,
+            );
+        }
         if doc.lossy() {
             tabs.activate(i);
             return (
@@ -179,6 +243,45 @@ fn quit_saving(tabs: &mut Tabs, notice: &mut String) -> (Option<Prompt>, bool) {
         }
     }
     (None, true)
+}
+
+/// Opens `path` in a new tab — or, if a tab already holds it, activates
+/// that tab instead of opening the file twice.
+fn open_path(tabs: &mut Tabs, path: PathBuf, notice: &mut String) {
+    if let Some(index) = tabs.find_by_path(&path) {
+        tabs.activate(index);
+        return;
+    }
+    match Document::open(path) {
+        Ok(doc) => {
+            tabs.active_mut().doc.break_undo_group();
+            tabs.push(doc);
+        }
+        Err(e) => {
+            let _ = write!(notice, "open failed: {e}");
+        }
+    }
+}
+
+/// Names the buffer and saves it there, then carries on with whatever the
+/// save was clearing the way for.
+fn save_as(
+    tabs: &mut Tabs,
+    path: PathBuf,
+    then: AfterSave,
+    notice: &mut String,
+) -> (Option<Prompt>, bool) {
+    let doc = &mut tabs.active_mut().doc;
+    doc.set_path(path);
+    if !try_save(doc, notice) {
+        // The name sticks, so a plain Ctrl+S can retry the same target.
+        return (None, false);
+    }
+    match then {
+        AfterSave::Stay => (None, false),
+        AfterSave::Quit => quit_saving(tabs, notice),
+        AfterSave::Close => (None, close_active_or_quit(tabs)),
+    }
 }
 
 /// Closing the last tab is quitting; returns whether to quit.
@@ -201,7 +304,8 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
 
     loop {
         back.clear();
-        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice);
+        let caret_in_status = matches!(prompt, Some(Prompt::Path { .. }));
+        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, caret_in_status);
         terminal.present(&back, cursor)?;
 
         // Page movement wants the text area as it was when the key arrived.
@@ -210,7 +314,7 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if let Some(pending) = prompt.take() {
-                    let (next, quit) = prompt_key(pending, key.code, tabs, &mut notice);
+                    let (next, quit) = prompt_key(pending, &key, tabs, &mut notice);
                     prompt = next;
                     if quit {
                         break;
@@ -245,6 +349,15 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                 } else if ctrl && key.code == KeyCode::Char('n') {
                     tabs.active_mut().doc.break_undo_group();
                     tabs.push(Document::empty());
+                } else if ctrl && key.code == KeyCode::Char('o') {
+                    prompt = open_prompt(
+                        Prompt::Path {
+                            edit: PathPrompt::new("open: "),
+                            action: PathAction::Open,
+                        },
+                        &tabs.active_mut().doc,
+                        &mut notice,
+                    );
                 } else if ctrl && key.code == KeyCode::Char('w') {
                     if tabs.active_mut().doc.dirty() {
                         prompt = open_prompt(Prompt::Close, &tabs.active_mut().doc, &mut notice);
@@ -272,7 +385,10 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                     }
                     match key.code {
                         KeyCode::Char('s') if ctrl => {
-                            if doc.lossy() {
+                            if doc.path().is_none() {
+                                prompt =
+                                    open_prompt(save_as_prompt(AfterSave::Stay), doc, &mut notice);
+                            } else if doc.lossy() {
                                 prompt = open_prompt(
                                     Prompt::LossySave {
                                         then: AfterSave::Stay,

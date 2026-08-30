@@ -1,6 +1,9 @@
 //! The open files: each tab pairs a document with its view, exactly one
 //! active at a time.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use crate::doc::Document;
 use crate::view::View;
 
@@ -93,6 +96,20 @@ impl Tabs {
     pub fn any_dirty(&self) -> bool {
         self.tabs.iter().any(|tab| tab.doc.dirty())
     }
+
+    /// Finds the tab holding `path`. Paths compare canonically where they
+    /// resolve, so `./x` and `x` meet; one that doesn't exist yet falls
+    /// back to lexical equality.
+    pub fn find_by_path(&self, path: &Path) -> Option<usize> {
+        let target = canonical(path);
+        self.tabs
+            .iter()
+            .position(|tab| tab.doc.path().is_some_and(|p| canonical(p) == target))
+    }
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -162,6 +179,34 @@ mod tests {
         tabs.close_active();
         assert_eq!(tabs.active_index(), 0);
         assert_eq!(tabs.active_mut().doc.rope().to_string(), "a");
+    }
+
+    #[test]
+    fn find_by_path_meets_spelling_variants_of_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("connor-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        let tabs = Tabs::new(vec![
+            Document::empty(),
+            Document::open(path.clone()).unwrap(),
+        ]);
+        assert_eq!(tabs.find_by_path(&path), Some(1));
+        assert_eq!(tabs.find_by_path(&dir.join(".").join("f.txt")), Some(1));
+        assert_eq!(tabs.find_by_path(&dir.join("other.txt")), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_by_path_falls_back_to_lexical_equality() {
+        let mut doc = Document::from_str("");
+        doc.set_path(PathBuf::from("no/such/file"));
+        let tabs = Tabs::new(vec![doc]);
+        assert_eq!(tabs.find_by_path(Path::new("no/such/file")), Some(0));
+        assert_eq!(tabs.find_by_path(Path::new("no/such/other")), None);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::doc::Document;
 use crate::grapheme::{self, RopeGraphemes};
+use crate::keymap;
 use crate::screen::Screen;
 use crate::search::Highlights;
 use crate::tabs::{Tab, Tabs};
@@ -26,7 +27,8 @@ pub fn text_height(screen_height: u16) -> usize {
 /// cell. O(viewport): only visible lines are walked, and each only to the
 /// viewport's right edge. `scratch` is reused across frames so steady-state
 /// drawing never heap-allocates. A non-empty `notice` — a message or a
-/// mini-prompt — takes over the status line until the next keypress;
+/// mini-prompt — takes over the status line until the next keypress,
+/// hiding its right-aligned help hint;
 /// `status_caret` parks the cursor after that many of the notice's chars
 /// while a prompt is editing there. `search` underlines every match and
 /// reverses the current one.
@@ -156,6 +158,15 @@ pub fn draw(
             scratch.push_str(" [recovered]");
         }
         screen.set_text(0, height - 1, scratch);
+        // The keymap's discoverability bootstrap: a right-aligned pointer
+        // at the overlay, yielding whenever the left content needs the room.
+        let left: usize = scratch.chars().map(char_cols).sum();
+        scratch.clear();
+        keymap::write_help_hint(scratch);
+        let hint = scratch.chars().count();
+        if hint > 0 && left + 2 + hint <= width {
+            screen.set_text((width - hint) as u16, height - 1, scratch);
+        }
     } else {
         screen.set_text(0, height - 1, notice);
     }
@@ -170,6 +181,128 @@ pub fn draw(
         .min(text_h.saturating_sub(1)))
     .min(usize::from(height) - 1) as u16;
     (cx, cy)
+}
+
+/// The rules that aren't bindings, shown inside the help box.
+const HELP_FOOTER: &str = "type to insert · shift+move selects";
+
+/// Columns between the help box's columns of bindings.
+const HELP_GAP: usize = 3;
+
+/// Draws the keymap overlay: a centered box over the text area, one row per
+/// binding under underlined section titles, flowed into as few columns as
+/// fit. Drawn after `draw`, straight over the text; the tab bar and status
+/// line stay visible. Every cell write bounds-checks, so a screen too small
+/// for the box clips it instead of panicking.
+pub fn draw_help(screen: &mut Screen, scratch: &mut String) {
+    let (width, height) = screen.size();
+    let width = usize::from(width);
+    let text_h = text_height(height);
+
+    let mut label_w = 0;
+    let mut desc_w = 0;
+    let mut rows = 0;
+    for section in keymap::KEYMAP {
+        rows += 1 + section.bindings.len();
+        desc_w = desc_w.max(section.title.chars().count());
+        for binding in section.bindings {
+            scratch.clear();
+            binding.write_label(scratch);
+            label_w = label_w.max(scratch.chars().count());
+            desc_w = desc_w.max(binding.what.chars().count());
+        }
+    }
+
+    // Borders and the footer take three rows beyond the binding rows.
+    let cols = if rows + 3 <= text_h { 1 } else { 2 };
+    let per_col = rows.div_ceil(cols);
+    let col_w = label_w + 2 + desc_w;
+    let box_w = (cols * col_w + (cols - 1) * HELP_GAP + 4)
+        .max(HELP_FOOTER.chars().count() + 4)
+        .min(width);
+    let box_h = (per_col + 3).min(text_h);
+    let x0 = (width - box_w) / 2;
+    let y0 = 1 + (text_h - box_h) / 2;
+
+    // A fresh cell per footprint position also clears the reverse and
+    // underline flags of whatever the box covers.
+    for y in y0..y0 + box_h {
+        for x in x0..x0 + box_w {
+            let edge_x = x == x0 || x == x0 + box_w - 1;
+            let edge_y = y == y0 || y == y0 + box_h - 1;
+            let ch = match (edge_x, edge_y) {
+                (true, true) => match (x == x0, y == y0) {
+                    (true, true) => '┌',
+                    (false, true) => '┐',
+                    (true, false) => '└',
+                    (false, false) => '┘',
+                },
+                (true, false) => '│',
+                (false, true) => '─',
+                (false, false) => ' ',
+            };
+            screen.set(x as u16, y as u16, ch);
+        }
+    }
+
+    let geom = HelpGeom {
+        x0,
+        y0,
+        box_w,
+        col_w,
+        per_col,
+        content_h: box_h.saturating_sub(3),
+    };
+    let mut i = 0;
+    for section in keymap::KEYMAP {
+        help_row(screen, &geom, i, section.title, true);
+        i += 1;
+        for binding in section.bindings {
+            scratch.clear();
+            binding.write_label(scratch);
+            while scratch.chars().count() < label_w + 2 {
+                scratch.push(' ');
+            }
+            scratch.push_str(binding.what);
+            help_row(screen, &geom, i, scratch, false);
+            i += 1;
+        }
+    }
+
+    if geom.content_h > 0 && HELP_FOOTER.chars().count() + 4 <= box_w {
+        let y = (y0 + box_h - 2) as u16;
+        screen.set_text((x0 + 2) as u16, y, HELP_FOOTER);
+    }
+}
+
+/// Where the help box sits and how its content rows flow into columns.
+struct HelpGeom {
+    x0: usize,
+    y0: usize,
+    box_w: usize,
+    col_w: usize,
+    per_col: usize,
+    content_h: usize,
+}
+
+/// Places content row `i` in its flowed column, underlined for a section
+/// title. Every help glyph is one column wide, so clipping by char count
+/// keeps a narrow box's right border intact.
+fn help_row(screen: &mut Screen, g: &HelpGeom, i: usize, text: &str, underline: bool) {
+    let (col, row) = (i / g.per_col, i % g.per_col);
+    if row >= g.content_h {
+        return;
+    }
+    let x = g.x0 + 2 + col * (g.col_w + HELP_GAP);
+    let y = (g.y0 + 1 + row) as u16;
+    let avail = (g.x0 + g.box_w).saturating_sub(1).saturating_sub(x);
+    for (c, ch) in text.chars().take(avail).enumerate() {
+        let x = (x + c) as u16;
+        screen.set(x, y, ch);
+        if underline {
+            screen.set_underlined(x, y, true);
+        }
+    }
 }
 
 /// Longest name a tab label shows before truncating with an ellipsis.
@@ -408,6 +541,16 @@ mod tests {
         let (screen, _) = render_tabs(&tabs, 32, 4);
         assert_eq!(row(&screen, 0), " a.rs+!                         ");
         assert_eq!(row(&screen, 3), "a.rs · 1:1 [+] [disk changed]   ");
+    }
+
+    #[test]
+    fn the_help_hint_right_aligns_and_yields_to_a_cramped_status() {
+        let (screen, _) = render("ab", 40, 3, View::default());
+        assert_eq!(row(&screen, 2), "[No Name] · 1:1                  F1 help");
+
+        // One column short of the two-space gap: the hint disappears whole.
+        let (screen, _) = render("ab", 23, 3, View::default());
+        assert_eq!(row(&screen, 2), "[No Name] · 1:1        ");
     }
 
     #[test]
@@ -672,10 +815,84 @@ mod tests {
         assert_eq!(sel_row(&screen, 1), "  ##");
     }
 
+    fn all_rows(screen: &Screen) -> String {
+        let (_, height) = screen.size();
+        (0..height).map(|y| row(screen, y) + "\n").collect()
+    }
+
+    #[test]
+    fn help_overlay_lists_every_binding_and_description() {
+        let tabs = tabs_of(Document::from_str("text"), View::default());
+        let mut screen = Screen::new(100, 60);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw_help(&mut screen, &mut scratch);
+        let all = all_rows(&screen);
+        assert!(all.contains(HELP_FOOTER));
+        for section in keymap::KEYMAP {
+            assert!(
+                all.contains(section.title),
+                "missing section {}",
+                section.title
+            );
+            for binding in section.bindings {
+                let mut label = String::new();
+                binding.write_label(&mut label);
+                assert!(all.contains(&label), "missing label {label}");
+                assert!(
+                    all.contains(binding.what),
+                    "missing description {}",
+                    binding.what
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_overlay_boxes_the_text_area_and_spares_the_chrome() {
+        // A selection reaching under the box must not bleed through it.
+        let view = View::test_at(19, 0, 0).with_anchor(0);
+        let tabs = tabs_of(Document::from_str("some text\nmore text"), view);
+        let mut scratch = String::new();
+        let mut plain = Screen::new(80, 24);
+        draw(&mut plain, &tabs, &mut scratch, "", None, None);
+        let mut screen = Screen::new(80, 24);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw_help(&mut screen, &mut scratch);
+
+        assert_eq!(row(&screen, 0), row(&plain, 0));
+        assert_eq!(row(&screen, 23), row(&plain, 23));
+        let all = all_rows(&screen);
+        assert!(all.contains('┌') && all.contains('┘'));
+        // Row 2 crosses the box interior: reversed cells left of the border
+        // survive, everything under the box is cleared.
+        let border = row(&screen, 1).chars().position(|c| c == '┌').unwrap();
+        let sel = sel_row(&screen, 2);
+        assert!(sel_row(&plain, 2)[border..].contains('#'));
+        assert!(sel[..border].contains('#'));
+        assert!(
+            !sel[border..].contains('#'),
+            "selection bleeds into the box: {sel}"
+        );
+    }
+
     #[test]
     fn degenerate_sizes_do_not_panic() {
-        for (w, h) in [(0, 0), (0, 5), (5, 0), (1, 1), (2, 2), (3, 1), (1, 3)] {
-            render("日本\ntext", w, h, View::default());
+        for (w, h) in [
+            (0, 0),
+            (0, 5),
+            (5, 0),
+            (1, 1),
+            (2, 2),
+            (3, 1),
+            (1, 3),
+            (10, 5),
+            (24, 8),
+            (80, 24),
+        ] {
+            let (mut screen, _) = render("日本\ntext", w, h, View::default());
+            let mut scratch = String::new();
+            draw_help(&mut screen, &mut scratch);
             let mut tabs = Tabs::new(vec![
                 named("aa.rs", "日本"),
                 dirtied(named("bb.rs", "text")),

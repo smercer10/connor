@@ -3,6 +3,7 @@ mod doc;
 mod draw;
 mod grapheme;
 mod journal;
+mod keymap;
 mod prompt;
 mod screen;
 mod search;
@@ -24,6 +25,7 @@ use crossterm::event::{
 
 use doc::{Caret, DiskCheck, Document};
 use journal::{Journal, Recovered};
+use keymap::Action;
 use prompt::{LinePrompt, Outcome, PathPrompt};
 use screen::Screen;
 use search::SearchPrompt;
@@ -155,6 +157,8 @@ enum Prompt {
     GoTo(LinePrompt),
     /// Ctrl+F: incremental search.
     Search(SearchPrompt),
+    /// Ctrl+/ or F1: the keymap overlay.
+    Help,
 }
 
 fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
@@ -176,6 +180,7 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
         Prompt::Path { edit, .. } => edit.render(notice),
         Prompt::GoTo(edit) => edit.render(notice),
         Prompt::Search(edit) => edit.render(notice),
+        Prompt::Help => notice.push_str("(esc) close"),
     }
     Some(prompt)
 }
@@ -220,7 +225,7 @@ fn prompt_paste(prompt: &mut Prompt, text: &str, tabs: &mut Tabs, notice: &mut S
             edit.paste(text);
             edit.render(notice);
         }
-        Prompt::Quit | Prompt::Close | Prompt::LossySave { .. } => {}
+        Prompt::Quit | Prompt::Close | Prompt::LossySave { .. } | Prompt::Help => {}
     }
 }
 
@@ -233,6 +238,16 @@ fn prompt_key(
     register: &str,
     notice: &mut String,
 ) -> (Option<Prompt>, bool) {
+    // The help overlay owns only its closing keys: Esc or a repeat of an
+    // opening chord dismisses it, anything else leaves it up.
+    if let Prompt::Help = prompt {
+        return if key.code == KeyCode::Esc || keymap::lookup(key) == Some(Action::Help) {
+            notice.clear();
+            (None, false)
+        } else {
+            (Some(Prompt::Help), false)
+        };
+    }
     // Ctrl+V pastes the register into the prompt's field; the prompts' own
     // key handlers never see modified chords.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
@@ -504,7 +519,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()>
         if redraw {
             back.clear();
             let status_caret = match &prompt {
-                Some(Prompt::Path { .. } | Prompt::GoTo(_)) => Some(notice.chars().count()),
+                Some(Prompt::Path { .. } | Prompt::GoTo(_) | Prompt::Help) => {
+                    Some(notice.chars().count())
+                }
                 Some(Prompt::Search(edit)) => Some(edit.caret_chars()),
                 _ => None,
             };
@@ -513,6 +530,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()>
                 _ => None,
             };
             let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret, search);
+            if matches!(prompt, Some(Prompt::Help)) {
+                draw::draw_help(&mut back, &mut scratch);
+            }
             terminal.present(&back, cursor)?;
         }
         redraw = true;
@@ -568,87 +588,87 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()>
                     }
                 } else {
                     notice.clear();
-                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    let alt = key.modifiers.contains(KeyModifiers::ALT);
-                    // Tab chords are claimed before the buffer keys: their base
-                    // keys are movement keys, and the movement path below would
-                    // clear the selection and move the wrong tab's cursor.
-                    let prev_tab =
-                        (ctrl && key.code == KeyCode::PageUp) || (alt && key.code == KeyCode::Left);
-                    let next_tab = (ctrl && key.code == KeyCode::PageDown)
-                        || (alt && key.code == KeyCode::Right);
-                    if prev_tab || next_tab {
-                        tabs.active_mut().doc.break_undo_group();
-                        if prev_tab {
-                            tabs.prev();
-                        } else {
-                            tabs.next();
-                        }
-                        // No continue: the loop tail re-clamps the incoming
-                        // view, which may have missed resizes while hidden.
-                    } else if ctrl && key.code == KeyCode::Char('q') {
-                        if tabs.any_dirty() {
-                            prompt = open_prompt(Prompt::Quit, &tabs.active_mut().doc, &mut notice);
-                        } else {
-                            break;
-                        }
-                    } else if ctrl && key.code == KeyCode::Char('n') {
-                        tabs.active_mut().doc.break_undo_group();
-                        tabs.push(Document::empty());
-                    } else if ctrl && key.code == KeyCode::Char('o') {
-                        prompt = open_prompt(
-                            Prompt::Path {
-                                edit: PathPrompt::new("open: "),
-                                action: PathAction::Open,
-                            },
-                            &tabs.active_mut().doc,
-                            &mut notice,
-                        );
-                    } else if ctrl && key.code == KeyCode::Char('f') {
+                    #[cfg(debug_assertions)]
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('p')
+                    {
+                        panic!("deliberate panic (Ctrl+P)");
+                    }
+                    if let Some(action) = keymap::lookup(&key) {
                         let Tab { doc, view } = tabs.active_mut();
-                        doc.break_undo_group();
-                        let edit = SearchPrompt::new(view);
-                        // The current match renders in reverse video, which
-                        // must not fight a reverse-video selection; the
-                        // origin keeps the anchor for Esc to restore.
-                        view.anchor = None;
-                        prompt = open_prompt(Prompt::Search(edit), doc, &mut notice);
-                    } else if ctrl && key.code == KeyCode::Char('g') {
-                        prompt = open_prompt(
-                            Prompt::GoTo(LinePrompt::new()),
-                            &tabs.active_mut().doc,
-                            &mut notice,
-                        );
-                    } else if ctrl && key.code == KeyCode::Char('w') {
-                        if tabs.active_mut().doc.dirty() {
-                            prompt =
-                                open_prompt(Prompt::Close, &tabs.active_mut().doc, &mut notice);
-                        } else if close_active_or_quit(tabs) {
-                            break;
-                        }
-                    } else {
-                        let Tab { doc, view } = tabs.active_mut();
-                        let movement = matches!(
-                            key.code,
-                            KeyCode::Left
-                                | KeyCode::Right
-                                | KeyCode::Up
-                                | KeyCode::Down
-                                | KeyCode::Home
-                                | KeyCode::End
-                                | KeyCode::PageUp
-                                | KeyCode::PageDown
-                        );
-                        if movement {
+                        if action.is_movement() {
                             // Shift extends a selection through any movement key;
-                            // Char keys never land here, so shifted typing is safe.
+                            // Char keys never map to movement, so shifted typing
+                            // is safe.
                             view.begin_or_clear_selection(
                                 key.modifiers.contains(KeyModifiers::SHIFT),
                             );
                             doc.break_undo_group();
                         }
-                        match key.code {
-                            KeyCode::Char('s') if ctrl => {
+                        match action {
+                            Action::PrevTab | Action::NextTab => {
+                                doc.break_undo_group();
+                                if action == Action::PrevTab {
+                                    tabs.prev();
+                                } else {
+                                    tabs.next();
+                                }
+                                // No continue: the loop tail re-clamps the incoming
+                                // view, which may have missed resizes while hidden.
+                            }
+                            Action::Quit => {
+                                if tabs.any_dirty() {
+                                    prompt = open_prompt(
+                                        Prompt::Quit,
+                                        &tabs.active_mut().doc,
+                                        &mut notice,
+                                    );
+                                } else {
+                                    break;
+                                }
+                            }
+                            Action::NewTab => {
+                                doc.break_undo_group();
+                                tabs.push(Document::empty());
+                            }
+                            Action::Open => {
+                                prompt = open_prompt(
+                                    Prompt::Path {
+                                        edit: PathPrompt::new("open: "),
+                                        action: PathAction::Open,
+                                    },
+                                    doc,
+                                    &mut notice,
+                                );
+                            }
+                            Action::Find => {
+                                doc.break_undo_group();
+                                let edit = SearchPrompt::new(view);
+                                // The current match renders in reverse video, which
+                                // must not fight a reverse-video selection; the
+                                // origin keeps the anchor for Esc to restore.
+                                view.anchor = None;
+                                prompt = open_prompt(Prompt::Search(edit), doc, &mut notice);
+                            }
+                            Action::GoToLine => {
+                                prompt =
+                                    open_prompt(Prompt::GoTo(LinePrompt::new()), doc, &mut notice);
+                            }
+                            Action::CloseTab => {
+                                if doc.dirty() {
+                                    prompt = open_prompt(
+                                        Prompt::Close,
+                                        &tabs.active_mut().doc,
+                                        &mut notice,
+                                    );
+                                } else if close_active_or_quit(tabs) {
+                                    break;
+                                }
+                            }
+                            Action::Help => {
+                                prompt = open_prompt(Prompt::Help, doc, &mut notice);
+                            }
+                            Action::Save => {
                                 if doc.path().is_none() {
                                     prompt = open_prompt(
                                         save_as_prompt(AfterSave::Stay),
@@ -667,60 +687,59 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()>
                                     try_save(doc, &mut notice);
                                 }
                             }
-                            KeyCode::Char('c') if ctrl => {
+                            Action::Copy => {
                                 if let Some(text) = view.selected_text(doc) {
                                     register = text;
                                     share_copy(&mut terminal, &register, in_tmux, &mut notice)?;
                                 }
                             }
-                            KeyCode::Char('x') if ctrl => {
+                            Action::Cut => {
                                 if let Some(text) = view.cut(doc) {
                                     register = text;
                                     share_copy(&mut terminal, &register, in_tmux, &mut notice)?;
                                 }
                             }
-                            KeyCode::Char('v') if ctrl => {
+                            Action::Paste => {
                                 if !register.is_empty() {
                                     view.paste(doc, &register);
                                 }
                             }
-                            KeyCode::Char('z') if ctrl => {
+                            Action::Undo => {
                                 if let Some(caret) = doc.undo() {
                                     view.set_caret(caret);
                                 }
                             }
-                            KeyCode::Char('y') if ctrl => {
+                            Action::Redo => {
                                 if let Some(caret) = doc.redo() {
                                     view.set_caret(caret);
                                 }
                             }
-                            #[cfg(debug_assertions)]
-                            KeyCode::Char('p') if ctrl => panic!("deliberate panic (Ctrl+P)"),
-                            KeyCode::Left if ctrl => view.move_word_left(doc),
-                            KeyCode::Right if ctrl => view.move_word_right(doc),
-                            KeyCode::Home if ctrl => view.move_doc_start(),
-                            KeyCode::End if ctrl => view.move_doc_end(doc),
-                            KeyCode::Left => view.move_left(doc),
-                            KeyCode::Right => view.move_right(doc),
-                            KeyCode::Up => view.move_up(doc),
-                            KeyCode::Down => view.move_down(doc),
-                            KeyCode::Home => view.move_home(doc),
-                            KeyCode::End => view.move_end(doc),
-                            KeyCode::PageUp => view.page_up(doc, text_h),
-                            KeyCode::PageDown => view.page_down(doc, text_h),
-                            // Alt-modified letters are terminal escape chords, not
-                            // text to insert.
-                            KeyCode::Char(ch)
-                                if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
-                            {
-                                view.insert_char(doc, ch)
-                            }
-                            KeyCode::Enter => view.insert_newline(doc),
-                            KeyCode::Tab => view.insert_tab(doc),
-                            KeyCode::Backspace => view.backspace(doc),
-                            KeyCode::Delete => view.delete(doc),
-                            _ => {}
+                            Action::WordLeft => view.move_word_left(doc),
+                            Action::WordRight => view.move_word_right(doc),
+                            Action::DocStart => view.move_doc_start(),
+                            Action::DocEnd => view.move_doc_end(doc),
+                            Action::Left => view.move_left(doc),
+                            Action::Right => view.move_right(doc),
+                            Action::Up => view.move_up(doc),
+                            Action::Down => view.move_down(doc),
+                            Action::Home => view.move_home(doc),
+                            Action::End => view.move_end(doc),
+                            Action::PageUp => view.page_up(doc, text_h),
+                            Action::PageDown => view.page_down(doc, text_h),
+                            Action::Newline => view.insert_newline(doc),
+                            Action::InsertTab => view.insert_tab(doc),
+                            Action::Backspace => view.backspace(doc),
+                            Action::Delete => view.delete(doc),
                         }
+                    } else if let KeyCode::Char(ch) = key.code
+                        // Alt-modified letters are terminal escape chords, not
+                        // text to insert.
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        let Tab { doc, view } = tabs.active_mut();
+                        view.insert_char(doc, ch);
                     }
                 }
             }
@@ -920,6 +939,35 @@ mod tests {
         assert!(docs.is_empty());
         assert_eq!(notice, "");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn help_prompt_closes_on_esc_and_its_own_chords_only() {
+        let mut tabs = Tabs::new(vec![Document::empty()]);
+        let mut notice = String::new();
+        for (code, mods) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::F(1), KeyModifiers::NONE),
+            (KeyCode::Char('/'), KeyModifiers::CONTROL),
+            (KeyCode::Char('7'), KeyModifiers::CONTROL),
+        ] {
+            notice.push_str("(esc) close");
+            let key = KeyEvent::new(code, mods);
+            let (next, quit) = prompt_key(Prompt::Help, &key, &mut tabs, "", &mut notice);
+            assert!(next.is_none(), "{code:?} left help open");
+            assert!(!quit);
+            assert!(notice.is_empty());
+        }
+        for (code, mods) in [
+            (KeyCode::Char('a'), KeyModifiers::NONE),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+            (KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            let key = KeyEvent::new(code, mods);
+            let (next, quit) = prompt_key(Prompt::Help, &key, &mut tabs, "", &mut notice);
+            assert!(matches!(next, Some(Prompt::Help)), "{code:?} closed help");
+            assert!(!quit);
+        }
     }
 
     #[test]

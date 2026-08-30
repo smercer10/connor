@@ -6,19 +6,23 @@ mod screen;
 mod tabs;
 mod term;
 mod view;
+mod watch;
 
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::time::Instant;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use doc::Document;
+use doc::{Caret, DiskCheck, Document};
 use prompt::{Outcome, PathPrompt};
 use screen::Screen;
 use tabs::{Tab, Tabs};
 use term::Terminal;
+use watch::{AppEvent, Debounce, DirWatcher};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
@@ -301,6 +305,18 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
     let mut scratch = String::new();
     let mut notice = String::new();
     let mut prompt: Option<Prompt> = None;
+    let (tx, rx) = mpsc::channel();
+    watch::spawn_input_thread(tx.clone());
+    // Losing the watcher (inotify limits, say) costs reloads, not the
+    // editor.
+    let mut watcher = match DirWatcher::new(tx) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            let _ = write!(notice, "file watching unavailable: {e}");
+            None
+        }
+    };
+    let mut debounce = Debounce::default();
 
     loop {
         back.clear();
@@ -311,8 +327,20 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
         // Page movement wants the text area as it was when the key arrived.
         let text_h = draw::text_height(back.size().1);
 
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+        // A pending debounce turns the indefinite block into a timed one;
+        // its expiry is the only wake that isn't a channel message.
+        let received = match debounce.deadline() {
+            None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            Some(t) => rx.recv_timeout(t.saturating_duration_since(Instant::now())),
+        };
+        match received {
+            Err(mpsc::RecvTimeoutError::Timeout) => reload_changed(tabs, &mut debounce),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("event channel closed"));
+            }
+            Ok(AppEvent::InputFailed(e)) => return Err(e),
+            Ok(AppEvent::Fs(path)) => debounce.note(path, Instant::now()),
+            Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 if let Some(pending) = prompt.take() {
                     let (next, quit) = prompt_key(pending, &key, tabs, &mut notice);
                     prompt = next;
@@ -439,11 +467,15 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                     }
                 }
             }
-            Event::Resize(width, height) => {
+            Ok(AppEvent::Input(Event::Resize(width, height))) => {
                 terminal.resize(width, height);
                 back.resize(width, height);
             }
-            _ => {}
+            Ok(AppEvent::Input(_)) => {}
+        }
+
+        if let Some(watcher) = &mut watcher {
+            watcher.sync(tabs);
         }
 
         // Re-fetch the size: a resize may have changed it.
@@ -453,4 +485,23 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
         view.scroll_to_cursor(doc, text_w, draw::text_height(height));
     }
     Ok(())
+}
+
+/// The debounce expired: reconcile every touched tab with its file. Paths
+/// that match no tab — our own temp files, unrelated neighbours in a
+/// watched directory — fall out here.
+fn reload_changed(tabs: &mut Tabs, debounce: &mut Debounce) {
+    for path in debounce.take() {
+        let Some(index) = tabs.find_by_path(&path) else {
+            continue;
+        };
+        let Tab { doc, view } = tabs.get_mut(index);
+        let caret = Caret {
+            cursor: view.cursor,
+            anchor: view.anchor,
+        };
+        if let DiskCheck::Reloaded { old, span } = doc.check_disk(caret) {
+            view.remap_after_reload(&old, doc.rope(), &span);
+        }
+    }
 }

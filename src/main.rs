@@ -2,6 +2,7 @@ mod clip;
 mod doc;
 mod draw;
 mod grapheme;
+mod journal;
 mod prompt;
 mod screen;
 mod search;
@@ -22,6 +23,7 @@ use crossterm::event::{
 };
 
 use doc::{Caret, DiskCheck, Document};
+use journal::{Journal, Recovered};
 use prompt::{LinePrompt, Outcome, PathPrompt};
 use screen::Screen;
 use search::SearchPrompt;
@@ -44,16 +46,74 @@ fn main() -> ExitCode {
             }
         }
     }
+    let (mut journal, recovered, startup_notice) = Journal::start();
+    let notice = merge_recovered(&mut docs, recovered, startup_notice);
     if docs.is_empty() {
         docs.push(Document::empty());
     }
     let mut tabs = Tabs::new(docs);
-    match run(&mut tabs) {
+    let result = run(&mut tabs, &mut journal, notice);
+    if result.is_err() {
+        // The terminal died out from under a possibly dirty buffer; a last
+        // snapshot before abandoning the session dir keeps it current.
+        journal.flush(&tabs);
+    }
+    journal.finish(result.is_ok());
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("connor: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Folds crash-recovered buffers into the docs the args opened: an entry
+/// for an already-open path splices into that document, any other becomes
+/// its own tab. Returns the notice the first frame shows.
+fn merge_recovered(
+    docs: &mut Vec<Document>,
+    recovered: Vec<Recovered>,
+    startup_notice: Option<String>,
+) -> String {
+    let mut count = 0;
+    for entry in recovered {
+        match entry.path {
+            Some(path) => {
+                let target = tabs::canonical(&path);
+                let existing = docs
+                    .iter_mut()
+                    .find(|doc| doc.path().is_some_and(|p| tabs::canonical(p) == target));
+                match existing {
+                    Some(doc) => count += usize::from(doc.restore_journal(&entry.text)),
+                    None => {
+                        // An unopenable path (permissions, say) must not
+                        // cost the content: it lives on as a pathless
+                        // buffer instead.
+                        let mut doc = Document::open(path).unwrap_or_else(|_| Document::empty());
+                        if doc.restore_journal(&entry.text) {
+                            docs.push(doc);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            None => {
+                let mut doc = Document::empty();
+                if doc.restore_journal(&entry.text) {
+                    docs.push(doc);
+                    count += 1;
+                }
+            }
+        }
+    }
+    match (count, startup_notice) {
+        (0, Some(notice)) => notice,
+        (0, None) => String::new(),
+        (n, _) => format!(
+            "recovered {n} unsaved buffer{}",
+            if n == 1 { "" } else { "s" }
+        ),
     }
 }
 
@@ -408,13 +468,15 @@ fn close_active_or_quit(tabs: &mut Tabs) -> bool {
     false
 }
 
-fn run(tabs: &mut Tabs) -> io::Result<()> {
+fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<()> {
     term::init_panic_hook();
     let mut terminal = Terminal::new()?;
     let (width, height) = terminal.size();
     let mut back = Screen::new(width, height);
     let mut scratch = String::new();
-    let mut notice = String::new();
+    // Startup already has something to say (a recovery, a disabled
+    // journal); the watcher complaint below yields to it.
+    let mut notice = notice;
     let mut prompt: Option<Prompt> = None;
     let (tx, rx) = mpsc::channel();
     watch::spawn_input_thread(tx.clone());
@@ -423,7 +485,9 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
     let mut watcher = match DirWatcher::new(tx) {
         Ok(watcher) => Some(watcher),
         Err(e) => {
-            let _ = write!(notice, "file watching unavailable: {e}");
+            if notice.is_empty() {
+                let _ = write!(notice, "file watching unavailable: {e}");
+            }
             None
         }
     };
@@ -433,40 +497,59 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
     // large for OSC 52, and works in terminals that ignore OSC 52 entirely.
     let mut register = String::new();
     let in_tmux = std::env::var_os("TMUX").is_some();
+    let mut redraw = true;
 
     loop {
         let mut follow_cursor = true;
-        back.clear();
-        let status_caret = match &prompt {
-            Some(Prompt::Path { .. } | Prompt::GoTo(_)) => Some(notice.chars().count()),
-            Some(Prompt::Search(edit)) => Some(edit.caret_chars()),
-            _ => None,
-        };
-        let search = match &prompt {
-            Some(Prompt::Search(edit)) => Some(edit.highlights()),
-            _ => None,
-        };
-        let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret, search);
-        terminal.present(&back, cursor)?;
+        if redraw {
+            back.clear();
+            let status_caret = match &prompt {
+                Some(Prompt::Path { .. } | Prompt::GoTo(_)) => Some(notice.chars().count()),
+                Some(Prompt::Search(edit)) => Some(edit.caret_chars()),
+                _ => None,
+            };
+            let search = match &prompt {
+                Some(Prompt::Search(edit)) => Some(edit.highlights()),
+                _ => None,
+            };
+            let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret, search);
+            terminal.present(&back, cursor)?;
+        }
+        redraw = true;
 
         // Page movement wants the text area as it was when the key arrived.
         let text_h = draw::text_height(back.size().1);
 
-        // A pending debounce turns the indefinite block into a timed one;
-        // its expiry is the only wake that isn't a channel message.
-        let received = match debounce.deadline() {
+        // A pending debounce or journal snapshot turns the indefinite block
+        // into a timed one; their expiries are the only wakes that aren't
+        // channel messages.
+        let wake = [debounce.deadline(), journal.deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        let received = match wake {
             None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
             Some(t) => rx.recv_timeout(t.saturating_duration_since(Instant::now())),
         };
         match received {
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                reload_changed(tabs, &mut debounce);
-                // A reload may have shifted or removed matches; a stale set
-                // must never reach navigation or a replace.
-                if let Some(Prompt::Search(edit)) = &mut prompt {
-                    let Tab { doc, view } = tabs.active_mut();
-                    edit.refresh(doc, view);
-                    edit.render(&mut notice);
+                let now = Instant::now();
+                let fs_due = debounce.deadline().is_some_and(|t| t <= now);
+                if journal.deadline().is_some_and(|t| t <= now) {
+                    journal.flush(tabs);
+                    // A snapshot changes nothing on screen; drawing here
+                    // would turn the timer into a periodic repaint.
+                    redraw = fs_due;
+                }
+                if fs_due {
+                    reload_changed(tabs, &mut debounce);
+                    // A reload may have shifted or removed matches; a stale
+                    // set must never reach navigation or a replace.
+                    if let Some(Prompt::Search(edit)) = &mut prompt {
+                        let Tab { doc, view } = tabs.active_mut();
+                        edit.refresh(doc, view);
+                        edit.render(&mut notice);
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -716,6 +799,12 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
         if let Some(watcher) = &mut watcher {
             watcher.sync(tabs);
         }
+        // One call site covers every way an entry goes stale: a save, an
+        // undo back to clean, a discarded close. A failure notice appearing
+        // here must reach the screen even on a wake that skips the draw.
+        let quiet = notice.is_empty();
+        journal.sync(tabs, Instant::now(), &mut notice);
+        redraw |= quiet && !notice.is_empty();
 
         // Re-fetch the size: a resize may have changed it. A wheel scroll
         // opts out of the snap, or it would scroll straight back.
@@ -745,5 +834,102 @@ fn reload_changed(tabs: &mut Tabs, debounce: &mut Debounce) {
         if let DiskCheck::Reloaded { old, span } = doc.check_disk(caret) {
             view.remap_after_reload(&old, doc.rope(), &span);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh scratch directory per test: tests run in parallel, so each
+    /// needs its own.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("connor-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry(path: Option<PathBuf>, text: &str) -> Recovered {
+        Recovered {
+            path,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn recovery_splices_into_the_doc_already_open_for_that_path() {
+        let dir = scratch_dir("merge-dedupe");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut docs = vec![Document::open(path.clone()).unwrap()];
+        let notice = merge_recovered(&mut docs, vec![entry(Some(path), "edited\n")], None);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].rope().to_string(), "edited\n");
+        assert!(docs[0].dirty());
+        assert!(docs[0].recovered());
+        assert_eq!(notice, "recovered 1 unsaved buffer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_opens_its_own_tab_for_a_path_not_on_the_command_line() {
+        let dir = scratch_dir("merge-new-tab");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let mut docs = Vec::new();
+        merge_recovered(&mut docs, vec![entry(Some(path.clone()), "edited\n")], None);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].path(), Some(path.as_path()));
+        assert_eq!(docs[0].rope().to_string(), "edited\n");
+        assert!(docs[0].dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_for_a_deleted_file_still_carries_its_path() {
+        let dir = scratch_dir("merge-deleted");
+        let path = dir.join("gone.txt");
+        let mut docs = Vec::new();
+        let notice = merge_recovered(&mut docs, vec![entry(Some(path.clone()), "lost\n")], None);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].path(), Some(path.as_path()));
+        assert!(docs[0].dirty());
+        assert_eq!(notice, "recovered 1 unsaved buffer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pathless_entry_becomes_a_dirty_no_name_buffer() {
+        let mut docs = Vec::new();
+        let notice = merge_recovered(&mut docs, vec![entry(None, "scratch\n")], None);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].path(), None);
+        assert!(docs[0].dirty());
+        assert!(docs[0].recovered());
+        assert_eq!(notice, "recovered 1 unsaved buffer");
+    }
+
+    #[test]
+    fn an_entry_matching_the_disk_is_dropped_without_a_tab() {
+        let dir = scratch_dir("merge-clean");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let mut docs = Vec::new();
+        let notice = merge_recovered(&mut docs, vec![entry(Some(path), "same\n")], None);
+        assert!(docs.is_empty());
+        assert_eq!(notice, "");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_startup_notice_yields_to_a_recovery_and_stands_otherwise() {
+        let mut docs = Vec::new();
+        let disabled = Some("crash journal disabled: x".to_owned());
+        let notice = merge_recovered(&mut docs, Vec::new(), disabled.clone());
+        assert_eq!(notice, "crash journal disabled: x");
+        let entries = vec![entry(None, "a\n"), entry(None, "b\n")];
+        let notice = merge_recovered(&mut docs, entries, disabled);
+        assert_eq!(notice, "recovered 2 unsaved buffers");
     }
 }

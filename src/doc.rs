@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, ErrorKind};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ropey::Rope;
 
@@ -12,6 +13,10 @@ use crate::grapheme;
 /// Lines examined by convention detection: plenty for any real file, a
 /// bound for absurd ones.
 const DETECT_LINE_CAP: usize = 10_000;
+
+/// Documents get process-unique ids: a stable identity for the crash
+/// journal while tab indices shift as tabs open and close.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineEnding {
@@ -234,12 +239,19 @@ impl History {
 /// than to a view of it (path, undo history, how it was loaded, its
 /// conventions).
 pub struct Document {
+    id: u64,
     rope: Rope,
     path: Option<PathBuf>,
     lossy: bool,
     line_ending: LineEnding,
     indent: IndentStyle,
     history: History,
+    /// Bumped on every mutation (edit, undo, redo) and never repeated, so
+    /// the crash journal can tell "changed since last snapshot" apart from
+    /// a history index that undo walked back to.
+    revision: u64,
+    /// Restored from the crash journal and not yet saved.
+    recovered: bool,
     /// FNV-1a of the bytes last seen on disk (loaded or saved); `None` when
     /// nothing is on disk yet. Lets a watch event tell an external change
     /// from our own save or a spurious wake.
@@ -252,12 +264,15 @@ pub struct Document {
 impl Document {
     pub fn empty() -> Self {
         Document {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             rope: Rope::new(),
             path: None,
             lossy: false,
             line_ending: LineEnding::Lf,
             indent: IndentStyle::Spaces(4),
             history: History::default(),
+            revision: 0,
+            recovered: false,
             disk_hash: None,
             conflict: false,
         }
@@ -292,9 +307,8 @@ impl Document {
             rope,
             path: Some(path),
             lossy,
-            history: History::default(),
             disk_hash,
-            conflict: false,
+            ..Document::empty()
         })
     }
 
@@ -349,6 +363,18 @@ impl Document {
         self.history.index != self.history.saved_index
     }
 
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn recovered(&self) -> bool {
+        self.recovered
+    }
+
     /// Writes the text to the document's path atomically: an interrupted
     /// save leaves the old file intact, never a truncated one. The rope is
     /// written verbatim, so line endings and the trailing newline (or its
@@ -367,6 +393,7 @@ impl Document {
         // disk, and the buffer now matches the file.
         self.disk_hash = Some(fnv1a(self.rope.chunks().map(str::as_bytes)));
         self.conflict = false;
+        self.recovered = false;
         Ok(())
     }
 
@@ -428,6 +455,37 @@ impl Document {
         DiskCheck::Reloaded { old, span }
     }
 
+    /// Splices crash-journal `text` over the loaded content as one
+    /// undoable edit that leaves the buffer dirty — the journal holds
+    /// unsaved work, and undo walks back to what the disk held. Returns
+    /// false when the journal already matches the buffer: nothing was
+    /// unsaved after all, and the buffer stays clean and unmarked.
+    pub fn restore_journal(&mut self, text: &str) -> bool {
+        let span = change_span(&self.rope, text);
+        let middle: String = text
+            .chars()
+            .skip(span.prefix)
+            .take(span.new_suffix_start - span.prefix)
+            .collect();
+        if span.prefix == span.old_suffix_start && middle.is_empty() {
+            return false;
+        }
+        let caret = Caret {
+            cursor: 0,
+            anchor: None,
+        };
+        self.edit(
+            span.prefix..span.old_suffix_start,
+            &middle,
+            caret,
+            EditKind::Other,
+        );
+        self.line_ending = detect_line_ending(&self.rope);
+        self.indent = detect_indent(&self.rope);
+        self.recovered = true;
+        true
+    }
+
     /// Replaces `range` with `text` — the single mutation entry point, so
     /// undo recording and coalescing see every change. `caret` is the caret
     /// as it stood before the edit; `kind` hints coalescing. Returns the
@@ -445,6 +503,7 @@ impl Document {
             inserted: text.to_owned(),
         };
         self.history.record(edit, caret, cursor, kind);
+        self.revision += 1;
         cursor
     }
 
@@ -463,6 +522,7 @@ impl Document {
         let end = group.edit.at + group.edit.inserted.chars().count();
         self.rope.remove(group.edit.at..end);
         self.rope.insert(group.edit.at, &group.edit.deleted);
+        self.revision += 1;
         Some(group.caret_before)
     }
 
@@ -475,6 +535,7 @@ impl Document {
         self.rope.remove(group.edit.at..end);
         self.rope.insert(group.edit.at, &group.edit.inserted);
         self.history.index += 1;
+        self.revision += 1;
         Some(Caret {
             cursor,
             anchor: None,
@@ -1159,6 +1220,73 @@ mod tests {
         assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Unchanged));
         assert_eq!(doc.rope().to_string(), "keep\n");
         assert!(!doc.conflict());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ids_are_unique_across_documents() {
+        assert_ne!(Document::empty().id(), Document::empty().id());
+    }
+
+    #[test]
+    fn revision_moves_on_every_mutation_and_only_on_mutation() {
+        let mut doc = Document::from_str("ab");
+        let start = doc.revision();
+        doc.edit(0..0, "x", caret(0), EditKind::Insert);
+        assert_eq!(doc.revision(), start + 1);
+        doc.undo();
+        assert_eq!(doc.revision(), start + 2);
+        assert!(doc.undo().is_none()); // nothing left to undo
+        assert_eq!(doc.revision(), start + 2);
+        doc.redo();
+        assert_eq!(doc.revision(), start + 3);
+        assert!(doc.redo().is_none()); // nothing left to redo
+        assert_eq!(doc.revision(), start + 3);
+    }
+
+    #[test]
+    fn restore_journal_leaves_a_dirty_marked_buffer_undoable_to_disk() {
+        let dir = scratch_dir("restore-basic");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        assert!(doc.restore_journal("one\nedited\ntwo\n"));
+        assert_eq!(doc.rope().to_string(), "one\nedited\ntwo\n");
+        assert!(doc.dirty());
+        assert!(doc.recovered());
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), "one\ntwo\n");
+        assert!(!doc.dirty()); // back at what disk holds
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restore_journal_with_matching_text_is_a_clean_no_op() {
+        let mut doc = Document::from_str("same\n");
+        assert!(!doc.restore_journal("same\n"));
+        assert!(!doc.dirty());
+        assert!(!doc.recovered());
+    }
+
+    #[test]
+    fn restore_journal_fills_an_empty_document() {
+        let mut doc = Document::empty();
+        assert!(doc.restore_journal("lost\r\nwork\r\n"));
+        assert_eq!(doc.rope().to_string(), "lost\r\nwork\r\n");
+        assert!(doc.dirty());
+        assert_eq!(doc.line_ending(), LineEnding::Crlf); // conventions re-detected
+    }
+
+    #[test]
+    fn save_clears_recovered() {
+        let dir = scratch_dir("restore-save");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        assert!(doc.restore_journal("changed\n"));
+        doc.save().unwrap();
+        assert!(!doc.recovered());
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

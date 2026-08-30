@@ -1,8 +1,9 @@
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::{self, BufReader, ErrorKind};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, ErrorKind};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ropey::Rope;
 
@@ -175,9 +176,9 @@ struct History {
     /// The kind that may still extend `groups[index - 1]`; `None` when the
     /// run is closed.
     open_kind: Option<EditKind>,
-    /// History position at the last save; 0 is the loaded state. Saving
-    /// (issue #4) must invalidate this when the saved position is truncated
-    /// out of an abandoned redo branch.
+    /// History position at the last save; 0 is the loaded state, and
+    /// `usize::MAX` marks a saved state no history position reaches — it was
+    /// truncated out of an abandoned redo branch.
     saved_index: usize,
 }
 
@@ -193,6 +194,9 @@ impl History {
         {
             last.cursor_after = cursor_after;
             return;
+        }
+        if self.saved_index > self.index {
+            self.saved_index = usize::MAX;
         }
         self.groups.truncate(self.index);
         self.groups.push(EditGroup {
@@ -291,6 +295,23 @@ impl Document {
         self.history.index != self.history.saved_index
     }
 
+    /// Writes the text to the document's path atomically: an interrupted
+    /// save leaves the old file intact, never a truncated one. The rope is
+    /// written verbatim, so line endings and the trailing newline (or its
+    /// absence) survive exactly as loaded. On success this position becomes
+    /// the saved state and the lossy flag clears — the file now holds what
+    /// the buffer shows.
+    pub fn save(&mut self) -> io::Result<()> {
+        let path = self.path.as_deref().ok_or_else(no_file_name)?;
+        write_atomic(path, &self.rope)?;
+        self.history.saved_index = self.history.index;
+        // Later typing must not coalesce into a pre-save group, or dirty()
+        // would report clean with post-save edits applied.
+        self.history.open_kind = None;
+        self.lossy = false;
+        Ok(())
+    }
+
     /// Replaces `range` with `text` — the single mutation entry point, so
     /// undo recording and coalescing see every change. `caret` is the caret
     /// as it stood before the edit; `kind` hints coalescing. Returns the
@@ -377,6 +398,94 @@ impl Document {
         }
         end
     }
+}
+
+fn no_file_name() -> io::Error {
+    io::Error::other("no file name")
+}
+
+/// The real file a save must land on: symlinks followed so the target is
+/// replaced rather than the link, path made absolute so the temp file lands
+/// beside it. A missing file resolves within its parent directory.
+fn resolve_target(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(target) => Ok(target),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let name = path.file_name().ok_or_else(no_file_name)?;
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            Ok(fs::canonicalize(parent)?.join(name))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Creates the temp file the save writes into, beside the target so the
+/// rename never crosses filesystems. `create_new` guarantees a fresh file;
+/// collisions (a dead editor's leftovers) move on to the next suffix.
+fn create_temp(dir: &Path, name: &OsStr) -> io::Result<(PathBuf, File)> {
+    let mut attempt = 0;
+    loop {
+        let mut temp_name = OsString::from(".");
+        temp_name.push(name);
+        temp_name.push(format!(".connor-{}-{attempt}.tmp", std::process::id()));
+        let temp_path = dir.join(temp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempt < 100 => attempt += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Write-to-temp-then-rename: a crash at any point leaves either the old
+/// file or the new one on disk, never a mix or a truncation.
+fn write_atomic(path: &Path, rope: &Rope) -> io::Result<()> {
+    let target = resolve_target(path)?;
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(no_file_name());
+    };
+    let (temp_path, file) = create_temp(dir, name)?;
+    let result = write_and_swap(file, &temp_path, &target, dir, rope);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_and_swap(
+    file: File,
+    temp_path: &Path,
+    target: &Path,
+    dir: &Path,
+    rope: &Rope,
+) -> io::Result<()> {
+    // The rename carries the temp file's permissions, so an existing
+    // target's must be copied over first.
+    if let Ok(meta) = fs::metadata(target) {
+        file.set_permissions(meta.permissions())?;
+    }
+    let mut writer = BufWriter::new(file);
+    rope.write_to(&mut writer)?;
+    let file = writer
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp_path, target)?;
+    // Syncing the directory makes the rename itself durable across power
+    // loss. Best-effort: failure (or a platform that can't open a
+    // directory) costs durability, never integrity.
+    if let Ok(dir) = File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -580,6 +689,131 @@ mod tests {
         let cursor = doc.edit(0..0, "e", caret(0), EditKind::Insert);
         assert_eq!(doc.rope().to_string(), "e\u{301}x");
         assert_eq!(cursor, 2); // past the whole e-plus-accent cluster
+    }
+
+    /// A fresh scratch directory per test: tests run in parallel, so each
+    /// needs its own.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("connor-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_writes_exact_bytes_and_leaves_no_temp_file() {
+        let dir = scratch_dir("save-exact");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "a\r\nb").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.edit(0..0, "X", caret(0), EditKind::Insert);
+        assert!(doc.dirty());
+        doc.save().unwrap();
+        assert!(!doc.dirty());
+        // CRLF and the absent trailing newline both survive.
+        assert_eq!(std::fs::read(&path).unwrap(), b"Xa\r\nb");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_creates_a_missing_file() {
+        let dir = scratch_dir("save-create");
+        let path = dir.join("new.txt");
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.edit(0..0, "hi\n", caret(0), EditKind::Insert);
+        doc.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hi\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_without_a_path_errors() {
+        let mut doc = Document::empty();
+        doc.edit(0..0, "a", caret(0), EditKind::Insert);
+        assert!(doc.save().is_err());
+        assert!(doc.dirty());
+    }
+
+    #[test]
+    fn undo_and_redo_cross_the_saved_state() {
+        let dir = scratch_dir("save-undo");
+        let mut doc = Document::open(dir.join("f.txt")).unwrap();
+        doc.edit(0..0, "a", caret(0), EditKind::Insert);
+        doc.save().unwrap();
+        doc.break_undo_group();
+        doc.edit(1..1, "b", caret(1), EditKind::Insert);
+        assert!(doc.dirty());
+        doc.undo();
+        assert!(!doc.dirty()); // back at the saved state
+        doc.undo();
+        assert!(doc.dirty()); // before it
+        doc.redo();
+        assert!(!doc.dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn typing_after_save_does_not_coalesce_across_it() {
+        let dir = scratch_dir("save-coalesce");
+        let mut doc = Document::open(dir.join("f.txt")).unwrap();
+        doc.edit(0..0, "a", caret(0), EditKind::Insert);
+        doc.save().unwrap();
+        doc.edit(1..1, "b", caret(1), EditKind::Insert);
+        assert!(doc.dirty());
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), "a");
+        assert!(!doc.dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn truncating_the_saved_state_out_of_a_redo_branch_stays_dirty() {
+        let dir = scratch_dir("save-truncate");
+        let mut doc = Document::open(dir.join("f.txt")).unwrap();
+        doc.edit(0..0, "a", caret(0), EditKind::Insert);
+        doc.save().unwrap();
+        doc.undo();
+        doc.edit(0..0, "b", caret(0), EditKind::Insert);
+        assert!(doc.dirty()); // same history position, different content
+        doc.undo();
+        assert!(doc.dirty()); // the saved state is unreachable now
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_clears_lossy() {
+        let dir = scratch_dir("save-lossy");
+        let path = dir.join("g.bin");
+        std::fs::write(&path, b"ok\xFFbad").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        assert!(doc.lossy());
+        doc.save().unwrap();
+        assert!(!doc.lossy());
+        assert_eq!(std::fs::read(&path).unwrap(), "ok\u{FFFD}bad".as_bytes());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_permissions_and_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("save-unix");
+        let target = dir.join("real.sh");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.join("link.sh");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut doc = Document::open(link.clone()).unwrap();
+        doc.edit(0..3, "new", caret(3), EditKind::Other);
+        doc.save().unwrap();
+
+        assert!(link.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

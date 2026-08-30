@@ -9,8 +9,8 @@ use crate::screen::Screen;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Puts the terminal back the way the shell expects it. Idempotent, so the
-/// panic hook, `Drop`, and suspend can all call it without coordination, and
-/// it must never panic — hence `let _ =` on every write.
+/// panic hook and `Drop` can both call it without coordination, and it must
+/// never panic — hence `let _ =` on every write.
 fn restore() {
     if ACTIVE.swap(false, Ordering::SeqCst) {
         // End any pending synchronized update first: a panic between begin and
@@ -119,20 +119,6 @@ impl Terminal {
         out.write_all(scratch.as_bytes())?;
         out.flush()?;
         front.copy_from(back);
-        Ok(())
-    }
-
-    /// Hands the terminal back to the shell until `fg`. Raising SIGTSTP on
-    /// ourselves stops the process right here; execution resumes on SIGCONT,
-    /// so no signal handler is needed. The caller must re-fetch `size` — the
-    /// terminal may have been resized while we were stopped — and redraw.
-    #[cfg(unix)]
-    pub fn suspend(&mut self) -> io::Result<()> {
-        restore();
-        unsafe { libc::raise(libc::SIGTSTP) };
-        self.enter()?;
-        let (width, height) = terminal::size()?;
-        self.resize(width, height);
         Ok(())
     }
 

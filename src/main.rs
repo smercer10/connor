@@ -18,7 +18,7 @@ use std::time::Instant;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use doc::{Caret, DiskCheck, Document};
-use prompt::{Outcome, PathPrompt};
+use prompt::{LinePrompt, Outcome, PathPrompt};
 use screen::Screen;
 use tabs::{Tab, Tabs};
 use term::Terminal;
@@ -80,6 +80,8 @@ enum Prompt {
         edit: PathPrompt,
         action: PathAction,
     },
+    /// Ctrl+G: a line number being typed.
+    GoTo(LinePrompt),
 }
 
 fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
@@ -99,6 +101,7 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
             );
         }
         Prompt::Path { edit, .. } => edit.render(notice),
+        Prompt::GoTo(edit) => edit.render(notice),
     }
     Some(prompt)
 }
@@ -132,6 +135,29 @@ fn prompt_key(
     tabs: &mut Tabs,
     notice: &mut String,
 ) -> (Option<Prompt>, bool) {
+    // A go-to-line prompt consumes every key itself.
+    if let Prompt::GoTo(mut edit) = prompt {
+        return match edit.key(key) {
+            Outcome::Pending => {
+                edit.render(notice);
+                (Some(Prompt::GoTo(edit)), false)
+            }
+            Outcome::Cancel => {
+                notice.clear();
+                (None, false)
+            }
+            Outcome::Submit => {
+                notice.clear();
+                if let Some(line) = edit.line() {
+                    let Tab { doc, view } = tabs.active_mut();
+                    doc.break_undo_group();
+                    view.begin_or_clear_selection(false);
+                    view.move_to_line(doc, line);
+                }
+                (None, false)
+            }
+        };
+    }
     // A path prompt consumes every key itself.
     if let Prompt::Path { mut edit, action } = prompt {
         return match edit.key(key) {
@@ -320,8 +346,8 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
 
     loop {
         back.clear();
-        let status_caret =
-            matches!(prompt, Some(Prompt::Path { .. })).then(|| notice.chars().count());
+        let status_caret = matches!(prompt, Some(Prompt::Path { .. } | Prompt::GoTo(_)))
+            .then(|| notice.chars().count());
         let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret);
         terminal.present(&back, cursor)?;
 
@@ -385,6 +411,12 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                                 edit: PathPrompt::new("open: "),
                                 action: PathAction::Open,
                             },
+                            &tabs.active_mut().doc,
+                            &mut notice,
+                        );
+                    } else if ctrl && key.code == KeyCode::Char('g') {
+                        prompt = open_prompt(
+                            Prompt::GoTo(LinePrompt::new()),
                             &tabs.active_mut().doc,
                             &mut notice,
                         );

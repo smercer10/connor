@@ -203,6 +203,12 @@ impl View {
         self.cursor = idx;
     }
 
+    /// Jumps to 1-based `line`, clamped to the document; cursor at its start.
+    pub fn move_to_line(&mut self, doc: &Document, line: usize) {
+        self.goal_col = None;
+        self.cursor = doc.line_start(line.clamp(1, doc.line_count()) - 1);
+    }
+
     /// Restores a caret handed back by undo or redo.
     pub fn set_caret(&mut self, caret: Caret) {
         self.goal_col = None;
@@ -433,6 +439,28 @@ mod tests {
         assert_eq!(view.cursor, 6);
         view.move_home(&doc);
         assert_eq!(view.cursor, 4);
+    }
+
+    #[test]
+    fn move_to_line_clamps_and_lands_at_line_starts() {
+        let doc = Document::from_str("ab\ncd\nef");
+        let mut view = view_at(1);
+        view.move_to_line(&doc, 2);
+        assert_eq!(view.cursor, 3);
+        view.move_to_line(&doc, 999);
+        assert_eq!(view.cursor, 6);
+        view.move_to_line(&doc, 0);
+        assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn move_to_line_resets_the_goal_column() {
+        let doc = Document::from_str("abcdef\nab\nabcdef");
+        let mut view = view_at(4);
+        view.move_down(&doc); // goal column 4, clamped to end of "ab"
+        view.move_to_line(&doc, 2);
+        view.move_down(&doc);
+        assert_eq!(view.cursor, 10); // start of line 2, not old goal col 4
     }
 
     #[test]

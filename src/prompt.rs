@@ -1,5 +1,5 @@
-//! A one-line path prompt in the status line: append-only editing plus
-//! bash-style Tab completion against the filesystem.
+//! One-line status-line prompts: an append-only path field with bash-style
+//! Tab completion, and a digits-only line-number field.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,55 @@ impl PathPrompt {
 
     pub fn into_path(self) -> PathBuf {
         PathBuf::from(self.buf)
+    }
+}
+
+/// Digits-only line-number field for go-to-line.
+pub struct LinePrompt {
+    buf: String,
+}
+
+impl LinePrompt {
+    pub fn new() -> LinePrompt {
+        LinePrompt { buf: String::new() }
+    }
+
+    /// Feeds one keypress: digits append, Backspace trims. Anything else is
+    /// ignored so a stray chord can't dismiss the prompt.
+    pub fn key(&mut self, key: &KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Enter => return Outcome::Submit,
+            KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Backspace => {
+                self.buf.pop();
+            }
+            KeyCode::Char(ch)
+                if ch.is_ascii_digit()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.buf.push(ch);
+            }
+            _ => {}
+        }
+        Outcome::Pending
+    }
+
+    /// Writes the prompt into the notice; the caret sits at its end.
+    pub fn render(&self, notice: &mut String) {
+        notice.clear();
+        notice.push_str("go to line: ");
+        notice.push_str(&self.buf);
+    }
+
+    /// The typed number; `None` when empty. Overflow saturates — the caller
+    /// clamps to the document anyway.
+    pub fn line(&self) -> Option<usize> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        Some(self.buf.parse().unwrap_or(usize::MAX))
     }
 }
 
@@ -175,6 +224,43 @@ mod tests {
             Outcome::Submit
         ));
         assert!(matches!(prompt.key(&press(KeyCode::Esc)), Outcome::Cancel));
+    }
+
+    #[test]
+    fn line_prompt_takes_digits_only() {
+        let mut prompt = LinePrompt::new();
+        for code in [
+            KeyCode::Char('4'),
+            KeyCode::Char('x'),
+            KeyCode::Char('2'),
+            KeyCode::Up,
+        ] {
+            assert!(matches!(prompt.key(&press(code)), Outcome::Pending));
+        }
+        prompt.key(&KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL));
+        let mut notice = String::new();
+        prompt.render(&mut notice);
+        assert_eq!(notice, "go to line: 42");
+        assert_eq!(prompt.line(), Some(42));
+
+        prompt.key(&press(KeyCode::Backspace));
+        prompt.key(&press(KeyCode::Backspace));
+        assert_eq!(prompt.line(), None);
+    }
+
+    #[test]
+    fn line_prompt_submits_cancels_and_saturates() {
+        let mut prompt = LinePrompt::new();
+        assert!(matches!(
+            prompt.key(&press(KeyCode::Enter)),
+            Outcome::Submit
+        ));
+        assert!(matches!(prompt.key(&press(KeyCode::Esc)), Outcome::Cancel));
+
+        for _ in 0..25 {
+            prompt.key(&press(KeyCode::Char('9')));
+        }
+        assert_eq!(prompt.line(), Some(usize::MAX));
     }
 
     #[test]

@@ -6,19 +6,22 @@ mod screen;
 mod tabs;
 mod term;
 mod view;
+mod watch;
 
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use doc::Document;
 use prompt::{Outcome, PathPrompt};
 use screen::Screen;
 use tabs::{Tab, Tabs};
 use term::Terminal;
+use watch::AppEvent;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
@@ -301,6 +304,8 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
     let mut scratch = String::new();
     let mut notice = String::new();
     let mut prompt: Option<Prompt> = None;
+    let (tx, rx) = mpsc::channel();
+    watch::spawn_input_thread(tx);
 
     loop {
         back.clear();
@@ -311,8 +316,12 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
         // Page movement wants the text area as it was when the key arrived.
         let text_h = draw::text_height(back.size().1);
 
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+        let event = rx
+            .recv()
+            .map_err(|_| io::Error::other("event channel closed"))?;
+        match event {
+            AppEvent::InputFailed(e) => return Err(e),
+            AppEvent::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 if let Some(pending) = prompt.take() {
                     let (next, quit) = prompt_key(pending, &key, tabs, &mut notice);
                     prompt = next;
@@ -439,11 +448,11 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                     }
                 }
             }
-            Event::Resize(width, height) => {
+            AppEvent::Input(Event::Resize(width, height)) => {
                 terminal.resize(width, height);
                 back.resize(width, height);
             }
-            _ => {}
+            AppEvent::Input(_) => {}
         }
 
         // Re-fetch the size: a resize may have changed it.

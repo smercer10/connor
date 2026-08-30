@@ -628,6 +628,13 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                 }
                 _ => {}
             },
+            Ok(AppEvent::Input(Event::Paste(text))) => {
+                if prompt.is_none() {
+                    notice.clear();
+                    let Tab { doc, view } = tabs.active_mut();
+                    view.paste(doc, &text);
+                }
+            }
             Ok(AppEvent::Input(_)) => {}
         }
 

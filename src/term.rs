@@ -1,6 +1,7 @@
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::{Command as _, cursor, execute, terminal};
 
@@ -25,6 +26,7 @@ fn restore() {
         let _ = execute!(
             io::stdout(),
             terminal::EndSynchronizedUpdate,
+            DisableBracketedPaste,
             Print(DISABLE_MOUSE),
             terminal::LeaveAlternateScreen,
             cursor::Show
@@ -151,6 +153,7 @@ impl Terminal {
         execute!(
             io::stdout(),
             terminal::EnterAlternateScreen,
+            EnableBracketedPaste,
             Print(ENABLE_MOUSE),
             cursor::Hide
         )?;

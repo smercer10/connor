@@ -33,6 +33,7 @@ pub fn draw(screen: &mut Screen, doc: &Document, view: &View, scratch: &mut Stri
     let gutter_w = gutter_width(doc);
     let text_w = width.saturating_sub(gutter_w);
 
+    let sel = view.selection();
     let mut buf = [0; 16];
     for y in 0..text_h {
         let line = view.scroll_line + y;
@@ -47,13 +48,19 @@ pub fn draw(screen: &mut Screen, doc: &Document, view: &View, scratch: &mut Stri
         }
 
         let start = doc.line_start(line);
-        let slice = doc.rope().slice(start..doc.line_end(line));
+        let line_end = doc.line_end(line);
+        let slice = doc.rope().slice(start..line_end);
         let right = view.scroll_col + text_w;
         let mut col = 0;
         for range in RopeGraphemes::new(slice) {
             if col >= right {
                 break;
             }
+            // Cursor and anchor sit on cluster boundaries, so a cluster is
+            // always wholly in or out of the selection.
+            let selected = sel
+                .as_ref()
+                .is_some_and(|s| s.start < start + range.end && start + range.start < s.end);
             let cluster = grapheme::grapheme_str(slice, range, &mut buf);
             let cluster_w = grapheme::grapheme_width(cluster, col);
             let end = col + cluster_w;
@@ -69,8 +76,25 @@ pub fn draw(screen: &mut Screen, doc: &Document, view: &View, scratch: &mut Stri
                         screen.set_grapheme(x, y as u16, cluster, cluster_w as u8);
                     }
                 }
+                if selected {
+                    for c in col.max(view.scroll_col)..end.min(right) {
+                        screen.set_reversed(
+                            (gutter_w + c - view.scroll_col) as u16,
+                            y as u16,
+                            true,
+                        );
+                    }
+                }
             }
             col = end;
+        }
+        // A selection running past the line's end highlights one extra
+        // column there — the cue that the terminator is included, and what
+        // makes selected empty lines visible at all.
+        if sel.as_ref().is_some_and(|s| s.contains(&line_end))
+            && (view.scroll_col..right).contains(&col)
+        {
+            screen.set_reversed((gutter_w + col - view.scroll_col) as u16, y as u16, true);
         }
     }
 
@@ -190,6 +214,77 @@ mod tests {
         let text = "a\n".repeat(10);
         let (_, cursor) = render(&text, 10, 6, &scrolled);
         assert_eq!(cursor, (3, 2));
+    }
+
+    /// The reverse-video flags of a row: `#` where set, space where not.
+    fn sel_row(screen: &Screen, y: u16) -> String {
+        let (width, _) = screen.size();
+        (0..width)
+            .map(|x| {
+                if screen.get(x, y).unwrap().reversed() {
+                    '#'
+                } else {
+                    ' '
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selection_highlights_its_extent_and_nothing_else() {
+        let view = View::test_at(7, 0, 0).with_anchor(2);
+        let (screen, _) = render("hello world", 14, 2, &view);
+        assert_eq!(row(&screen, 0), "1 hello world ");
+        assert_eq!(sel_row(&screen, 0), "    #####     ");
+    }
+
+    #[test]
+    fn no_selection_or_empty_selection_highlights_nothing() {
+        let (screen, _) = render("hello", 9, 2, &View::default());
+        assert_eq!(sel_row(&screen, 0), "         ");
+
+        let collapsed = View::test_at(2, 0, 0).with_anchor(2);
+        let (screen, _) = render("hello", 9, 2, &collapsed);
+        assert_eq!(sel_row(&screen, 0), "         ");
+    }
+
+    #[test]
+    fn selection_across_lines_cues_the_terminator() {
+        let view = View::test_at(4, 0, 0).with_anchor(1);
+        let (screen, _) = render("ab\ncd", 7, 3, &view);
+        assert_eq!(sel_row(&screen, 0), "   ##  "); // b plus the terminator
+        assert_eq!(sel_row(&screen, 1), "  #    "); // c
+    }
+
+    #[test]
+    fn selected_empty_line_shows_its_terminator_cue() {
+        let view = View::test_at(4, 0, 0).with_anchor(0);
+        let (screen, _) = render("a\n\nb", 6, 4, &view);
+        assert_eq!(sel_row(&screen, 0), "  ##  ");
+        assert_eq!(sel_row(&screen, 1), "  #   ");
+        assert_eq!(sel_row(&screen, 2), "  #   ");
+    }
+
+    #[test]
+    fn selected_tabs_and_wide_glyphs_highlight_their_whole_span() {
+        let view = View::test_at(3, 0, 0).with_anchor(0);
+        let (screen, _) = render("a\tb", 12, 2, &view);
+        assert_eq!(row(&screen, 0), "1 a       b ");
+        assert_eq!(sel_row(&screen, 0), "  ######### ");
+
+        let view = View::test_at(1, 0, 0).with_anchor(0);
+        let (screen, _) = render("日x", 7, 2, &view);
+        assert_eq!(sel_row(&screen, 0), "  ##   ");
+    }
+
+    #[test]
+    fn selection_clips_to_the_viewport() {
+        // "abcdef" with columns 0-2 scrolled off and a 2-column text area:
+        // only d and e are visible of the d-f selection.
+        let view = View::test_at(6, 0, 3).with_anchor(3);
+        let (screen, _) = render("abcdef", 4, 2, &view);
+        assert_eq!(row(&screen, 0), "1 de");
+        assert_eq!(sel_row(&screen, 0), "  ##");
     }
 
     #[test]

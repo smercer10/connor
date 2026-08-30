@@ -56,6 +56,16 @@ pub fn prev_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     }
 }
 
+/// The nearest cluster boundary at or after `char_idx` — the identity when
+/// already on one. Guards callers whose index can land mid-cluster, e.g. an
+/// insert that merges with a following combining mark.
+pub fn snap_to_boundary(slice: RopeSlice, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    next_grapheme_boundary(slice, prev_grapheme_boundary(slice, char_idx))
+}
+
 /// Yields each cluster of a slice as a char range, front to back. Walks the
 /// chunks linearly — amortized O(bytes), no per-cluster tree lookups — which
 /// is what rendering and word scans want.
@@ -212,6 +222,16 @@ mod tests {
         }
         assert_eq!(idx, slice.len_chars());
         assert_eq!(count, 4001);
+    }
+
+    #[test]
+    fn snap_is_identity_on_boundaries_and_snaps_forward_inside_clusters() {
+        let rope = Rope::from_str("ae\u{301}b");
+        let slice = rope.slice(..);
+        for idx in [0, 1, 3, 4] {
+            assert_eq!(snap_to_boundary(slice, idx), idx);
+        }
+        assert_eq!(snap_to_boundary(slice, 2), 3); // between e and its accent
     }
 
     #[test]

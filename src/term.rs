@@ -1,6 +1,7 @@
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::style::{Attribute, SetAttribute};
 use crossterm::{Command as _, cursor, execute, terminal};
 
 use crate::screen::Screen;
@@ -8,8 +9,8 @@ use crate::screen::Screen;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Puts the terminal back the way the shell expects it. Idempotent, so the
-/// panic hook, `Drop`, and suspend can all call it without coordination, and
-/// it must never panic — hence `let _ =` on every write.
+/// panic hook and `Drop` can both call it without coordination, and it must
+/// never panic — hence `let _ =` on every write.
 fn restore() {
     if ACTIVE.swap(false, Ordering::SeqCst) {
         // End any pending synchronized update first: a panic between begin and
@@ -83,6 +84,9 @@ impl Terminal {
             let _ = terminal::Clear(terminal::ClearType::All).write_ansi(scratch);
             *needs_clear = false;
         }
+        // Reverse video is toggled only when it changes and always switched
+        // off by frame end, so each frame starts from a known plain state.
+        let mut reversed = false;
         back.for_each_changed_run(front, |x, y, run| {
             // A wide glyph changing always changes its leader, so a run can
             // never begin on a continuation cell.
@@ -92,10 +96,22 @@ impl Terminal {
                 // The terminal advanced two columns at the leader; emitting
                 // anything for the continuation would shift the row.
                 if !cell.is_continuation() {
+                    if cell.reversed() != reversed {
+                        reversed = cell.reversed();
+                        let attr = if reversed {
+                            Attribute::Reverse
+                        } else {
+                            Attribute::NoReverse
+                        };
+                        let _ = SetAttribute(attr).write_ansi(scratch);
+                    }
                     scratch.push_str(cell.str());
                 }
             }
         });
+        if reversed {
+            let _ = SetAttribute(Attribute::NoReverse).write_ansi(scratch);
+        }
         let _ = cursor::MoveTo(cursor.0, cursor.1).write_ansi(scratch);
         let _ = cursor::Show.write_ansi(scratch);
         let _ = terminal::EndSynchronizedUpdate.write_ansi(scratch);
@@ -103,20 +119,6 @@ impl Terminal {
         out.write_all(scratch.as_bytes())?;
         out.flush()?;
         front.copy_from(back);
-        Ok(())
-    }
-
-    /// Hands the terminal back to the shell until `fg`. Raising SIGTSTP on
-    /// ourselves stops the process right here; execution resumes on SIGCONT,
-    /// so no signal handler is needed. The caller must re-fetch `size` — the
-    /// terminal may have been resized while we were stopped — and redraw.
-    #[cfg(unix)]
-    pub fn suspend(&mut self) -> io::Result<()> {
-        restore();
-        unsafe { libc::raise(libc::SIGTSTP) };
-        self.enter()?;
-        let (width, height) = terminal::size()?;
-        self.resize(width, height);
         Ok(())
     }
 
@@ -133,7 +135,9 @@ impl Terminal {
 
     fn reserve_scratch(&mut self) {
         let (width, height) = self.front.size();
-        let target = usize::from(width) * usize::from(height) * 16 + 1024;
+        // 24 bytes per cell: the glyph plus cursor moves and reverse-video
+        // toggles that can appear inside runs.
+        let target = usize::from(width) * usize::from(height) * 24 + 1024;
         self.scratch
             .reserve(target.saturating_sub(self.scratch.len()));
     }

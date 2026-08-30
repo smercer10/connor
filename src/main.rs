@@ -25,7 +25,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     // Open before touching the terminal so errors print on the normal screen.
-    let doc = match path {
+    let mut doc = match path {
         Some(path) => match Document::open(path.clone()) {
             Ok(doc) => doc,
             Err(e) => {
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
         },
         None => Document::empty(),
     };
-    match run(&doc) {
+    match run(&mut doc) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("connor: {e}");
@@ -44,7 +44,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(doc: &Document) -> io::Result<()> {
+fn run(doc: &mut Document) -> io::Result<()> {
     term::init_panic_hook();
     let mut terminal = Terminal::new()?;
     let (width, height) = terminal.size();
@@ -63,13 +63,34 @@ fn run(doc: &Document) -> io::Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let movement = matches!(
+                    key.code,
+                    KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                );
+                if movement {
+                    // Shift extends a selection through any movement key;
+                    // Char keys never land here, so shifted typing is safe.
+                    view.begin_or_clear_selection(key.modifiers.contains(KeyModifiers::SHIFT));
+                    doc.break_undo_group();
+                }
                 match key.code {
                     KeyCode::Char('q') if ctrl => break,
-                    #[cfg(unix)]
                     KeyCode::Char('z') if ctrl => {
-                        terminal.suspend()?;
-                        let (width, height) = terminal.size();
-                        back.resize(width, height);
+                        if let Some(caret) = doc.undo() {
+                            view.set_caret(caret);
+                        }
+                    }
+                    KeyCode::Char('y') if ctrl => {
+                        if let Some(caret) = doc.redo() {
+                            view.set_caret(caret);
+                        }
                     }
                     #[cfg(debug_assertions)]
                     KeyCode::Char('p') if ctrl => panic!("deliberate panic (Ctrl+P)"),
@@ -85,6 +106,15 @@ fn run(doc: &Document) -> io::Result<()> {
                     KeyCode::End => view.move_end(doc),
                     KeyCode::PageUp => view.page_up(doc, text_h),
                     KeyCode::PageDown => view.page_down(doc, text_h),
+                    // Alt-modified letters are terminal escape chords, not
+                    // text to insert.
+                    KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                        view.insert_char(doc, ch)
+                    }
+                    KeyCode::Enter => view.insert_newline(doc),
+                    KeyCode::Tab => view.insert_tab(doc),
+                    KeyCode::Backspace => view.backspace(doc),
+                    KeyCode::Delete => view.delete(doc),
                     _ => {}
                 }
             }
@@ -95,7 +125,7 @@ fn run(doc: &Document) -> io::Result<()> {
             _ => {}
         }
 
-        // Re-fetch the size: resize and suspend may have changed it.
+        // Re-fetch the size: a resize may have changed it.
         let (width, height) = back.size();
         let text_w = usize::from(width).saturating_sub(draw::gutter_width(doc));
         view.scroll_to_cursor(doc, text_w, draw::text_height(height));

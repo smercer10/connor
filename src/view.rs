@@ -1,15 +1,20 @@
-use crate::doc::Document;
+use std::ops::Range;
+
+use crate::doc::{Caret, Document, EditKind};
 use crate::grapheme::{self, RopeGraphemes};
 
 /// Everything that belongs to one view of a document rather than to the
-/// document itself: cursor, sticky column, and scroll position. A document
-/// shown in two places would have two of these.
+/// document itself: cursor, selection, sticky column, and scroll position.
+/// A document shown in two places would have two of these.
 #[derive(Default)]
 pub struct View {
     /// Char index into the rope. Always on a grapheme-cluster boundary and
     /// never past a line's terminator (it may sit at a line's end, after the
     /// last cluster).
     pub cursor: usize,
+    /// The selection's fixed end; the cursor is the moving end. `None` means
+    /// no selection.
+    pub anchor: Option<usize>,
     /// The visual column vertical movement aims for, so the cursor springs
     /// back out wide after crossing short lines. Set by the first vertical
     /// move, cleared by any horizontal one.
@@ -43,14 +48,38 @@ impl View {
     pub fn test_at(cursor: usize, scroll_line: usize, scroll_col: usize) -> View {
         View {
             cursor,
+            anchor: None,
             goal_col: None,
             scroll_line,
             scroll_col,
         }
     }
 
+    #[cfg(test)]
+    pub fn with_anchor(mut self, anchor: usize) -> View {
+        self.anchor = Some(anchor);
+        self
+    }
+
     pub fn line(&self, doc: &Document) -> usize {
         doc.rope().char_to_line(self.cursor)
+    }
+
+    /// The selected char range, normalized so start ≤ end. A zero-width
+    /// selection behaves as none everywhere.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    /// Called before every movement key: an extending move drops the anchor
+    /// where the cursor stands, a plain move dissolves the selection.
+    pub fn begin_or_clear_selection(&mut self, extend: bool) {
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
     }
 
     pub fn move_left(&mut self, doc: &Document) {
@@ -157,6 +186,98 @@ impl View {
             }
         }
         self.cursor = idx;
+    }
+
+    /// Restores a caret handed back by undo or redo.
+    pub fn set_caret(&mut self, caret: Caret) {
+        self.goal_col = None;
+        self.cursor = caret.cursor;
+        self.anchor = caret.anchor;
+    }
+
+    /// The range a pending edit replaces: the selection, or nothing at the
+    /// cursor.
+    fn edit_range(&self) -> Range<usize> {
+        self.selection().unwrap_or(self.cursor..self.cursor)
+    }
+
+    fn apply_edit(&mut self, doc: &mut Document, range: Range<usize>, text: &str, kind: EditKind) {
+        let caret = Caret {
+            cursor: self.cursor,
+            anchor: self.anchor,
+        };
+        self.goal_col = None;
+        self.anchor = None;
+        self.cursor = doc.edit(range, text, caret, kind);
+    }
+
+    /// Kind for an insertion: replacing a selection is its own undo step,
+    /// plain typing joins the open run.
+    fn insert_kind(range: &Range<usize>) -> EditKind {
+        if range.is_empty() {
+            EditKind::Insert
+        } else {
+            EditKind::Other
+        }
+    }
+
+    pub fn insert_char(&mut self, doc: &mut Document, ch: char) {
+        let range = self.edit_range();
+        let kind = View::insert_kind(&range);
+        let mut buf = [0; 4];
+        self.apply_edit(doc, range, ch.encode_utf8(&mut buf), kind);
+    }
+
+    pub fn insert_tab(&mut self, doc: &mut Document) {
+        let range = self.edit_range();
+        let kind = View::insert_kind(&range);
+        let text = doc.indent().as_str();
+        self.apply_edit(doc, range, text, kind);
+    }
+
+    /// Enter: the detected terminator plus a copy of the current line's
+    /// leading whitespace — only the part before the edit point, so Enter
+    /// pressed inside the indentation doesn't deepen it. One edit, so a
+    /// selection replace and the newline undo together.
+    pub fn insert_newline(&mut self, doc: &mut Document) {
+        let range = self.edit_range();
+        let line_start = doc.line_start(doc.rope().char_to_line(range.start));
+        let mut text = String::from(doc.line_ending().as_str());
+        text.extend(
+            doc.rope()
+                .slice(line_start..range.start)
+                .chars()
+                .take_while(|&ch| ch == ' ' || ch == '\t'),
+        );
+        self.apply_edit(doc, range, &text, EditKind::Other);
+    }
+
+    pub fn backspace(&mut self, doc: &mut Document) {
+        let (range, kind) = match self.selection() {
+            Some(sel) => (sel, EditKind::Other),
+            None => {
+                let prev = grapheme::prev_grapheme_boundary(doc.rope().slice(..), self.cursor);
+                if prev == self.cursor {
+                    return;
+                }
+                (prev..self.cursor, EditKind::Backspace)
+            }
+        };
+        self.apply_edit(doc, range, "", kind);
+    }
+
+    pub fn delete(&mut self, doc: &mut Document) {
+        let (range, kind) = match self.selection() {
+            Some(sel) => (sel, EditKind::Other),
+            None => {
+                let next = grapheme::next_grapheme_boundary(doc.rope().slice(..), self.cursor);
+                if next == self.cursor {
+                    return;
+                }
+                (self.cursor..next, EditKind::Delete)
+            }
+        };
+        self.apply_edit(doc, range, "", kind);
     }
 
     /// The cursor's visual column on its line. O(prefix): fine for any real
@@ -374,6 +495,147 @@ mod tests {
         }
         view.move_word_left(&doc);
         assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn insert_advances_past_the_typed_char() {
+        let mut doc = Document::from_str("bc");
+        let mut view = View::default();
+        view.insert_char(&mut doc, 'a');
+        assert_eq!(doc.rope().to_string(), "abc");
+        assert_eq!(view.cursor, 1);
+    }
+
+    #[test]
+    fn typing_over_a_selection_replaces_it() {
+        let mut doc = Document::from_str("hello");
+        let mut view = view_at(1).with_anchor(4); // "ell", cursor at its start
+        view.insert_char(&mut doc, 'X');
+        assert_eq!(doc.rope().to_string(), "hXo");
+        assert_eq!(view.cursor, 2);
+        assert_eq!(view.anchor, None);
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_whole_clusters() {
+        let mut doc = Document::from_str("ae\u{301}b");
+        let mut view = view_at(3);
+        view.backspace(&mut doc); // e plus its accent
+        assert_eq!(doc.rope().to_string(), "ab");
+        assert_eq!(view.cursor, 1);
+        view.delete(&mut doc);
+        assert_eq!(doc.rope().to_string(), "a");
+        assert_eq!(view.cursor, 1);
+    }
+
+    #[test]
+    fn backspace_at_a_line_start_removes_the_whole_crlf() {
+        let mut doc = Document::from_str("ab\r\ncd");
+        let mut view = view_at(4);
+        view.backspace(&mut doc);
+        assert_eq!(doc.rope().to_string(), "abcd");
+        assert_eq!(view.cursor, 2);
+    }
+
+    #[test]
+    fn backspace_and_delete_eat_a_selection_whole() {
+        let mut doc = Document::from_str("hello");
+        let mut view = view_at(4).with_anchor(1);
+        view.backspace(&mut doc);
+        assert_eq!(doc.rope().to_string(), "ho");
+        assert_eq!(view.cursor, 1);
+        assert_eq!(view.anchor, None);
+    }
+
+    #[test]
+    fn edits_at_the_document_edges_are_no_ops() {
+        let mut doc = Document::from_str("a");
+        let mut view = view_at(0);
+        view.backspace(&mut doc);
+        let mut view = view_at(1);
+        view.delete(&mut doc);
+        assert_eq!(doc.rope().to_string(), "a");
+        assert!(!doc.dirty());
+    }
+
+    #[test]
+    fn enter_copies_the_leading_whitespace() {
+        let mut doc = Document::from_str("    foo");
+        let mut view = view_at(7);
+        view.insert_newline(&mut doc);
+        assert_eq!(doc.rope().to_string(), "    foo\n    ");
+        assert_eq!(view.cursor, 12);
+    }
+
+    #[test]
+    fn enter_inside_the_indentation_copies_only_the_prefix() {
+        let mut doc = Document::from_str("\t\tfoo");
+        let mut view = view_at(1);
+        view.insert_newline(&mut doc);
+        assert_eq!(doc.rope().to_string(), "\t\n\t\tfoo");
+        assert_eq!(view.cursor, 3);
+    }
+
+    #[test]
+    fn enter_on_a_crlf_document_inserts_crlf() {
+        let mut doc = Document::from_str("ab\r\ncd");
+        let mut view = view_at(6);
+        view.insert_newline(&mut doc);
+        assert_eq!(doc.rope().to_string(), "ab\r\ncd\r\n");
+        assert_eq!(view.cursor, 8);
+    }
+
+    #[test]
+    fn enter_replaces_a_selection_then_indents_from_the_result() {
+        let mut doc = Document::from_str("  ab\n  cd");
+        let mut view = view_at(8).with_anchor(3); // "b\n  c"
+        view.insert_newline(&mut doc);
+        assert_eq!(doc.rope().to_string(), "  a\n  d");
+        assert_eq!(view.cursor, 6);
+    }
+
+    #[test]
+    fn tab_inserts_the_detected_indent() {
+        let mut doc = Document::from_str("\tx\n");
+        let mut view = View::default();
+        view.insert_tab(&mut doc);
+        assert_eq!(doc.rope().to_string(), "\t\tx\n");
+
+        let mut doc = Document::from_str("  x\n  y\n");
+        let mut view = View::default();
+        view.insert_tab(&mut doc);
+        assert_eq!(doc.rope().to_string(), "    x\n  y\n");
+
+        let mut doc = Document::empty();
+        let mut view = View::default();
+        view.insert_tab(&mut doc);
+        assert_eq!(doc.rope().to_string(), "    ");
+    }
+
+    #[test]
+    fn edits_clear_the_goal_column() {
+        let mut doc = Document::from_str("abcdef\nab\nabcdef");
+        let mut view = view_at(4);
+        view.move_down(&doc); // goal 4, clamped to end of "ab"
+        view.insert_char(&mut doc, 'x');
+        view.move_down(&doc); // new goal is col 3, not the stale 4
+        assert_eq!(view.cursor, 14);
+    }
+
+    #[test]
+    fn a_typing_burst_undoes_as_one_step_through_the_view() {
+        let mut doc = Document::empty();
+        let mut view = View::default();
+        for ch in "hi!".chars() {
+            view.insert_char(&mut doc, ch);
+        }
+        assert_eq!(doc.rope().to_string(), "hi!");
+        view.set_caret(doc.undo().unwrap());
+        assert_eq!(doc.rope().to_string(), "");
+        assert_eq!(view.cursor, 0);
+        view.set_caret(doc.redo().unwrap());
+        assert_eq!(doc.rope().to_string(), "hi!");
+        assert_eq!(view.cursor, 3);
     }
 
     #[test]

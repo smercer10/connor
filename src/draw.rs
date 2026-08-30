@@ -27,7 +27,8 @@ pub fn text_height(screen_height: u16) -> usize {
 /// cell. O(viewport): only visible lines are walked, and each only to the
 /// viewport's right edge. `scratch` is reused across frames so steady-state
 /// drawing never heap-allocates. A non-empty `notice` — a message or a
-/// mini-prompt — takes over the status line until the next keypress;
+/// mini-prompt — takes over the status line until the next keypress,
+/// hiding its right-aligned help hint;
 /// `status_caret` parks the cursor after that many of the notice's chars
 /// while a prompt is editing there. `search` underlines every match and
 /// reverses the current one.
@@ -157,6 +158,15 @@ pub fn draw(
             scratch.push_str(" [recovered]");
         }
         screen.set_text(0, height - 1, scratch);
+        // The keymap's discoverability bootstrap: a right-aligned pointer
+        // at the overlay, yielding whenever the left content needs the room.
+        let left: usize = scratch.chars().map(char_cols).sum();
+        scratch.clear();
+        keymap::write_help_hint(scratch);
+        let hint = scratch.chars().count();
+        if hint > 0 && left + 2 + hint <= width {
+            screen.set_text((width - hint) as u16, height - 1, scratch);
+        }
     } else {
         screen.set_text(0, height - 1, notice);
     }
@@ -531,6 +541,16 @@ mod tests {
         let (screen, _) = render_tabs(&tabs, 32, 4);
         assert_eq!(row(&screen, 0), " a.rs+!                         ");
         assert_eq!(row(&screen, 3), "a.rs · 1:1 [+] [disk changed]   ");
+    }
+
+    #[test]
+    fn the_help_hint_right_aligns_and_yields_to_a_cramped_status() {
+        let (screen, _) = render("ab", 40, 3, View::default());
+        assert_eq!(row(&screen, 2), "[No Name] · 1:1                  F1 help");
+
+        // One column short of the two-space gap: the hint disappears whole.
+        let (screen, _) = render("ab", 23, 3, View::default());
+        assert_eq!(row(&screen, 2), "[No Name] · 1:1        ");
     }
 
     #[test]

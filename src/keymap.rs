@@ -227,6 +227,26 @@ impl Binding {
     }
 }
 
+/// Appends the status line's pointer at the overlay, e.g. "F1 help":
+/// the Help binding's unmodified chord (its tersest spelling), sourced
+/// from the table so a rebinding follows.
+pub fn write_help_hint(out: &mut String) {
+    let binding = KEYMAP
+        .iter()
+        .flat_map(|s| s.bindings)
+        .find(|b| b.action == Action::Help);
+    let Some(binding) = binding else { return };
+    let key = binding
+        .keys
+        .iter()
+        .find(|k| k.mods.is_empty())
+        .or(binding.keys.first());
+    if let Some(key) = key {
+        push_key(out, key);
+        out.push_str(" help");
+    }
+}
+
 fn push_key(out: &mut String, key: &Key) {
     if key.mods.contains(KeyModifiers::CONTROL) {
         out.push_str("Ctrl+");
@@ -347,6 +367,13 @@ mod tests {
         assert_eq!(label(Action::Help), "Ctrl+/·F1");
         assert_eq!(label(Action::DocStart), "Ctrl+Home");
         assert_eq!(label(Action::Backspace), "Bksp");
+    }
+
+    #[test]
+    fn the_help_hint_names_the_unmodified_chord() {
+        let mut out = String::new();
+        write_help_hint(&mut out);
+        assert_eq!(out, "F1 help");
     }
 
     #[test]

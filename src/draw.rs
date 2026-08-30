@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::doc::Document;
 use crate::grapheme::{self, RopeGraphemes};
 use crate::screen::Screen;
+use crate::search::Highlights;
 use crate::tabs::{Tab, Tabs};
 
 /// The screen columns the text area starts at: the gutter holds every line
@@ -26,14 +27,16 @@ pub fn text_height(screen_height: u16) -> usize {
 /// viewport's right edge. `scratch` is reused across frames so steady-state
 /// drawing never heap-allocates. A non-empty `notice` — a message or a
 /// mini-prompt — takes over the status line until the next keypress;
-/// `caret_in_status` parks the cursor at the notice's end while a prompt
-/// is editing there.
+/// `status_caret` parks the cursor after that many of the notice's chars
+/// while a prompt is editing there. `search` underlines every match and
+/// reverses the current one.
 pub fn draw(
     screen: &mut Screen,
     tabs: &Tabs,
     scratch: &mut String,
     notice: &str,
-    caret_in_status: bool,
+    status_caret: Option<usize>,
+    search: Option<Highlights>,
 ) -> (u16, u16) {
     let (width, height) = screen.size();
     if width == 0 || height == 0 {
@@ -73,11 +76,13 @@ pub fn draw(
             if col >= right {
                 break;
             }
-            // Cursor and anchor sit on cluster boundaries, so a cluster is
-            // always wholly in or out of the selection.
+            // The cluster's span in document char indices. Cursor and anchor
+            // sit on cluster boundaries, so a cluster is always wholly in or
+            // out of the selection.
+            let (c_start, c_end) = (start + range.start, start + range.end);
             let selected = sel
                 .as_ref()
-                .is_some_and(|s| s.start < start + range.end && start + range.start < s.end);
+                .is_some_and(|s| s.start < c_end && c_start < s.end);
             let cluster = grapheme::grapheme_str(slice, range, &mut buf);
             let cluster_w = grapheme::grapheme_width(cluster, col);
             let end = col + cluster_w;
@@ -96,6 +101,27 @@ pub fn draw(
                 if selected {
                     for c in col.max(view.scroll_col)..end.min(right) {
                         screen.set_reversed((gutter_w + c - view.scroll_col) as u16, row, true);
+                    }
+                }
+                // Match starts sit on char indices, so like the selection a
+                // cluster is wholly in or out; binary search keeps the pass
+                // O(log matches) per visible cluster. A stale out-of-range
+                // start simply intersects nothing.
+                if let Some(h) = &search
+                    && h.len > 0
+                {
+                    let i = h
+                        .starts
+                        .partition_point(|&s| s.saturating_add(h.len) <= c_start);
+                    if h.starts.get(i).is_some_and(|&s| s < c_end) {
+                        for c in col.max(view.scroll_col)..end.min(right) {
+                            let x = (gutter_w + c - view.scroll_col) as u16;
+                            if h.current == Some(i) {
+                                screen.set_reversed(x, row, true);
+                            } else {
+                                screen.set_underlined(x, row, true);
+                            }
+                        }
                     }
                 }
             }
@@ -131,8 +157,8 @@ pub fn draw(
         screen.set_text(0, height - 1, notice);
     }
 
-    if caret_in_status {
-        let col: usize = notice.chars().map(char_cols).sum();
+    if let Some(chars) = status_caret {
+        let col: usize = notice.chars().take(chars).map(char_cols).sum();
         return (col.min(width - 1) as u16, height - 1);
     }
     let cx = (gutter_w + vcol.saturating_sub(view.scroll_col)).min(width - 1) as u16;
@@ -258,7 +284,7 @@ mod tests {
     fn render_tabs(tabs: &Tabs, width: u16, height: u16) -> (Screen, (u16, u16)) {
         let mut screen = Screen::new(width, height);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, tabs, &mut scratch, "", false);
+        let cursor = draw(&mut screen, tabs, &mut scratch, "", None, None);
         (screen, cursor)
     }
 
@@ -362,7 +388,7 @@ mod tests {
         let tabs = tabs_of(Document::from_str("ab"), View::default());
         let mut screen = Screen::new(12, 3);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "saved ab", false);
+        draw(&mut screen, &tabs, &mut scratch, "saved ab", None, None);
         assert_eq!(row(&screen, 2), "saved ab    ");
     }
 
@@ -371,12 +397,36 @@ mod tests {
         let tabs = tabs_of(Document::from_str("ab"), View::default());
         let mut screen = Screen::new(12, 3);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, &tabs, &mut scratch, "open: sr", true);
+        let cursor = draw(&mut screen, &tabs, &mut scratch, "open: sr", Some(8), None);
         assert_eq!(cursor, (8, 2));
 
         // The caret clips at the right edge rather than leaving the screen.
-        let cursor = draw(&mut screen, &tabs, &mut scratch, "open: src/main.rs", true);
+        let cursor = draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "open: src/main.rs",
+            Some(17),
+            None,
+        );
         assert_eq!(cursor, (11, 2));
+    }
+
+    #[test]
+    fn prompt_caret_can_park_inside_the_notice() {
+        let tabs = tabs_of(Document::from_str("ab"), View::default());
+        let mut screen = Screen::new(24, 3);
+        let mut scratch = String::new();
+        // Caret after "find: 日" — hint text follows the edited field.
+        let cursor = draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "find: 日 · esc",
+            Some(7),
+            None,
+        );
+        assert_eq!(cursor, (8, 2));
     }
 
     #[test]
@@ -433,6 +483,83 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// The underline flags of a row: `_` where set, space where not.
+    fn ul_row(screen: &Screen, y: u16) -> String {
+        let (width, _) = screen.size();
+        (0..width)
+            .map(|x| {
+                if screen.get(x, y).unwrap().underlined() {
+                    '_'
+                } else {
+                    ' '
+                }
+            })
+            .collect()
+    }
+
+    fn render_search(
+        text: &str,
+        width: u16,
+        height: u16,
+        view: View,
+        search: Highlights,
+    ) -> Screen {
+        let tabs = tabs_of(Document::from_str(text), view);
+        let mut screen = Screen::new(width, height);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, Some(search));
+        screen
+    }
+
+    #[test]
+    fn matches_underline_and_the_current_one_reverses() {
+        let starts = [0, 3, 6];
+        let search = Highlights {
+            starts: &starts,
+            len: 2,
+            current: Some(1),
+        };
+        let screen = render_search("ab ab ab", 11, 3, View::default(), search);
+        assert_eq!(ul_row(&screen, 1), "  __    __ ");
+        assert_eq!(sel_row(&screen, 1), "     ##    ");
+    }
+
+    #[test]
+    fn match_highlights_clip_to_the_viewport_and_span_wide_glyphs() {
+        // "abcdef" with columns 0-2 scrolled off: only the "de" of the
+        // "def" match is visible.
+        let starts = [3];
+        let search = Highlights {
+            starts: &starts,
+            len: 3,
+            current: None,
+        };
+        let screen = render_search("abcdef", 4, 3, View::test_at(0, 0, 3), search);
+        assert_eq!(ul_row(&screen, 1), "  __");
+
+        let starts = [1];
+        let search = Highlights {
+            starts: &starts,
+            len: 1,
+            current: None,
+        };
+        let screen = render_search("a日b", 8, 3, View::default(), search);
+        assert_eq!(ul_row(&screen, 1), "   __   ");
+    }
+
+    #[test]
+    fn stale_match_starts_past_the_text_highlight_nothing() {
+        let starts = [2, 90, 500];
+        let search = Highlights {
+            starts: &starts,
+            len: 2,
+            current: Some(2),
+        };
+        let screen = render_search("abcd", 8, 3, View::default(), search);
+        assert_eq!(ul_row(&screen, 1), "    __  ");
+        assert_eq!(sel_row(&screen, 1), "        ");
     }
 
     #[test]
@@ -503,6 +630,14 @@ mod tests {
             ]);
             tabs.activate(2);
             render_tabs(&tabs, w, h);
+
+            let starts = [0, 7, usize::MAX - 1];
+            let search = Highlights {
+                starts: &starts,
+                len: 2,
+                current: Some(9),
+            };
+            render_search("日本\ntext", w, h, View::default(), search);
         }
     }
 }

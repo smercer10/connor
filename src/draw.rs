@@ -22,8 +22,15 @@ pub fn text_height(screen_height: u16) -> usize {
 /// Draws one frame into a cleared screen and returns the cursor's screen
 /// cell. O(viewport): only visible lines are walked, and each only to the
 /// viewport's right edge. `scratch` is reused across frames so steady-state
-/// drawing never heap-allocates.
-pub fn draw(screen: &mut Screen, doc: &Document, view: &View, scratch: &mut String) -> (u16, u16) {
+/// drawing never heap-allocates. A non-empty `notice` — a message or a
+/// mini-prompt — takes over the status line until the next keypress.
+pub fn draw(
+    screen: &mut Screen,
+    doc: &Document,
+    view: &View,
+    scratch: &mut String,
+    notice: &str,
+) -> (u16, u16) {
     let (width, height) = screen.size();
     if width == 0 || height == 0 {
         return (0, 0);
@@ -101,15 +108,19 @@ pub fn draw(screen: &mut Screen, doc: &Document, view: &View, scratch: &mut Stri
     let line = view.line(doc);
     let vcol = view.vcol(doc);
 
-    scratch.clear();
-    let _ = write!(scratch, "{} · {}:{}", doc.name(), line + 1, vcol + 1);
-    if doc.dirty() {
-        scratch.push_str(" [+]");
+    if notice.is_empty() {
+        scratch.clear();
+        let _ = write!(scratch, "{} · {}:{}", doc.name(), line + 1, vcol + 1);
+        if doc.dirty() {
+            scratch.push_str(" [+]");
+        }
+        if doc.lossy() {
+            scratch.push_str(" [lossy]");
+        }
+        screen.set_text(0, height - 1, scratch);
+    } else {
+        screen.set_text(0, height - 1, notice);
     }
-    if doc.lossy() {
-        scratch.push_str(" [lossy]");
-    }
-    screen.set_text(0, height - 1, scratch);
 
     let cx = (gutter_w + vcol.saturating_sub(view.scroll_col)).min(width - 1) as u16;
     let cy = line
@@ -135,7 +146,7 @@ mod tests {
         let doc = Document::from_str(text);
         let mut screen = Screen::new(width, height);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, &doc, view, &mut scratch);
+        let cursor = draw(&mut screen, &doc, view, &mut scratch, "");
         (screen, cursor)
     }
 
@@ -197,9 +208,24 @@ mod tests {
         let view = View::test_at(4, 0, 0); // 'b' on line 2
         let mut screen = Screen::new(24, 3);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, &doc, &view, &mut scratch);
+        let cursor = draw(&mut screen, &doc, &view, &mut scratch, "");
         assert_eq!(row(&screen, 2), "[No Name] · 2:2 [lossy] ");
         assert_eq!(cursor, (3, 1));
+    }
+
+    #[test]
+    fn a_notice_takes_over_the_status_line() {
+        let doc = Document::from_str("ab");
+        let mut screen = Screen::new(12, 2);
+        let mut scratch = String::new();
+        draw(
+            &mut screen,
+            &doc,
+            &View::default(),
+            &mut scratch,
+            "saved ab",
+        );
+        assert_eq!(row(&screen, 1), "saved ab    ");
     }
 
     #[test]

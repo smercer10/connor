@@ -5,6 +5,7 @@ mod screen;
 mod term;
 mod view;
 
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -44,6 +45,79 @@ fn main() -> ExitCode {
     }
 }
 
+/// A mini-prompt owning the next keypress; its question sits in the notice.
+enum Prompt {
+    /// Ctrl+Q with unsaved changes: save / discard / cancel.
+    Quit,
+    /// The file loaded lossily, so writing it back mangles the bytes the
+    /// U+FFFD marks stand for — overwriting must be deliberate.
+    LossySave { then_quit: bool },
+}
+
+fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
+    notice.clear();
+    match prompt {
+        Prompt::Quit => {
+            notice.push_str("unsaved changes — save before quitting? (y)es · (n)o · (esc) cancel");
+        }
+        Prompt::LossySave { .. } => {
+            let _ = write!(
+                notice,
+                "invalid UTF-8 was replaced on load — overwrite {}? (y)es · (esc) cancel",
+                doc.name()
+            );
+        }
+    }
+    Some(prompt)
+}
+
+fn try_save(doc: &mut Document, notice: &mut String) -> bool {
+    notice.clear();
+    match doc.save() {
+        Ok(()) => {
+            let _ = write!(notice, "saved {}", doc.name());
+            true
+        }
+        Err(e) => {
+            let _ = write!(notice, "save failed: {e}");
+            false
+        }
+    }
+}
+
+/// Feeds one keypress to a pending prompt. Returns the prompt still pending
+/// (unrecognized keys leave it up) and whether the editor should quit.
+fn prompt_key(
+    prompt: Prompt,
+    key: KeyCode,
+    doc: &mut Document,
+    notice: &mut String,
+) -> (Option<Prompt>, bool) {
+    match (prompt, key) {
+        (Prompt::Quit, KeyCode::Char('y' | 'Y')) => {
+            if doc.lossy() {
+                (
+                    open_prompt(Prompt::LossySave { then_quit: true }, doc, notice),
+                    false,
+                )
+            } else {
+                // A failed save cancels the quit: the error stays visible
+                // and the changes stay alive.
+                (None, try_save(doc, notice))
+            }
+        }
+        (Prompt::Quit, KeyCode::Char('n' | 'N')) => (None, true),
+        (Prompt::LossySave { then_quit }, KeyCode::Char('y' | 'Y')) => {
+            (None, try_save(doc, notice) && then_quit)
+        }
+        (_, KeyCode::Esc) => {
+            notice.clear();
+            (None, false)
+        }
+        (prompt, _) => (Some(prompt), false),
+    }
+}
+
 fn run(doc: &mut Document) -> io::Result<()> {
     term::init_panic_hook();
     let mut terminal = Terminal::new()?;
@@ -51,10 +125,12 @@ fn run(doc: &mut Document) -> io::Result<()> {
     let mut back = Screen::new(width, height);
     let mut view = View::default();
     let mut scratch = String::new();
+    let mut notice = String::new();
+    let mut prompt: Option<Prompt> = None;
 
     loop {
         back.clear();
-        let cursor = draw::draw(&mut back, doc, &view, &mut scratch);
+        let cursor = draw::draw(&mut back, doc, &view, &mut scratch, &notice);
         terminal.present(&back, cursor)?;
 
         // Page movement wants the text area as it was when the key arrived.
@@ -62,6 +138,15 @@ fn run(doc: &mut Document) -> io::Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let Some(pending) = prompt.take() {
+                    let (next, quit) = prompt_key(pending, key.code, doc, &mut notice);
+                    prompt = next;
+                    if quit {
+                        break;
+                    }
+                    continue;
+                }
+                notice.clear();
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let movement = matches!(
                     key.code,
@@ -81,7 +166,24 @@ fn run(doc: &mut Document) -> io::Result<()> {
                     doc.break_undo_group();
                 }
                 match key.code {
-                    KeyCode::Char('q') if ctrl => break,
+                    KeyCode::Char('q') if ctrl => {
+                        if doc.dirty() {
+                            prompt = open_prompt(Prompt::Quit, doc, &mut notice);
+                        } else {
+                            break;
+                        }
+                    }
+                    KeyCode::Char('s') if ctrl => {
+                        if doc.lossy() {
+                            prompt = open_prompt(
+                                Prompt::LossySave { then_quit: false },
+                                doc,
+                                &mut notice,
+                            );
+                        } else {
+                            try_save(doc, &mut notice);
+                        }
+                    }
                     KeyCode::Char('z') if ctrl => {
                         if let Some(caret) = doc.undo() {
                             view.set_caret(caret);

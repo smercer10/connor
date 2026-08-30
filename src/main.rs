@@ -63,6 +63,22 @@ fn run(doc: &Document) -> io::Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let movement = matches!(
+                    key.code,
+                    KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                );
+                if movement {
+                    // Shift extends a selection through any movement key;
+                    // Char keys never land here, so shifted typing is safe.
+                    view.begin_or_clear_selection(key.modifiers.contains(KeyModifiers::SHIFT));
+                }
                 match key.code {
                     KeyCode::Char('q') if ctrl => break,
                     #[cfg(unix)]

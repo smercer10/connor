@@ -1,15 +1,20 @@
+use std::ops::Range;
+
 use crate::doc::Document;
 use crate::grapheme::{self, RopeGraphemes};
 
 /// Everything that belongs to one view of a document rather than to the
-/// document itself: cursor, sticky column, and scroll position. A document
-/// shown in two places would have two of these.
+/// document itself: cursor, selection, sticky column, and scroll position.
+/// A document shown in two places would have two of these.
 #[derive(Default)]
 pub struct View {
     /// Char index into the rope. Always on a grapheme-cluster boundary and
     /// never past a line's terminator (it may sit at a line's end, after the
     /// last cluster).
     pub cursor: usize,
+    /// The selection's fixed end; the cursor is the moving end. `None` means
+    /// no selection.
+    pub anchor: Option<usize>,
     /// The visual column vertical movement aims for, so the cursor springs
     /// back out wide after crossing short lines. Set by the first vertical
     /// move, cleared by any horizontal one.
@@ -43,14 +48,38 @@ impl View {
     pub fn test_at(cursor: usize, scroll_line: usize, scroll_col: usize) -> View {
         View {
             cursor,
+            anchor: None,
             goal_col: None,
             scroll_line,
             scroll_col,
         }
     }
 
+    #[cfg(test)]
+    pub fn with_anchor(mut self, anchor: usize) -> View {
+        self.anchor = Some(anchor);
+        self
+    }
+
     pub fn line(&self, doc: &Document) -> usize {
         doc.rope().char_to_line(self.cursor)
+    }
+
+    /// The selected char range, normalized so start ≤ end. A zero-width
+    /// selection behaves as none everywhere.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    /// Called before every movement key: an extending move drops the anchor
+    /// where the cursor stands, a plain move dissolves the selection.
+    pub fn begin_or_clear_selection(&mut self, extend: bool) {
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
     }
 
     pub fn move_left(&mut self, doc: &Document) {

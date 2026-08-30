@@ -1,14 +1,16 @@
 use unicode_width::UnicodeWidthChar;
 
 /// One terminal cell: a grapheme cluster stored inline (no heap) plus its
-/// display width. A two-column glyph occupies a leader cell followed by one
-/// `CONTINUATION` cell; emission skips continuations because the terminal
-/// advances two columns when the leader is written.
+/// display width and whether it renders in reverse video. A two-column glyph
+/// occupies a leader cell followed by one `CONTINUATION` cell; emission skips
+/// continuations because the terminal advances two columns when the leader is
+/// written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cell {
     bytes: [u8; 14],
     len: u8,
     width: u8,
+    reversed: bool,
 }
 
 impl Cell {
@@ -18,12 +20,14 @@ impl Cell {
         bytes: [0; 14],
         len: 0,
         width: 0,
+        reversed: false,
     };
     /// U+FFFD; stands in for clusters too long to store inline.
     const REPLACEMENT: Cell = Cell {
         bytes: [0xEF, 0xBF, 0xBD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         len: 3,
         width: 1,
+        reversed: false,
     };
 
     const fn from_ascii(byte: u8) -> Cell {
@@ -33,6 +37,7 @@ impl Cell {
             bytes,
             len: 1,
             width: 1,
+            reversed: false,
         }
     }
 
@@ -46,6 +51,7 @@ impl Cell {
             bytes,
             len: grapheme.len() as u8,
             width: width.max(1),
+            reversed: false,
         }
     }
 
@@ -60,6 +66,10 @@ impl Cell {
 
     pub fn is_continuation(&self) -> bool {
         self.width == 0
+    }
+
+    pub fn reversed(&self) -> bool {
+        self.reversed
     }
 }
 
@@ -139,6 +149,18 @@ impl Screen {
         } else if self.cells[index].width == 2 {
             self.cells[index + 1] = Cell::BLANK;
         }
+    }
+
+    /// Flips one cell's reverse-video flag. Style doesn't change cluster
+    /// geometry, so unlike `set_grapheme` no repair is needed; flagging by
+    /// column also covers cells the cluster path leaves blank (tabs, clipped
+    /// wide glyphs). Out-of-bounds writes are ignored, matching `set_grapheme`.
+    pub fn set_reversed(&mut self, x: u16, y: u16, on: bool) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let index = self.index(x, y);
+        self.cells[index].reversed = on;
     }
 
     /// Writes scalar-per-glyph text (UI chrome), advancing by display width.
@@ -359,6 +381,32 @@ mod tests {
         narrow.set_text(2, 0, "ab");
         assert_eq!(runs(&narrow, &prev), vec![(2, 0, "ab".into())]);
         assert_eq!(runs(&prev, &narrow), vec![(2, 0, "日".into())]);
+    }
+
+    #[test]
+    fn style_only_change_yields_a_run() {
+        let prev = Screen::new(4, 1);
+        let mut next = Screen::new(4, 1);
+        next.set_reversed(1, 0, true);
+        assert!(next.get(1, 0).unwrap().reversed());
+        assert_eq!(runs(&next, &prev), vec![(1, 0, " ".into())]);
+    }
+
+    #[test]
+    fn out_of_bounds_set_reversed_is_ignored() {
+        let mut screen = Screen::new(4, 2);
+        screen.set_reversed(4, 0, true);
+        screen.set_reversed(0, 2, true);
+        let blank = Screen::new(4, 2);
+        assert!(runs(&screen, &blank).is_empty());
+    }
+
+    #[test]
+    fn clear_resets_reversed_flags() {
+        let mut screen = Screen::new(4, 1);
+        screen.set_reversed(0, 0, true);
+        screen.clear();
+        assert!(!screen.get(0, 0).unwrap().reversed());
     }
 
     #[test]

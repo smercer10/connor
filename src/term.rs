@@ -1,12 +1,19 @@
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::style::{Attribute, SetAttribute};
+use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::{Command as _, cursor, execute, terminal};
 
 use crate::screen::Screen;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// Button presses (?1000), drags while held (?1002) and SGR encoding (?1006),
+// but not crossterm's EnableMouseCapture: that also turns on any-motion
+// tracking (?1003), which would wake the loop and redraw on every pointer
+// move. crossterm parses SGR reports regardless of how tracking was enabled.
+const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 /// Puts the terminal back the way the shell expects it. Idempotent, so the
 /// panic hook and `Drop` can both call it without coordination, and it must
@@ -18,6 +25,7 @@ fn restore() {
         let _ = execute!(
             io::stdout(),
             terminal::EndSynchronizedUpdate,
+            Print(DISABLE_MOUSE),
             terminal::LeaveAlternateScreen,
             cursor::Show
         );
@@ -140,7 +148,12 @@ impl Terminal {
         // mode on, alternate screen failed) is still restored by Drop.
         ACTIVE.store(true, Ordering::SeqCst);
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+        execute!(
+            io::stdout(),
+            terminal::EnterAlternateScreen,
+            Print(ENABLE_MOUSE),
+            cursor::Hide
+        )?;
         self.front.clear();
         self.needs_clear = true;
         Ok(())

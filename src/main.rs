@@ -46,13 +46,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// What a prompt-gated save was clearing the way for.
+#[derive(Clone, Copy)]
+enum AfterSave {
+    Stay,
+    Quit,
+    Close,
+}
+
 /// A mini-prompt owning the next keypress; its question sits in the notice.
 enum Prompt {
-    /// Ctrl+Q with unsaved changes: save / discard / cancel.
+    /// Ctrl+Q with unsaved changes in any tab: save all / discard / cancel.
     Quit,
+    /// Ctrl+W on a dirty tab: save / discard / cancel.
+    Close,
     /// The file loaded lossily, so writing it back mangles the bytes the
     /// U+FFFD marks stand for — overwriting must be deliberate.
-    LossySave { then_quit: bool },
+    LossySave { then: AfterSave },
 }
 
 fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
@@ -60,6 +70,9 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
     match prompt {
         Prompt::Quit => {
             notice.push_str("unsaved changes — save before quitting? (y)es · (n)o · (esc) cancel");
+        }
+        Prompt::Close => {
+            notice.push_str("unsaved changes — save before closing? (y)es · (n)o · (esc) cancel");
         }
         Prompt::LossySave { .. } => {
             let _ = write!(
@@ -91,25 +104,43 @@ fn try_save(doc: &mut Document, notice: &mut String) -> bool {
 fn prompt_key(
     prompt: Prompt,
     key: KeyCode,
-    doc: &mut Document,
+    tabs: &mut Tabs,
     notice: &mut String,
 ) -> (Option<Prompt>, bool) {
     match (prompt, key) {
-        (Prompt::Quit, KeyCode::Char('y' | 'Y')) => {
+        (Prompt::Quit, KeyCode::Char('y' | 'Y')) => quit_saving(tabs, notice),
+        (Prompt::Quit, KeyCode::Char('n' | 'N')) => (None, true),
+        (Prompt::Close, KeyCode::Char('y' | 'Y')) => {
+            let doc = &mut tabs.active_mut().doc;
             if doc.lossy() {
                 (
-                    open_prompt(Prompt::LossySave { then_quit: true }, doc, notice),
+                    open_prompt(
+                        Prompt::LossySave {
+                            then: AfterSave::Close,
+                        },
+                        doc,
+                        notice,
+                    ),
                     false,
                 )
+            } else if try_save(doc, notice) {
+                (None, close_active_or_quit(tabs))
             } else {
-                // A failed save cancels the quit: the error stays visible
+                // A failed save cancels the close: the error stays visible
                 // and the changes stay alive.
-                (None, try_save(doc, notice))
+                (None, false)
             }
         }
-        (Prompt::Quit, KeyCode::Char('n' | 'N')) => (None, true),
-        (Prompt::LossySave { then_quit }, KeyCode::Char('y' | 'Y')) => {
-            (None, try_save(doc, notice) && then_quit)
+        (Prompt::Close, KeyCode::Char('n' | 'N')) => (None, close_active_or_quit(tabs)),
+        (Prompt::LossySave { then }, KeyCode::Char('y' | 'Y')) => {
+            if !try_save(&mut tabs.active_mut().doc, notice) {
+                return (None, false);
+            }
+            match then {
+                AfterSave::Stay => (None, false),
+                AfterSave::Quit => quit_saving(tabs, notice),
+                AfterSave::Close => (None, close_active_or_quit(tabs)),
+            }
         }
         (_, KeyCode::Esc) => {
             notice.clear();
@@ -117,6 +148,46 @@ fn prompt_key(
         }
         (prompt, _) => (Some(prompt), false),
     }
+}
+
+/// Saves every dirty tab on the way out. A lossy one is activated and gets
+/// its own confirmation, which re-enters here afterwards; a failed save
+/// activates the failing tab and cancels the quit — the error stays
+/// visible and the changes stay alive.
+fn quit_saving(tabs: &mut Tabs, notice: &mut String) -> (Option<Prompt>, bool) {
+    for i in 0..tabs.count() {
+        let doc = &mut tabs.get_mut(i).doc;
+        if !doc.dirty() {
+            continue;
+        }
+        if doc.lossy() {
+            tabs.activate(i);
+            return (
+                open_prompt(
+                    Prompt::LossySave {
+                        then: AfterSave::Quit,
+                    },
+                    &tabs.active_mut().doc,
+                    notice,
+                ),
+                false,
+            );
+        }
+        if !try_save(doc, notice) {
+            tabs.activate(i);
+            return (None, false);
+        }
+    }
+    (None, true)
+}
+
+/// Closing the last tab is quitting; returns whether to quit.
+fn close_active_or_quit(tabs: &mut Tabs) -> bool {
+    if tabs.count() == 1 {
+        return true;
+    }
+    tabs.close_active();
+    false
 }
 
 fn run(tabs: &mut Tabs) -> io::Result<()> {
@@ -139,8 +210,7 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if let Some(pending) = prompt.take() {
-                    let (next, quit) =
-                        prompt_key(pending, key.code, &mut tabs.active_mut().doc, &mut notice);
+                    let (next, quit) = prompt_key(pending, key.code, tabs, &mut notice);
                     prompt = next;
                     if quit {
                         break;
@@ -166,6 +236,21 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                     }
                     // No continue: the loop tail re-clamps the incoming
                     // view, which may have missed resizes while hidden.
+                } else if ctrl && key.code == KeyCode::Char('q') {
+                    if tabs.any_dirty() {
+                        prompt = open_prompt(Prompt::Quit, &tabs.active_mut().doc, &mut notice);
+                    } else {
+                        break;
+                    }
+                } else if ctrl && key.code == KeyCode::Char('n') {
+                    tabs.active_mut().doc.break_undo_group();
+                    tabs.push(Document::empty());
+                } else if ctrl && key.code == KeyCode::Char('w') {
+                    if tabs.active_mut().doc.dirty() {
+                        prompt = open_prompt(Prompt::Close, &tabs.active_mut().doc, &mut notice);
+                    } else if close_active_or_quit(tabs) {
+                        break;
+                    }
                 } else {
                     let Tab { doc, view } = tabs.active_mut();
                     let movement = matches!(
@@ -186,17 +271,12 @@ fn run(tabs: &mut Tabs) -> io::Result<()> {
                         doc.break_undo_group();
                     }
                     match key.code {
-                        KeyCode::Char('q') if ctrl => {
-                            if doc.dirty() {
-                                prompt = open_prompt(Prompt::Quit, doc, &mut notice);
-                            } else {
-                                break;
-                            }
-                        }
                         KeyCode::Char('s') if ctrl => {
                             if doc.lossy() {
                                 prompt = open_prompt(
-                                    Prompt::LossySave { then_quit: false },
+                                    Prompt::LossySave {
+                                        then: AfterSave::Stay,
+                                    },
                                     doc,
                                     &mut notice,
                                 );

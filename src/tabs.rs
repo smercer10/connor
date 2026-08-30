@@ -38,8 +38,20 @@ impl Tabs {
         &self.tabs
     }
 
+    pub fn count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> &mut Tab {
+        &mut self.tabs[index]
+    }
+
     pub fn active_index(&self) -> usize {
         self.active
+    }
+
+    pub fn activate(&mut self, index: usize) {
+        self.active = index;
     }
 
     pub fn active(&self) -> &Tab {
@@ -60,9 +72,26 @@ impl Tabs {
         self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
     }
 
-    #[cfg(test)]
-    pub fn test_activate(&mut self, index: usize) {
-        self.active = index;
+    /// Appends a tab and activates it.
+    pub fn push(&mut self, doc: Document) {
+        self.tabs.push(Tab {
+            doc,
+            view: View::default(),
+        });
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Removes the active tab: its right-hand neighbour slides into its
+    /// slot and becomes active, or the new last tab does. Keeping the
+    /// collection non-empty is the caller's job.
+    pub fn close_active(&mut self) {
+        debug_assert!(self.tabs.len() > 1);
+        self.tabs.remove(self.active);
+        self.active = self.active.min(self.tabs.len() - 1);
+    }
+
+    pub fn any_dirty(&self) -> bool {
+        self.tabs.iter().any(|tab| tab.doc.dirty())
     }
 }
 
@@ -102,5 +131,53 @@ mod tests {
             Document::from_str("second"),
         ]);
         assert_eq!(tabs.active_mut().doc.rope().to_string(), "first");
+    }
+
+    #[test]
+    fn push_appends_and_activates() {
+        let mut tabs = Tabs::new(vec![Document::from_str("first")]);
+        tabs.push(Document::from_str("second"));
+        assert_eq!(tabs.count(), 2);
+        assert_eq!(tabs.active_index(), 1);
+        assert_eq!(tabs.active_mut().doc.rope().to_string(), "second");
+    }
+
+    #[test]
+    fn closing_a_middle_tab_activates_its_right_neighbour() {
+        let mut tabs = Tabs::new(vec![
+            Document::from_str("a"),
+            Document::from_str("b"),
+            Document::from_str("c"),
+        ]);
+        tabs.activate(1);
+        tabs.close_active();
+        assert_eq!(tabs.active_index(), 1);
+        assert_eq!(tabs.active_mut().doc.rope().to_string(), "c");
+    }
+
+    #[test]
+    fn closing_the_last_tab_activates_the_new_last() {
+        let mut tabs = Tabs::new(vec![Document::from_str("a"), Document::from_str("b")]);
+        tabs.activate(1);
+        tabs.close_active();
+        assert_eq!(tabs.active_index(), 0);
+        assert_eq!(tabs.active_mut().doc.rope().to_string(), "a");
+    }
+
+    #[test]
+    fn any_dirty_scans_every_tab() {
+        use crate::doc::{Caret, EditKind};
+        let mut tabs = Tabs::new(vec![Document::from_str("a"), Document::from_str("b")]);
+        assert!(!tabs.any_dirty());
+        tabs.get_mut(1).doc.edit(
+            0..0,
+            "x",
+            Caret {
+                cursor: 0,
+                anchor: None,
+            },
+            EditKind::Insert,
+        );
+        assert!(tabs.any_dirty());
     }
 }

@@ -372,7 +372,7 @@ mod tests {
             named("bb.rs", ""),
             named("cc.rs", ""),
         ]);
-        tabs.test_activate(2);
+        tabs.activate(2);
         let (screen, _) = render_tabs(&tabs, 15, 3);
         assert_eq!(row(&screen, 0), " bb.rs  cc.rs  ");
         assert_eq!(sel_row(&screen, 0), "       ####### ");
@@ -458,7 +458,7 @@ mod tests {
                 dirtied(named("bb.rs", "text")),
                 named("a_very_long_file_name.rs", ""),
             ]);
-            tabs.test_activate(2);
+            tabs.activate(2);
             render_tabs(&tabs, w, h);
         }
     }

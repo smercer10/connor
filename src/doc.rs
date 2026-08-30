@@ -275,6 +275,16 @@ impl Document {
         self.lossy = lossy;
     }
 
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Names a path-less buffer (or renames one) so `save` has somewhere to
+    /// write; the next save creates or overwrites that file.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
     pub fn rope(&self) -> &Rope {
         &self.rope
     }

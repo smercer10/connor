@@ -312,7 +312,7 @@ impl SearchPrompt {
 
 /// One-to-one case fold: `Ф`→`ф`, but `ß` stays (its lowercase expands to
 /// two chars, and equal match and query lengths are load-bearing).
-fn simple_fold(ch: char) -> char {
+pub(crate) fn simple_fold(ch: char) -> char {
     let mut lower = ch.to_lowercase();
     match (lower.next(), lower.next()) {
         (Some(folded), None) => folded,

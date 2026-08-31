@@ -2,6 +2,7 @@ mod clip;
 mod doc;
 mod draw;
 mod grapheme;
+mod grep;
 mod journal;
 mod keymap;
 mod picker;
@@ -27,6 +28,7 @@ use crossterm::event::{
 };
 
 use doc::{Caret, DiskCheck, Document};
+use grep::Grep;
 use journal::{Journal, Recovered};
 use keymap::Action;
 use picker::Picker;
@@ -183,6 +185,8 @@ enum Prompt {
     Help,
     /// Ctrl+P: the fuzzy file picker over the project.
     Pick(Picker),
+    /// Alt+F: project-wide search.
+    Grep(Grep),
 }
 
 fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
@@ -206,6 +210,7 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
         Prompt::Search(edit) => edit.render(notice),
         Prompt::Help => notice.push_str("(esc) close"),
         Prompt::Pick(_) => notice.push_str("↑↓ select · enter open · esc"),
+        Prompt::Grep(_) => notice.push_str("↑↓ select · enter jump · esc"),
     }
     Some(prompt)
 }
@@ -252,6 +257,7 @@ fn prompt_paste(prompt: &mut Prompt, text: &str, tabs: &mut Tabs, notice: &mut S
         }
         // The query lives in the overlay, so the notice stays untouched.
         Prompt::Pick(edit) => edit.paste(text),
+        Prompt::Grep(edit) => edit.paste(text, Instant::now()),
         Prompt::Quit | Prompt::Close | Prompt::LossySave { .. } | Prompt::Help => {}
     }
 }
@@ -301,6 +307,29 @@ fn prompt_key(
             picker::Outcome::Open(path) => {
                 notice.clear();
                 open_path(tabs, path, notice);
+                (None, false)
+            }
+        };
+    }
+    // The project-search overlay likewise consumes every key; a repeat of
+    // its opening chord dismisses it.
+    if let Prompt::Grep(mut edit) = prompt {
+        if keymap::lookup(key) == Some(Action::FindProject) {
+            edit.dismiss();
+            notice.clear();
+            return (None, false);
+        }
+        return match edit.key(key, Instant::now()) {
+            grep::Outcome::Pending => (Some(Prompt::Grep(edit)), false),
+            grep::Outcome::Cancel => {
+                notice.clear();
+                (None, false)
+            }
+            grep::Outcome::Open { path, line, col } => {
+                notice.clear();
+                if open_path(tabs, path, notice) {
+                    jump_to_hit(tabs, line, col);
+                }
                 (None, false)
             }
         };
@@ -466,21 +495,38 @@ fn quit_saving(tabs: &mut Tabs, notice: &mut String) -> (Option<Prompt>, bool) {
 }
 
 /// Opens `path` in a new tab — or, if a tab already holds it, activates
-/// that tab instead of opening the file twice.
-fn open_path(tabs: &mut Tabs, path: PathBuf, notice: &mut String) {
+/// that tab instead of opening the file twice. False means the active tab
+/// never changed: the file failed to open.
+fn open_path(tabs: &mut Tabs, path: PathBuf, notice: &mut String) -> bool {
     if let Some(index) = tabs.find_by_path(&path) {
         tabs.activate(index);
-        return;
+        return true;
     }
     match Document::open(path) {
         Ok(doc) => {
             tabs.active_mut().doc.break_undo_group();
             tabs.push(doc);
+            true
         }
         Err(e) => {
             let _ = write!(notice, "open failed: {e}");
+            false
         }
     }
+}
+
+/// Lands the caret on a project-search hit: 1-based `line`, char `col`,
+/// both clamped — the file may have changed since the search read it.
+fn jump_to_hit(tabs: &mut Tabs, line: usize, col: usize) {
+    let Tab { doc, view } = tabs.active_mut();
+    doc.break_undo_group();
+    view.begin_or_clear_selection(false);
+    let line = line.clamp(1, doc.line_count()) - 1;
+    let pos = (doc.line_start(line) + col).min(doc.line_end(line));
+    view.set_caret(Caret {
+        cursor: grapheme::snap_to_boundary(doc.rope().slice(..), pos),
+        anchor: None,
+    });
 }
 
 /// Names the buffer and saves it there, then carries on with whatever the
@@ -535,6 +581,15 @@ fn absorb_files(
     match prompt {
         Some(Prompt::Pick(edit)) if edit.generation() == batch.generation => edit.absorb(batch),
         _ => tree.as_mut().is_some_and(|t| t.absorb(batch, text_h)),
+    }
+}
+
+/// Routes a hit batch to the project-search overlay. Returns whether
+/// anything on screen changed; a chunk from a dead search changes nothing.
+fn absorb_hits(prompt: &mut Option<Prompt>, batch: grep::HitBatch) -> bool {
+    match prompt {
+        Some(Prompt::Grep(edit)) => edit.absorb(batch),
+        _ => false,
     }
 }
 
@@ -624,6 +679,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             if let Some(Prompt::Pick(edit)) = &prompt {
                 cursor = draw::draw_picker(&mut back, edit, &mut scratch);
             }
+            if let Some(Prompt::Grep(edit)) = &prompt {
+                cursor = draw::draw_grep(&mut back, edit, &mut scratch);
+            }
             // A focused sidebar shows focus as its selection bar; a blinking
             // caret there would promise typing the tree can't accept.
             let caret = (!(tree_focus && draw::tree_width(tree.is_some(), back.size().0) > 0))
@@ -638,10 +696,19 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
         // A pending debounce or journal snapshot turns the indefinite block
         // into a timed one; their expiries are the only wakes that aren't
         // channel messages.
-        let wake = [debounce.deadline(), journal.deadline(), refresh.deadline()]
-            .into_iter()
-            .flatten()
-            .min();
+        let grep_restart = match &prompt {
+            Some(Prompt::Grep(edit)) => edit.deadline(),
+            _ => None,
+        };
+        let wake = [
+            debounce.deadline(),
+            journal.deadline(),
+            refresh.deadline(),
+            grep_restart,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let received = match wake {
             None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
             Some(t) => rx.recv_timeout(t.saturating_duration_since(Instant::now())),
@@ -677,6 +744,16 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                         edit.refresh(doc, view);
                         edit.render(&mut notice);
                     }
+                }
+                // A query's restart pause ran out; its search starts, and
+                // the overlay's searching indicator appears.
+                if let Some(Prompt::Grep(edit)) = &mut prompt
+                    && let Some(query) = edit.take_restart(now)
+                {
+                    walk_gen += 1;
+                    let cancel = grep::spawn_search(root.clone(), query, walk_gen, tx.clone());
+                    edit.begin(walk_gen, cancel);
+                    redraw = true;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -715,6 +792,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     let cancel = project::spawn_walk(root.clone(), walk_gen, tx.clone());
                     t.begin_refresh(walk_gen, cancel);
                 }
+            }
+            Ok(AppEvent::Hits(batch)) => {
+                redraw = absorb_hits(&mut prompt, batch);
             }
             Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 // A pending prompt owns the key; the loop tail still runs,
@@ -802,6 +882,15 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                 // origin keeps the anchor for Esc to restore.
                                 view.anchor = None;
                                 prompt = open_prompt(Prompt::Search(edit), doc, &mut notice);
+                            }
+                            Action::FindProject => {
+                                // The search itself spawns once a query is
+                                // typed and its restart pause runs out.
+                                prompt = open_prompt(
+                                    Prompt::Grep(Grep::new(root.clone())),
+                                    doc,
+                                    &mut notice,
+                                );
                             }
                             Action::GoToLine => {
                                 prompt =
@@ -1273,6 +1362,136 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn grep_prompt(root: PathBuf, path: &str, hits: Vec<grep::Hit>) -> Prompt {
+        let mut edit = Grep::new(root);
+        edit.begin(1, Default::default());
+        edit.absorb(grep::HitBatch {
+            generation: 1,
+            files: vec![grep::FileHits {
+                path: path.to_string(),
+                hits,
+            }],
+            done: true,
+            truncated: false,
+        });
+        Prompt::Grep(edit)
+    }
+
+    fn hit(line: u32, col: u32) -> grep::Hit {
+        grep::Hit {
+            line,
+            col,
+            preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn grep_prompt_types_closes_on_its_chord_and_jumps_on_enter() {
+        let dir = scratch_dir("grep-jump");
+        std::fs::write(dir.join("f.txt"), "one\nneedle here\n").unwrap();
+        let mut tabs = Tabs::new(vec![Document::empty()]);
+        let mut notice = String::new();
+
+        // A typed character leaves the overlay up.
+        let prompt = grep_prompt(dir.clone(), "f.txt", vec![hit(2, 7)]);
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        let (next, quit) = prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+        assert!(matches!(next, Some(Prompt::Grep(_))));
+        assert!(!quit);
+
+        // Esc and a repeat Alt+F both dismiss without opening.
+        for (code, mods) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('f'), KeyModifiers::ALT),
+        ] {
+            notice.push_str("↑↓ select · enter jump · esc");
+            let prompt = grep_prompt(dir.clone(), "f.txt", vec![hit(2, 7)]);
+            let key = KeyEvent::new(code, mods);
+            let (next, quit) = prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+            assert!(next.is_none(), "{code:?} left the overlay open");
+            assert!(!quit);
+            assert!(notice.is_empty());
+            assert_eq!(tabs.count(), 1);
+        }
+
+        // Enter opens the hit's file and lands the caret on its line and
+        // column.
+        let prompt = grep_prompt(dir.clone(), "f.txt", vec![hit(2, 7)]);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let (next, quit) = prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+        assert!(next.is_none());
+        assert!(!quit);
+        assert_eq!(tabs.count(), 2);
+        let Tab { doc, view } = tabs.active_mut();
+        assert_eq!(doc.path(), Some(dir.join("f.txt").as_path()));
+        assert_eq!(view.cursor, doc.line_start(1) + 7);
+        assert_eq!(view.anchor, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_hit_outrunning_the_changed_file_clamps_instead_of_panicking() {
+        let dir = scratch_dir("grep-clamp");
+        std::fs::write(dir.join("f.txt"), "short\n").unwrap();
+        let mut tabs = Tabs::new(vec![Document::empty()]);
+        let mut notice = String::new();
+        let prompt = grep_prompt(dir.clone(), "f.txt", vec![hit(99, 50)]);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+        let Tab { doc, view } = tabs.active_mut();
+        assert!(view.cursor <= doc.rope().len_chars());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unopenable_hit_file_reports_and_moves_no_caret() {
+        // A missing file opens as an empty buffer by design; a directory is
+        // what genuinely fails to open.
+        let dir = scratch_dir("grep-unopenable");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut tabs = Tabs::new(vec![Document::from_str("stay\n")]);
+        tabs.active_mut().view.cursor = 3;
+        let mut notice = String::new();
+        let prompt = grep_prompt(dir.clone(), "sub", vec![hit(1, 0)]);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let (next, _) = prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+        assert!(next.is_none());
+        assert!(notice.contains("open failed"), "notice: {notice}");
+        assert_eq!(tabs.count(), 1);
+        assert_eq!(tabs.active_mut().view.cursor, 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hit_batches_route_to_the_grep_overlay_by_generation() {
+        let batch = |generation| grep::HitBatch {
+            generation,
+            files: vec![grep::FileHits {
+                path: "a.rs".to_string(),
+                hits: vec![hit(1, 0)],
+            }],
+            done: false,
+            truncated: false,
+        };
+        let mut prompt = match grep_prompt(PathBuf::from("/r"), "seed.rs", vec![hit(1, 0)]) {
+            Prompt::Grep(mut edit) => {
+                edit.begin(2, Default::default());
+                Some(Prompt::Grep(edit))
+            }
+            _ => unreachable!(),
+        };
+        assert!(absorb_hits(&mut prompt, batch(2)));
+        // A dead search's chunk changes nothing, and no overlay eats it.
+        assert!(!absorb_hits(&mut prompt, batch(9)));
+        let Some(Prompt::Grep(edit)) = &prompt else {
+            unreachable!()
+        };
+        assert_eq!(edit.hit_count(), 2);
+        assert!(!absorb_hits(&mut None, batch(2)));
+        let mut help = Some(Prompt::Help);
+        assert!(!absorb_hits(&mut help, batch(2)));
     }
 
     #[test]

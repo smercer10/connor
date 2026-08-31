@@ -22,6 +22,8 @@ pub enum AppEvent {
     Fs(PathBuf),
     /// A chunk of project files from the background walker.
     Files(crate::project::FileBatch),
+    /// A chunk of project-search hits from the background grep.
+    Hits(crate::grep::HitBatch),
     /// An external signal arrived; the loop decides whether to suspend,
     /// resync, or exit.
     #[cfg(unix)]

@@ -30,6 +30,7 @@ pub enum Action {
     Backspace,
     Delete,
     Find,
+    FindProject,
     GoToLine,
     Left,
     Right,
@@ -170,6 +171,11 @@ pub static KEYMAP: &[Section] = &[
         title: "search",
         bindings: &[
             bind(&[ctrl(KeyCode::Char('f'))], Action::Find, "find / replace"),
+            bind(
+                &[alt(KeyCode::Char('f'))],
+                Action::FindProject,
+                "find in project",
+            ),
             bind(&[ctrl(KeyCode::Char('g'))], Action::GoToLine, "go to line"),
         ],
     },

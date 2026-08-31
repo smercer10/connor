@@ -2,7 +2,7 @@ use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
+use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::{Command as _, cursor, execute, terminal};
 
 use crate::screen::Screen;
@@ -16,26 +16,14 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
-// `Cell::fg` codes to named colours, which crossterm writes as the base
-// SGRs 30-37/90-97 the terminal theme defines — no RGB assumptions.
-const FG_COLORS: [Color; 17] = [
-    Color::Reset,
-    Color::Black,
-    Color::DarkRed,
-    Color::DarkGreen,
-    Color::DarkYellow,
-    Color::DarkBlue,
-    Color::DarkMagenta,
-    Color::DarkCyan,
-    Color::Grey,
-    Color::DarkGrey,
-    Color::Red,
-    Color::Green,
-    Color::Yellow,
-    Color::Blue,
-    Color::Magenta,
-    Color::Cyan,
-    Color::White,
+// `Cell::fg` codes to classic foreground SGRs (default, then the 16 ANSI
+// palette colours the terminal theme defines — no RGB assumptions). Raw
+// rather than crossterm's `SetForegroundColor`, which writes the longer
+// 256-colour form some plainer terminals lack.
+const FG_SGR: [&str; 17] = [
+    "\x1b[39m", "\x1b[30m", "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[34m", "\x1b[35m", "\x1b[36m",
+    "\x1b[37m", "\x1b[90m", "\x1b[91m", "\x1b[92m", "\x1b[93m", "\x1b[94m", "\x1b[95m", "\x1b[96m",
+    "\x1b[97m",
 ];
 
 /// Puts the terminal back the way the shell expects it. Idempotent, so the
@@ -155,8 +143,7 @@ impl Terminal {
                 if !cell.is_continuation() {
                     if cell.fg() != fg {
                         fg = cell.fg();
-                        let color = FG_COLORS[usize::from(fg).min(FG_COLORS.len() - 1)];
-                        let _ = SetForegroundColor(color).write_ansi(scratch);
+                        scratch.push_str(FG_SGR[usize::from(fg).min(FG_SGR.len() - 1)]);
                     }
                     if cell.reversed() != reversed {
                         reversed = cell.reversed();
@@ -181,7 +168,7 @@ impl Terminal {
             }
         });
         if fg != 0 {
-            let _ = SetForegroundColor(Color::Reset).write_ansi(scratch);
+            scratch.push_str(FG_SGR[0]);
         }
         if reversed {
             let _ = SetAttribute(Attribute::NoReverse).write_ansi(scratch);

@@ -192,7 +192,9 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let dir = scratch_dir("walk-nonutf8");
         touch(&dir.join("kept.rs"));
-        fs::write(dir.join(OsStr::from_bytes(b"bad-\xff-name")), b"").unwrap();
+        // Best-effort: APFS refuses invalid UTF-8 names outright, so on
+        // macOS this only proves the walk of the rest still succeeds.
+        let _ = fs::write(dir.join(OsStr::from_bytes(b"bad-\xff-name")), b"");
         assert_eq!(walked_paths(&dir), ["kept.rs"]);
         let _ = fs::remove_dir_all(&dir);
     }

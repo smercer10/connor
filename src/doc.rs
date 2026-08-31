@@ -115,6 +115,24 @@ pub struct Caret {
     pub anchor: Option<usize>,
 }
 
+/// One rope mutation in byte offsets and (row, byte-column) points, captured
+/// before the mutation applied — the coordinates an incremental parser needs
+/// to shift its tree. Plain data, so the document stays parser-agnostic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Splice {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+    pub start_point: (usize, usize),
+    pub old_end_point: (usize, usize),
+    pub new_end_point: (usize, usize),
+}
+
+/// Pending splices past this are dropped and flagged: a consumer that far
+/// behind reparses from scratch anyway, so the log stays bounded while a
+/// background tab reloads repeatedly.
+const SPLICE_CAP: usize = 256;
+
 /// The region a reload replaced, in char indices: `[prefix, old_suffix_start)`
 /// of the old text became `[prefix, new_suffix_start)` of the new — the
 /// bounds views need to re-anchor positions by content.
@@ -259,6 +277,14 @@ pub struct Document {
     /// Disk changed under a dirty buffer; cleared when buffer and disk
     /// reconverge (a save, or disk restored to the baseline).
     conflict: bool,
+    /// Splices since the last `take_splices`, recorded only while a
+    /// consumer tracks them — an untracked document pays one branch per
+    /// edit and nothing more.
+    pending: Vec<Splice>,
+    track_splices: bool,
+    /// The log hit `SPLICE_CAP` and was dropped; the consumer must rebuild
+    /// rather than replay.
+    splices_overflowed: bool,
 }
 
 impl Document {
@@ -275,6 +301,9 @@ impl Document {
             recovered: false,
             disk_hash: None,
             conflict: false,
+            pending: Vec::new(),
+            track_splices: false,
+            splices_overflowed: false,
         }
     }
 
@@ -493,8 +522,7 @@ impl Document {
     /// insertion merged with a following combining mark.
     pub fn edit(&mut self, range: Range<usize>, text: &str, caret: Caret, kind: EditKind) -> usize {
         let deleted = self.rope.slice(range.clone()).to_string();
-        self.rope.remove(range.clone());
-        self.rope.insert(range.start, text);
+        self.splice(range.clone(), text);
         let cursor =
             grapheme::snap_to_boundary(self.rope.slice(..), range.start + text.chars().count());
         let edit = Edit {
@@ -503,8 +531,63 @@ impl Document {
             inserted: text.to_owned(),
         };
         self.history.record(edit, caret, cursor, kind);
-        self.revision += 1;
         cursor
+    }
+
+    /// The one place the rope mutates: replaces `range` with `text`, records
+    /// the splice for any tracking consumer, and bumps the revision. Undo
+    /// and redo replay history through here too, so the log misses nothing.
+    fn splice(&mut self, range: Range<usize>, text: &str) {
+        if self.track_splices && !self.splices_overflowed {
+            if self.pending.len() >= SPLICE_CAP {
+                // Once overflowed the log is useless, so recording stays off
+                // until `take_splices` resets the flag.
+                self.pending.clear();
+                self.splices_overflowed = true;
+            } else {
+                let start_byte = self.rope.char_to_byte(range.start);
+                let old_end_byte = self.rope.char_to_byte(range.end);
+                let start_point = self.point_of(start_byte);
+                let new_end_point = match text.rfind('\n') {
+                    None => (start_point.0, start_point.1 + text.len()),
+                    Some(last) => {
+                        let rows = text.bytes().filter(|&b| b == b'\n').count();
+                        (start_point.0 + rows, text.len() - (last + 1))
+                    }
+                };
+                self.pending.push(Splice {
+                    start_byte,
+                    old_end_byte,
+                    new_end_byte: start_byte + text.len(),
+                    start_point,
+                    old_end_point: self.point_of(old_end_byte),
+                    new_end_point,
+                });
+            }
+        }
+        self.rope.remove(range.clone());
+        self.rope.insert(range.start, text);
+        self.revision += 1;
+    }
+
+    /// (row, byte-column) of a byte offset, pre-mutation.
+    fn point_of(&self, byte: usize) -> (usize, usize) {
+        let row = self.rope.byte_to_line(byte);
+        (row, byte - self.rope.line_to_byte(row))
+    }
+
+    /// Starts recording splices for `take_splices`; in force for the rest of
+    /// the document's life.
+    pub fn track_splices(&mut self) {
+        self.track_splices = true;
+    }
+
+    /// Drains the recorded splices, oldest first. The flag reports that the
+    /// log overflowed and was dropped: what remains is incomplete and the
+    /// consumer must rebuild from the rope instead of replaying.
+    pub fn take_splices(&mut self) -> (std::vec::Drain<'_, Splice>, bool) {
+        let overflowed = std::mem::take(&mut self.splices_overflowed);
+        (self.pending.drain(..), overflowed)
     }
 
     /// Closes the open typing run so the next edit starts a fresh undo step.
@@ -518,24 +601,31 @@ impl Document {
     pub fn undo(&mut self) -> Option<Caret> {
         self.history.open_kind = None;
         self.history.index = self.history.index.checked_sub(1)?;
-        let group = &self.history.groups[self.history.index];
-        let end = group.edit.at + group.edit.inserted.chars().count();
-        self.rope.remove(group.edit.at..end);
-        self.rope.insert(group.edit.at, &group.edit.deleted);
-        self.revision += 1;
-        Some(group.caret_before)
+        let index = self.history.index;
+        let group = &mut self.history.groups[index];
+        let at = group.edit.at;
+        let end = at + group.edit.inserted.chars().count();
+        let caret_before = group.caret_before;
+        // Taken and put back rather than cloned: undoing a large splice (a
+        // reload, a replace-all) must not copy its text.
+        let deleted = std::mem::take(&mut group.edit.deleted);
+        self.splice(at..end, &deleted);
+        self.history.groups[index].edit.deleted = deleted;
+        Some(caret_before)
     }
 
     /// Re-applies the next undone group and hands back the caret to restore.
     pub fn redo(&mut self) -> Option<Caret> {
         self.history.open_kind = None;
-        let group = self.history.groups.get(self.history.index)?;
-        let end = group.edit.at + group.edit.deleted.chars().count();
+        let index = self.history.index;
+        let group = self.history.groups.get_mut(index)?;
+        let at = group.edit.at;
+        let end = at + group.edit.deleted.chars().count();
         let cursor = group.cursor_after;
-        self.rope.remove(group.edit.at..end);
-        self.rope.insert(group.edit.at, &group.edit.inserted);
+        let inserted = std::mem::take(&mut group.edit.inserted);
+        self.splice(at..end, &inserted);
+        self.history.groups[index].edit.inserted = inserted;
         self.history.index += 1;
-        self.revision += 1;
         Some(Caret {
             cursor,
             anchor: None,
@@ -1288,5 +1378,128 @@ mod tests {
         assert!(!doc.recovered());
         assert_eq!(std::fs::read(&path).unwrap(), b"changed\n");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn splices_of(doc: &mut Document) -> (Vec<Splice>, bool) {
+        let (drain, overflowed) = doc.take_splices();
+        (drain.collect(), overflowed)
+    }
+
+    #[test]
+    fn untracked_documents_record_no_splices() {
+        let mut doc = Document::from_str("ab");
+        doc.edit(0..0, "x", caret(0), EditKind::Insert);
+        doc.undo();
+        let (splices, overflowed) = splices_of(&mut doc);
+        assert!(splices.is_empty());
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn edits_record_byte_correct_splices() {
+        let mut doc = Document::from_str("a日\nb");
+        doc.track_splices();
+        // Replace the wide char (bytes 1..4) with two lines of text.
+        doc.edit(1..2, "x\nyz", caret(1), EditKind::Other);
+        assert_eq!(doc.rope().to_string(), "ax\nyz\nb");
+        let (splices, overflowed) = splices_of(&mut doc);
+        assert!(!overflowed);
+        assert_eq!(
+            splices,
+            vec![Splice {
+                start_byte: 1,
+                old_end_byte: 4,
+                new_end_byte: 5,
+                start_point: (0, 1),
+                old_end_point: (0, 4),
+                new_end_point: (1, 2),
+            }]
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_record_their_splices() {
+        let mut doc = Document::from_str("ab\ncd");
+        doc.track_splices();
+        doc.edit(3..5, "x", caret(3), EditKind::Other);
+        let edit = splices_of(&mut doc).0[0];
+        assert_eq!(edit.start_point, (1, 0));
+
+        doc.undo();
+        let (splices, _) = splices_of(&mut doc);
+        assert_eq!(
+            splices,
+            vec![Splice {
+                start_byte: 3,
+                old_end_byte: 4,
+                new_end_byte: 5,
+                start_point: (1, 0),
+                old_end_point: (1, 1),
+                new_end_point: (1, 2),
+            }]
+        );
+        assert_eq!(doc.rope().to_string(), "ab\ncd");
+
+        doc.redo();
+        let (splices, _) = splices_of(&mut doc);
+        assert_eq!(splices, vec![edit]);
+        assert_eq!(doc.rope().to_string(), "ab\nx");
+    }
+
+    #[test]
+    fn reload_records_a_single_splice() {
+        let dir = scratch_dir("splice-reload");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.track_splices();
+        std::fs::write(&path, "one\nTWO\n").unwrap();
+        assert!(matches!(
+            doc.check_disk(caret(0)),
+            DiskCheck::Reloaded { .. }
+        ));
+        let (splices, overflowed) = splices_of(&mut doc);
+        assert!(!overflowed);
+        assert_eq!(splices.len(), 1);
+        assert_eq!(splices[0].start_byte, 4);
+        assert_eq!(splices[0].start_point, (1, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn splice_log_overflow_drops_and_flags() {
+        let mut doc = Document::from_str("");
+        doc.track_splices();
+        for _ in 0..SPLICE_CAP + 5 {
+            doc.edit(0..0, "x", caret(0), EditKind::Other);
+            doc.break_undo_group();
+        }
+        let (splices, overflowed) = splices_of(&mut doc);
+        assert!(splices.is_empty());
+        assert!(overflowed);
+        // The next edit records normally again.
+        doc.edit(0..0, "y", caret(0), EditKind::Other);
+        let (splices, overflowed) = splices_of(&mut doc);
+        assert_eq!(splices.len(), 1);
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn crlf_terminators_count_as_line_breaks_in_splice_points() {
+        let mut doc = Document::from_str("ab\r\ncd");
+        doc.track_splices();
+        doc.edit(5..6, "e\r\nf", caret(5), EditKind::Other);
+        let (splices, _) = splices_of(&mut doc);
+        assert_eq!(
+            splices,
+            vec![Splice {
+                start_byte: 5,
+                old_end_byte: 6,
+                new_end_byte: 9,
+                start_point: (1, 1),
+                old_end_point: (1, 2),
+                new_end_point: (2, 1),
+            }]
+        );
     }
 }

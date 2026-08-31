@@ -82,7 +82,7 @@ pub fn draw(
     let tree_w = tree_width(tree.is_some(), width);
     let width = usize::from(width);
     let text_h = text_height(height);
-    let Tab { doc, view } = tabs.active();
+    let Tab { doc, view, .. } = tabs.active();
     let gutter_w = gutter_width(doc);
     let text_w = width.saturating_sub(tree_w + gutter_w);
 

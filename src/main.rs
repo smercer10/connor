@@ -244,7 +244,7 @@ fn try_save(doc: &mut Document, notice: &mut String) -> bool {
 fn prompt_paste(prompt: &mut Prompt, text: &str, tabs: &mut Tabs, notice: &mut String) {
     match prompt {
         Prompt::Search(edit) => {
-            let Tab { doc, view } = tabs.active_mut();
+            let Tab { doc, view, .. } = tabs.active_mut();
             edit.paste(text, doc, view);
             edit.render(notice);
         }
@@ -338,7 +338,7 @@ fn prompt_key(
     // A search prompt consumes every key itself, and may move the cursor
     // and edit the document.
     if let Prompt::Search(mut edit) = prompt {
-        let Tab { doc, view } = tabs.active_mut();
+        let Tab { doc, view, .. } = tabs.active_mut();
         return match edit.key(key, doc, view) {
             search::Outcome::Pending => {
                 edit.render(notice);
@@ -369,7 +369,7 @@ fn prompt_key(
             Outcome::Submit => {
                 notice.clear();
                 if let Some(line) = edit.line() {
-                    let Tab { doc, view } = tabs.active_mut();
+                    let Tab { doc, view, .. } = tabs.active_mut();
                     doc.break_undo_group();
                     view.begin_or_clear_selection(false);
                     view.move_to_line(doc, line);
@@ -519,7 +519,7 @@ fn open_path(tabs: &mut Tabs, path: PathBuf, notice: &mut String) -> bool {
 /// Lands the caret on a project-search hit: 1-based `line`, char `col`,
 /// both clamped — the file may have changed since the search read it.
 fn jump_to_hit(tabs: &mut Tabs, line: usize, col: usize) {
-    let Tab { doc, view } = tabs.active_mut();
+    let Tab { doc, view, .. } = tabs.active_mut();
     doc.break_undo_group();
     view.begin_or_clear_selection(false);
     let line = line.clamp(1, doc.line_count()) - 1;
@@ -538,8 +538,11 @@ fn save_as(
     then: AfterSave,
     notice: &mut String,
 ) -> (Option<Prompt>, bool) {
-    let doc = &mut tabs.active_mut().doc;
-    doc.set_path(path);
+    let tab = tabs.active_mut();
+    tab.doc.set_path(path);
+    // The new name can gain or lose a grammar; rebuild the highlighter.
+    tab.syntax = syntax::Syntax::new(&mut tab.doc);
+    let doc = &mut tab.doc;
     if !try_save(doc, notice) {
         // The name sticks, so a plain Ctrl+S can retry the same target.
         return (None, false);
@@ -592,6 +595,22 @@ fn absorb_hits(prompt: &mut Option<Prompt>, batch: grep::HitBatch) -> bool {
         Some(Prompt::Grep(edit)) => edit.absorb(batch),
         _ => false,
     }
+}
+
+/// Routes a finished background parse to the tab still waiting on it.
+/// Returns whether the screen changed — only when the parse is current and
+/// its tab is the active one; a closed tab's or superseded result is
+/// dropped.
+fn absorb_parse(tabs: &mut Tabs, done: syntax::ParseDone, tx: &mpsc::Sender<AppEvent>) -> bool {
+    let active = tabs.active_index();
+    for index in 0..tabs.count() {
+        let Tab { doc, syntax, .. } = tabs.get_mut(index);
+        if doc.id() == done.doc_id {
+            let changed = syntax.as_mut().is_some_and(|s| s.absorb(done, doc, tx));
+            return changed && index == active;
+        }
+    }
+    false
 }
 
 /// Closing the last tab is quitting; returns whether to quit.
@@ -653,6 +672,17 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     loop {
         let mut follow_cursor = true;
         if redraw {
+            // The highlighter catches the tree up with the document and the
+            // final viewport before the scene reads its spans; a quiet
+            // document with an unmoved viewport is a cache hit.
+            {
+                let text_h = draw::text_height(back.size().1);
+                let Tab { doc, view, syntax } = tabs.active_mut();
+                if let Some(syntax) = syntax {
+                    syntax.pump(doc, &tx);
+                    syntax.refresh(doc, view.scroll_line, text_h);
+                }
+            }
             back.clear();
             let status_caret = match &prompt {
                 Some(Prompt::Path { .. } | Prompt::GoTo(_) | Prompt::Help) => {
@@ -673,7 +703,11 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 status_caret,
                 draw::Marks {
                     search,
-                    syntax: &[],
+                    syntax: tabs
+                        .active()
+                        .syntax
+                        .as_ref()
+                        .map_or(&[][..], syntax::Syntax::spans),
                 },
                 tree.as_ref().map(|t| (t, tree_focus)),
             );
@@ -744,7 +778,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     // A reload may have shifted or removed matches; a stale
                     // set must never reach navigation or a replace.
                     if let Some(Prompt::Search(edit)) = &mut prompt {
-                        let Tab { doc, view } = tabs.active_mut();
+                        let Tab { doc, view, .. } = tabs.active_mut();
                         edit.refresh(doc, view);
                         edit.render(&mut notice);
                     }
@@ -800,6 +834,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             Ok(AppEvent::Hits(batch)) => {
                 redraw = absorb_hits(&mut prompt, batch);
             }
+            Ok(AppEvent::Parsed(done)) => {
+                redraw = absorb_parse(tabs, done, &tx);
+            }
             Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 // A pending prompt owns the key; the loop tail still runs,
                 // because prompts are allowed to move the cursor.
@@ -832,7 +869,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 } else {
                     notice.clear();
                     if let Some(action) = keymap::lookup(&key) {
-                        let Tab { doc, view } = tabs.active_mut();
+                        let Tab { doc, view, .. } = tabs.active_mut();
                         if action.is_movement() {
                             // Shift extends a selection through any movement key;
                             // Char keys never map to movement, so shifted typing
@@ -1029,7 +1066,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     {
-                        let Tab { doc, view } = tabs.active_mut();
+                        let Tab { doc, view, .. } = tabs.active_mut();
                         view.insert_char(doc, ch);
                     }
                 }
@@ -1069,7 +1106,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                 t.scroll_by(delta, text_h);
                             }
                         } else {
-                            let Tab { doc, view } = tabs.active_mut();
+                            let Tab { doc, view, .. } = tabs.active_mut();
                             view.scroll_wheel(doc, delta);
                         }
                         follow_cursor = false;
@@ -1110,7 +1147,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                 t.elapsed() <= DOUBLE_CLICK && (x, y) == (m.column, m.row)
                             });
                         last_click = Some((Instant::now(), m.column, m.row));
-                        let Tab { doc, view } = tabs.active_mut();
+                        let Tab { doc, view, .. } = tabs.active_mut();
                         doc.break_undo_group();
                         let gutter_w = draw::gutter_width(doc);
                         view.click(doc, tree_w + gutter_w, text_h, m.column, m.row, shift);
@@ -1132,7 +1169,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) if prompt.is_none() && !tree_focus => {
-                        let Tab { doc, view } = tabs.active_mut();
+                        let Tab { doc, view, .. } = tabs.active_mut();
                         let gutter_w = draw::gutter_width(doc);
                         view.drag(doc, tree_w + gutter_w, text_h, m.column, m.row);
                     }
@@ -1144,7 +1181,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     prompt_paste(pending, &text, tabs, &mut notice);
                 } else {
                     notice.clear();
-                    let Tab { doc, view } = tabs.active_mut();
+                    let Tab { doc, view, .. } = tabs.active_mut();
                     view.paste(doc, &text);
                 }
             }
@@ -1171,7 +1208,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
         if follow_cursor {
             let (width, height) = back.size();
             let tree_w = draw::tree_width(tree.is_some(), width);
-            let Tab { doc, view } = tabs.active_mut();
+            let Tab { doc, view, .. } = tabs.active_mut();
             let text_w = usize::from(width).saturating_sub(tree_w + draw::gutter_width(doc));
             view.scroll_to_cursor(doc, text_w, draw::text_height(height));
         }
@@ -1187,7 +1224,7 @@ fn reload_changed(tabs: &mut Tabs, debounce: &mut Debounce) {
         let Some(index) = tabs.find_by_path(&path) else {
             continue;
         };
-        let Tab { doc, view } = tabs.get_mut(index);
+        let Tab { doc, view, .. } = tabs.get_mut(index);
         let caret = Caret {
             cursor: view.cursor,
             anchor: view.anchor,
@@ -1428,7 +1465,7 @@ mod tests {
         assert!(next.is_none());
         assert!(!quit);
         assert_eq!(tabs.count(), 2);
-        let Tab { doc, view } = tabs.active_mut();
+        let Tab { doc, view, .. } = tabs.active_mut();
         assert_eq!(doc.path(), Some(dir.join("f.txt").as_path()));
         assert_eq!(view.cursor, doc.line_start(1) + 7);
         assert_eq!(view.anchor, None);
@@ -1444,7 +1481,7 @@ mod tests {
         let prompt = grep_prompt(dir.clone(), "f.txt", vec![hit(99, 50)]);
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         prompt_key(prompt, &key, &mut tabs, "", &mut notice);
-        let Tab { doc, view } = tabs.active_mut();
+        let Tab { doc, view, .. } = tabs.active_mut();
         assert!(view.cursor <= doc.rope().len_chars());
         std::fs::remove_dir_all(&dir).unwrap();
     }

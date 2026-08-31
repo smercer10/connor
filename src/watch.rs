@@ -24,6 +24,8 @@ pub enum AppEvent {
     Files(crate::project::FileBatch),
     /// A chunk of project-search hits from the background grep.
     Hits(crate::grep::HitBatch),
+    /// A finished background parse from the syntax highlighter.
+    Parsed(crate::syntax::ParseDone),
     /// An external signal arrived; the loop decides whether to suspend,
     /// resync, or exit.
     #[cfg(unix)]

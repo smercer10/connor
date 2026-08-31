@@ -131,7 +131,7 @@ pub struct Splice {
 /// Pending splices past this are dropped and flagged: a consumer that far
 /// behind reparses from scratch anyway, so the log stays bounded while a
 /// background tab reloads repeatedly.
-const SPLICE_CAP: usize = 256;
+pub(crate) const SPLICE_CAP: usize = 256;
 
 /// The region a reload replaced, in char indices: `[prefix, old_suffix_start)`
 /// of the old text became `[prefix, new_suffix_start)` of the new — the

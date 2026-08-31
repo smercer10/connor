@@ -3,8 +3,12 @@
 
 use std::fmt::Write as _;
 
+use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
+use crate::compare::Compare;
+use crate::diff;
+use crate::doc::Document;
 use crate::grapheme::{self, RopeGraphemes};
 use crate::grep::{Grep, Row};
 use crate::keymap;
@@ -341,6 +345,237 @@ const HELP_FOOTER: &str = "type to insert · shift+move selects";
 
 /// Columns between the help box's columns of bindings.
 const HELP_GAP: usize = 3;
+
+/// Rows the side-by-side view has for content: the body less its header.
+pub fn compare_rows(text_h: usize) -> usize {
+    text_h.saturating_sub(1)
+}
+
+/// Draws the side-by-side view over the body — the tab bar and status line
+/// stay — and returns whether any visible line ran past a pane's right
+/// edge. Nothing here knows a line's width without walking it, so that
+/// answer is what bounds the view's horizontal scroll.
+///
+/// The panes take the whole width, sidebar included: two of them want the
+/// room, and the sidebar comes back untouched when the view closes.
+pub fn draw_compare(
+    screen: &mut Screen,
+    compare: &Compare,
+    doc: &Document,
+    scratch: &mut String,
+) -> bool {
+    let (screen_w, height) = screen.size();
+    let text_h = text_height(height);
+    // Two gutters and a divider need somewhere to be.
+    if usize::from(screen_w) < 3 || text_h == 0 {
+        return false;
+    }
+    let width = usize::from(screen_w);
+    // The body is drawn already and none of it belongs here: a fresh cell
+    // per position also clears the reverse and underline flags of whatever
+    // it covers, the way `overlay_box` clears its footprint.
+    for y in 1..=text_h {
+        for x in 0..width {
+            screen.set(x as u16, y as u16, ' ');
+        }
+    }
+    // The divider belongs to neither pane, the way the sidebar's does.
+    let left_w = (width - 1) / 2;
+    let right_x = left_w + 1;
+    let right_w = width - right_x;
+    for y in 1..=text_h {
+        screen.set(left_w as u16, y as u16, '│');
+    }
+
+    // Only once a lookup has answered is an empty pane HEAD's answer
+    // rather than the absence of one.
+    let baseline = if compare.tracked() || compare.note().is_some() {
+        "HEAD"
+    } else {
+        "not in HEAD"
+    };
+    draw_head(screen, 0, 1, baseline, left_w);
+    scratch.clear();
+    let _ = write!(scratch, "{}", doc.name());
+    if doc.dirty() {
+        scratch.push_str(" [+]");
+    }
+    let name_w = draw_head(screen, right_x, 1, scratch, right_w);
+    scratch.clear();
+    match (compare.at(), compare.changes()) {
+        (_, 0) => scratch.push_str("no changes"),
+        (0, 1) => scratch.push_str("1 change"),
+        (0, n) => {
+            let _ = write!(scratch, "{n} changes");
+        }
+        (at, n) => {
+            let _ = write!(scratch, "{at}/{n} changes");
+        }
+    }
+    // The count yields to the name rather than overwrite it, like the
+    // status line's help hint.
+    let count_w: usize = scratch.chars().map(char_cols).sum();
+    if compare.note().is_none() && name_w + 2 + count_w <= right_w {
+        screen.set_text((right_x + right_w - count_w) as u16, 1, scratch);
+    }
+    // Underlined edge to edge: the rule that separates header from panes.
+    for x in 0..width {
+        screen.set_underlined(x as u16, 1, true);
+    }
+
+    let rows = compare_rows(text_h);
+    if rows == 0 {
+        return false;
+    }
+    if let Some(note) = compare.note() {
+        let note_w: usize = note.chars().map(char_cols).sum();
+        draw_head(
+            screen,
+            width.saturating_sub(note_w) / 2,
+            (2 + rows / 2) as u16,
+            note,
+            width,
+        );
+        return false;
+    }
+
+    let bands = compare.bands();
+    let (top, scroll_col) = (compare.top(), compare.scroll_col());
+    // Bands tile the whole view rather than the viewport, so the walk
+    // starts where the viewport does instead of scanning up to it — the
+    // gutter's rule for hunks.
+    let mut band_i = bands.partition_point(|b| b.row + b.height() <= top);
+    let head = compare.head();
+    let left_g = digits(head.len_lines()) + 2;
+    let right_g = digits(doc.line_count()) + 2;
+    let mut clipped = false;
+    for k in 0..rows {
+        let row = top + k;
+        while bands.get(band_i).is_some_and(|b| b.row + b.height() <= row) {
+            band_i += 1;
+        }
+        let Some(band) = bands.get(band_i) else {
+            break;
+        };
+        let y = (2 + k) as u16;
+        let offset = row - band.row;
+        // The side with no line here leaves its half blank, line number
+        // and all: an absent row is what a padded band has to say.
+        if band.head.start + offset < band.head.end {
+            clipped |= draw_compare_line(
+                screen,
+                Pane {
+                    x: 0,
+                    width: left_w,
+                    gutter: left_g,
+                    // Left is what HEAD had; red is what a reader of any
+                    // diff already reads that as.
+                    fg: if band.same { 0 } else { 2 },
+                },
+                y,
+                head,
+                band.head.start + offset,
+                scroll_col,
+                scratch,
+            );
+        }
+        let line = band.buffer.start + offset;
+        // An edit can outrun the diff it will be aligned by; until the new
+        // bands land, a line the buffer no longer has simply isn't drawn.
+        if line < band.buffer.end && line < doc.line_count() {
+            clipped |= draw_compare_line(
+                screen,
+                Pane {
+                    x: right_x,
+                    width: right_w,
+                    gutter: right_g,
+                    fg: if band.same { 0 } else { 3 },
+                },
+                y,
+                doc.rope(),
+                line,
+                scroll_col,
+                scratch,
+            );
+        }
+    }
+    clipped
+}
+
+/// One pane of the side-by-side view: where it sits, how wide its own line
+/// numbers make its gutter, and the colour its differing rows take.
+struct Pane {
+    x: usize,
+    width: usize,
+    gutter: usize,
+    fg: u8,
+}
+
+/// One row of one pane: its line number, its change bar, and the line
+/// itself clipped at the pane's right edge. Returns whether the line ran
+/// past that edge. The main text area's walk without its decorations —
+/// there is no selection, no search and no cursor in here, and colour is
+/// spent saying what changed rather than what the grammar is.
+fn draw_compare_line(
+    screen: &mut Screen,
+    pane: Pane,
+    y: u16,
+    rope: &Rope,
+    line: usize,
+    scroll_col: usize,
+    scratch: &mut String,
+) -> bool {
+    scratch.clear();
+    let _ = write!(scratch, "{:>w$} ", line + 1, w = pane.gutter - 2);
+    // A pane narrower than its own gutter must not spill over the divider
+    // into its neighbour: digits and a space, so bytes are columns here.
+    scratch.truncate(pane.width);
+    screen.set_text(pane.x as u16, y, scratch);
+    if pane.fg != 0 && pane.gutter <= pane.width {
+        let x = (pane.x + pane.gutter - 1) as u16;
+        screen.set(x, y, diff::BAR);
+        screen.set_fg(x, y, pane.fg);
+    }
+    let avail = pane.width.saturating_sub(pane.gutter);
+    if avail == 0 {
+        return false;
+    }
+    let x0 = pane.x + pane.gutter;
+    let slice = diff::strip_terminator(rope.line(line));
+    let right = scroll_col + avail;
+    let mut buf = [0; 16];
+    let mut col = 0;
+    let mut more = false;
+    for range in RopeGraphemes::new(slice) {
+        if col >= right {
+            more = true;
+            break;
+        }
+        let cluster = grapheme::grapheme_str(slice, range, &mut buf);
+        let cluster_w = grapheme::grapheme_width(cluster, col);
+        let end = col + cluster_w;
+        if end > scroll_col {
+            // Tabs and clusters clipped by either edge stay blank, exactly
+            // as they do in the text area.
+            if cluster != "\t" && col >= scroll_col && end <= right {
+                let x = (x0 + col - scroll_col) as u16;
+                let first = cluster.chars().next().unwrap_or(' ');
+                if first.is_control() {
+                    screen.set_grapheme(x, y, "\u{FFFD}", 1);
+                } else {
+                    screen.set_grapheme(x, y, cluster, cluster_w as u8);
+                }
+            }
+            if pane.fg != 0 {
+                for c in col.max(scroll_col)..end.min(right) {
+                    screen.set_fg((x0 + c - scroll_col) as u16, y, pane.fg);
+                }
+            }
+        }
+        col = end;
+    }
+    more || col > right
+}
 
 /// Draws the keymap overlay: a centered box over the text area, one row per
 /// binding under underlined section titles, flowed into as few columns as
@@ -794,6 +1029,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::compare::Compare;
     use crate::diff::{Change, Diff, Hunk};
     use crate::doc::{Caret, Document, EditKind};
     use crate::view::View;
@@ -876,8 +1112,16 @@ mod tests {
         tabs
     }
 
+    /// A gutter mark. The HEAD side is the side-by-side view's business,
+    /// not the gutter's, so these carry none.
     fn hunk(start: usize, end: usize, kind: Change) -> Hunk {
-        Hunk { start, end, kind }
+        Hunk {
+            start,
+            end,
+            kind,
+            head_start: 0,
+            head_end: 0,
+        }
     }
 
     #[test]
@@ -1421,6 +1665,142 @@ mod tests {
         assert_eq!(sel_row(&screen, 1), "  ##");
     }
 
+    /// A view of `buffer` against `head`, with its lookup already answered.
+    fn comparing(head: &str, buffer: &str, rows: usize) -> (Document, Compare) {
+        let doc = named("sample.rs", buffer);
+        let head = Rope::from_str(head);
+        let hunks = crate::diff::hunks(&head, doc.rope());
+        let diff = Diff::test_baseline(Some(head), hunks);
+        let compare = Compare::new(&doc, &diff, 0, rows);
+        (doc, compare)
+    }
+
+    fn render_compare(compare: &Compare, doc: &Document, width: u16, height: u16) -> Screen {
+        let mut screen = Screen::new(width, height);
+        let mut scratch = String::new();
+        // Drawn over a full frame, the way the loop composes it.
+        let tabs = tabs_of(Document::from_str("scratch"), View::default());
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
+        draw_compare(&mut screen, compare, doc, &mut scratch);
+        screen
+    }
+
+    #[test]
+    fn the_panes_stand_the_two_texts_level() {
+        // One line rewritten and one inserted: the rewrite sits level, and
+        // the insertion pads the side that does not have it.
+        let (doc, compare) = comparing("a\nb\nc\n", "a\nB\nnew\nc\n", 6);
+        let screen = render_compare(&compare, &doc, 30, 9);
+        assert_eq!(row(&screen, 1), "HEAD          │sample.rs      ");
+        assert_eq!(row(&screen, 2), "1  a          │1  a           ");
+        assert_eq!(row(&screen, 3), "2 ▍b          │2 ▍B           ");
+        assert_eq!(row(&screen, 4), "              │3 ▍new         ");
+        assert_eq!(row(&screen, 5), "3  c          │4  c           ");
+        // The empty line every rope carries past its last terminator, one
+        // opposite the other.
+        assert_eq!(row(&screen, 6), "4             │5              ");
+        // Past the end of the shorter view, nothing at all.
+        assert_eq!(row(&screen, 7), "              │               ");
+    }
+
+    #[test]
+    fn the_left_pane_reads_red_and_the_right_green() {
+        // The side carries the before-and-after, so a rewrite is red
+        // against green rather than one "changed" colour on both.
+        let (doc, compare) = comparing("a\nb\nc\n", "a\nB\nnew\nc\n", 6);
+        let screen = render_compare(&compare, &doc, 30, 9);
+        // Context rows carry no colour at all.
+        assert_eq!(fg_row(&screen, 2), "                              ");
+        // The bar and the text take it; the line numbers stay plain, as
+        // the gutter's do.
+        assert_eq!(fg_row(&screen, 3), "  22             33           ");
+        assert_eq!(fg_row(&screen, 4), "                 3333         ");
+        assert_eq!(fg_row(&screen, 5), "                              ");
+    }
+
+    #[test]
+    fn a_deletion_leaves_the_buffer_side_blank() {
+        let (doc, compare) = comparing("a\ngone\nb\n", "a\nb\n", 6);
+        let screen = render_compare(&compare, &doc, 30, 9);
+        assert_eq!(row(&screen, 3), "2 ▍gone       │               ");
+        assert_eq!(fg_row(&screen, 3), "  22222                       ");
+    }
+
+    #[test]
+    fn the_view_covers_the_body_and_spares_the_tab_bar_and_status_line() {
+        let (doc, compare) = comparing("a\n", "a\nb\n", 6);
+        let mut plain = Screen::new(30, 9);
+        let mut scratch = String::new();
+        let tabs = tabs_of(Document::from_str("scratch"), View::default());
+        draw(
+            &mut plain,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
+        let screen = render_compare(&compare, &doc, 30, 9);
+        assert_eq!(row(&screen, 0), row(&plain, 0));
+        assert_eq!(row(&screen, 8), row(&plain, 8));
+        // Nothing of the text area beneath shows through.
+        assert!(!all_rows(&screen).contains("scratch"));
+    }
+
+    #[test]
+    fn a_note_stands_in_for_the_panes_when_there_is_nothing_to_show() {
+        let doc = named("sample.rs", "a\n");
+        let compare = Compare::new(&doc, &Diff::new(None), 0, 6);
+        let screen = render_compare(&compare, &doc, 40, 9);
+        assert!(
+            all_rows(&screen).contains(crate::compare::NOTHING),
+            "{}",
+            all_rows(&screen)
+        );
+        // No pane content behind the note.
+        assert!(!all_rows(&screen).contains('▍'));
+    }
+
+    #[test]
+    fn a_line_running_past_a_pane_reports_the_clip() {
+        let wide = "x".repeat(200);
+        let (doc, compare) = comparing("a\n", &format!("{wide}\n"), 6);
+        let mut screen = Screen::new(30, 9);
+        let mut scratch = String::new();
+        assert!(draw_compare(&mut screen, &compare, &doc, &mut scratch));
+        // Short lines on both sides have nothing past the edge.
+        let (doc, compare) = comparing("a\n", "b\n", 6);
+        let mut screen = Screen::new(30, 9);
+        assert!(!draw_compare(&mut screen, &compare, &doc, &mut scratch));
+    }
+
+    #[test]
+    fn the_panes_hold_their_columns_on_a_terminal_too_narrow_for_them() {
+        // Gutters wider than their pane clip rather than crash, and the
+        // divider keeps its column.
+        let (doc, compare) = comparing("a\nb\n", "a\nB\n", 4);
+        for width in [3, 6, 12] {
+            let screen = render_compare(&compare, &doc, width, 8);
+            let divider = usize::from((width - 1) / 2);
+            for y in 1..6 {
+                assert_eq!(
+                    row(&screen, y).chars().nth(divider),
+                    Some('│'),
+                    "width {width} row {y}"
+                );
+            }
+        }
+    }
+
     fn all_rows(screen: &Screen) -> String {
         let (_, height) = screen.size();
         (0..height).map(|y| row(screen, y) + "\n").collect()
@@ -1465,10 +1845,14 @@ mod tests {
     #[test]
     fn help_overlay_boxes_the_text_area_and_spares_the_chrome() {
         // A selection reaching under the box must not bleed through it.
-        let view = View::test_at(19, 0, 0).with_anchor(0);
-        let tabs = tabs_of(Document::from_str("some text\nmore text"), view);
+        // Lines long enough to run past the box's left edge, on a screen
+        // wide enough to leave one — the box's own width is the keymap's
+        // business and must not decide whether this test can see a bleed.
+        let text = "some text that runs on and on\nmore text that runs on and on";
+        let view = View::test_at(text.chars().count(), 0, 0).with_anchor(0);
+        let tabs = tabs_of(Document::from_str(text), view);
         let mut scratch = String::new();
-        let mut plain = Screen::new(80, 24);
+        let mut plain = Screen::new(100, 24);
         draw(
             &mut plain,
             &tabs,
@@ -1478,7 +1862,7 @@ mod tests {
             Marks::default(),
             None,
         );
-        let mut screen = Screen::new(80, 24);
+        let mut screen = Screen::new(100, 24);
         draw(
             &mut screen,
             &tabs,

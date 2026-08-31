@@ -2,6 +2,7 @@
 //! its files respecting ignore rules. The picker consumes it today; the
 //! file tree and project-wide search reuse it.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,11 +34,25 @@ fn root_from(start: &Path) -> PathBuf {
     repo_of(start).unwrap_or(start).to_path_buf()
 }
 
-/// Whether the file sits inside a git project. The cheap ancestor walk, no
+/// Whether the file sits inside a git project. An ancestor walk, no
 /// subprocess: false is what keeps connor from ever running `git` for a
 /// buffer outside a repository.
+///
+/// The parent is resolved first. `Path::ancestors` ends a relative path at
+/// an empty component, and `join` resolves that against the working
+/// directory — so `connor ../elsewhere/file` would walk sideways into the
+/// repository connor was started in rather than upward out of the file's
+/// own directory. A parent that cannot be resolved is not in a repository.
 pub fn in_repo(path: &Path) -> bool {
-    path.parent().is_some_and(|dir| repo_of(dir).is_some())
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    fs::canonicalize(dir).is_ok_and(|dir| repo_of(&dir).is_some())
 }
 
 /// The nearest ancestor holding `.git`, which may be a directory or, in a
@@ -127,6 +142,32 @@ mod tests {
         assert!(!in_repo(&loose.join("a.rs")));
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&linked).unwrap();
+        fs::remove_dir_all(&loose).unwrap();
+    }
+
+    /// A path naming `target` relatively from the working directory, which
+    /// under `cargo test` is the crate root — a repository.
+    #[cfg(unix)]
+    fn relative_to_cwd(target: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let ups: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        ups.join(target.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_relative_path_out_of_the_tree_does_not_borrow_the_working_repository() {
+        // The walk must climb out of the file's own directory, not stop at
+        // the empty ancestor a relative path ends on — which `join` reads
+        // as the working directory, a repository whenever connor was
+        // started in one.
+        let loose = scratch_dir("relative-outside");
+        touch(&loose.join("a.rs"));
+        let relative = relative_to_cwd(&loose).join("a.rs");
+        assert!(relative.is_relative());
+        assert!(relative.exists(), "{relative:?}");
+        assert!(in_repo(Path::new("src/project.rs")), "the crate is one");
+        assert!(!in_repo(&relative));
         fs::remove_dir_all(&loose).unwrap();
     }
 

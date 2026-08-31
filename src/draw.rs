@@ -12,6 +12,7 @@ use crate::picker::Picker;
 use crate::screen::Screen;
 use crate::search::Highlights;
 use crate::tabs::{Tab, Tabs};
+use crate::tree::Tree;
 
 /// The screen columns the text area starts at: the gutter holds every line
 /// number right-aligned plus one space.
@@ -24,6 +25,25 @@ pub fn text_height(screen_height: u16) -> usize {
     usize::from(screen_height).saturating_sub(2)
 }
 
+/// Widest the tree sidebar grows.
+const TREE_MAX_W: usize = 30;
+
+/// Columns the editor keeps when the sidebar squeezes it.
+const EDITOR_MIN_W: usize = 30;
+
+/// Below this the sidebar disappears entirely rather than shrink to junk.
+const TREE_HIDE_W: usize = 45;
+
+/// The sidebar's columns, border included: fixed, shrinking to keep the
+/// editor at least `EDITOR_MIN_W`, gone on a terminal too narrow for both.
+pub fn tree_width(open: bool, screen_w: u16) -> usize {
+    let width = usize::from(screen_w);
+    if !open || width < TREE_HIDE_W {
+        return 0;
+    }
+    TREE_MAX_W.min(width - EDITOR_MIN_W)
+}
+
 /// Draws one frame into a cleared screen and returns the cursor's screen
 /// cell. O(viewport): only visible lines are walked, and each only to the
 /// viewport's right edge. `scratch` is reused across frames so steady-state
@@ -32,7 +52,9 @@ pub fn text_height(screen_height: u16) -> usize {
 /// hiding its right-aligned help hint;
 /// `status_caret` parks the cursor after that many of the notice's chars
 /// while a prompt is editing there. `search` underlines every match and
-/// reverses the current one.
+/// reverses the current one. An open `tree` sidebar shifts the gutter and
+/// text right; its focus is the selection bar — the caller hides the
+/// terminal cursor while the tree holds it.
 pub fn draw(
     screen: &mut Screen,
     tabs: &Tabs,
@@ -40,16 +62,18 @@ pub fn draw(
     notice: &str,
     status_caret: Option<usize>,
     search: Option<Highlights>,
+    tree: Option<(&Tree, bool)>,
 ) -> (u16, u16) {
     let (width, height) = screen.size();
     if width == 0 || height == 0 {
         return (0, 0);
     }
+    let tree_w = tree_width(tree.is_some(), width);
     let width = usize::from(width);
     let text_h = text_height(height);
     let Tab { doc, view } = tabs.active();
     let gutter_w = gutter_width(doc);
-    let text_w = width.saturating_sub(gutter_w);
+    let text_w = width.saturating_sub(tree_w + gutter_w);
 
     if height > 1 {
         draw_tab_bar(screen, tabs, scratch, width);
@@ -65,7 +89,7 @@ pub fn draw(
         let row = (y + 1) as u16;
         scratch.clear();
         let _ = write!(scratch, "{:>w$} ", line + 1, w = gutter_w - 1);
-        screen.set_text(0, row, scratch);
+        screen.set_text(tree_w as u16, row, scratch);
         if text_w == 0 {
             continue;
         }
@@ -93,7 +117,7 @@ pub fn draw(
                 // Tabs and clusters clipped by either viewport edge stay
                 // blank — the cleared screen already holds spaces there.
                 if cluster != "\t" && col >= view.scroll_col && end <= right {
-                    let x = (gutter_w + col - view.scroll_col) as u16;
+                    let x = (tree_w + gutter_w + col - view.scroll_col) as u16;
                     let first = cluster.chars().next().unwrap_or(' ');
                     if first.is_control() {
                         screen.set_grapheme(x, row, "\u{FFFD}", 1);
@@ -103,7 +127,8 @@ pub fn draw(
                 }
                 if selected {
                     for c in col.max(view.scroll_col)..end.min(right) {
-                        screen.set_reversed((gutter_w + c - view.scroll_col) as u16, row, true);
+                        let x = (tree_w + gutter_w + c - view.scroll_col) as u16;
+                        screen.set_reversed(x, row, true);
                     }
                 }
                 // Match starts sit on char indices, so like the selection a
@@ -118,7 +143,7 @@ pub fn draw(
                         .partition_point(|&s| s.saturating_add(h.len) <= c_start);
                     if h.starts.get(i).is_some_and(|&s| s < c_end) {
                         for c in col.max(view.scroll_col)..end.min(right) {
-                            let x = (gutter_w + c - view.scroll_col) as u16;
+                            let x = (tree_w + gutter_w + c - view.scroll_col) as u16;
                             if h.current == Some(i) {
                                 screen.set_reversed(x, row, true);
                             } else {
@@ -136,7 +161,8 @@ pub fn draw(
         if sel.as_ref().is_some_and(|s| s.contains(&line_end))
             && (view.scroll_col..right).contains(&col)
         {
-            screen.set_reversed((gutter_w + col - view.scroll_col) as u16, row, true);
+            let x = (tree_w + gutter_w + col - view.scroll_col) as u16;
+            screen.set_reversed(x, row, true);
         }
     }
 
@@ -172,16 +198,96 @@ pub fn draw(
         screen.set_text(0, height - 1, notice);
     }
 
+    if tree_w > 0
+        && let Some((tree, focused)) = tree
+    {
+        draw_tree(screen, tree, focused, tree_w);
+    }
     if let Some(chars) = status_caret {
         let col: usize = notice.chars().take(chars).map(char_cols).sum();
         return (col.min(width - 1) as u16, height - 1);
     }
-    let cx = (gutter_w + vcol.saturating_sub(view.scroll_col)).min(width - 1) as u16;
+    let cx = (tree_w + gutter_w + vcol.saturating_sub(view.scroll_col)).min(width - 1) as u16;
     let cy = (1 + line
         .saturating_sub(view.scroll_line)
         .min(text_h.saturating_sub(1)))
     .min(usize::from(height) - 1) as u16;
     (cx, cy)
+}
+
+/// Draws the tree sidebar over rows 1..=text_h: a border column on its
+/// right edge, one indented row per visible entry with `▸`/`▾` marking
+/// collapsed and expanded directories, the selection in reverse video
+/// while the tree holds focus, and the edited file's name underlined.
+/// Every cell write bounds-checks, so degenerate sizes clip, not panic.
+fn draw_tree(screen: &mut Screen, tree: &Tree, focused: bool, tree_w: usize) {
+    let (_, height) = screen.size();
+    let text_h = text_height(height);
+    let inner = tree_w - 1;
+    for k in 0..text_h {
+        screen.set(inner as u16, (1 + k) as u16, '│');
+    }
+    // A resize may have shrunk the window since the last state change;
+    // drawing clamps read-only rather than mutating the scroll.
+    let scroll = tree.scroll().min(tree.visible_len().saturating_sub(1));
+    for k in 0..text_h {
+        let i = scroll + k;
+        let y = (1 + k) as u16;
+        if i >= tree.visible_len() {
+            // The ellipsis row says the walk is still feeding entries in.
+            if tree.walking() && i == tree.visible_len() {
+                screen.set(0, y, '…');
+            }
+            break;
+        }
+        let r = tree.row(i);
+        // Deep nesting caps the indent so the name keeps some columns.
+        let indent = (r.depth * 2).min(inner.saturating_sub(8));
+        if r.dir {
+            screen.set(indent as u16, y, if r.expanded { '▾' } else { '▸' });
+        }
+        let name_x = indent + 2;
+        let drawn = draw_head(screen, name_x, y, r.name, inner.saturating_sub(name_x));
+        if r.active {
+            for x in name_x..name_x + drawn {
+                screen.set_underlined(x as u16, y, true);
+            }
+        }
+        if focused && i == tree.selected() {
+            for x in 0..inner {
+                screen.set_reversed(x as u16, y, true);
+            }
+        }
+    }
+}
+
+/// Draws `text` within `avail` columns starting at `x`. One that doesn't
+/// fit keeps its head — for a name, the stem — before a trailing ellipsis.
+/// Returns the columns drawn.
+fn draw_head(screen: &mut Screen, x: usize, y: u16, text: &str, avail: usize) -> usize {
+    let total: usize = text.chars().map(char_cols).sum();
+    if total > avail {
+        if avail == 0 {
+            return 0;
+        }
+        let mut drawn = 0;
+        for ch in text.chars() {
+            let w = char_cols(ch);
+            if drawn + w > avail - 1 {
+                break;
+            }
+            screen.set((x + drawn) as u16, y, ch);
+            drawn += w;
+        }
+        screen.set((x + drawn) as u16, y, '…');
+        return drawn + 1;
+    }
+    let mut drawn = 0;
+    for ch in text.chars() {
+        screen.set((x + drawn) as u16, y, ch);
+        drawn += char_cols(ch);
+    }
+    drawn
 }
 
 /// The rules that aren't bindings, shown inside the help box.
@@ -574,7 +680,7 @@ mod tests {
     fn render_tabs(tabs: &Tabs, width: u16, height: u16) -> (Screen, (u16, u16)) {
         let mut screen = Screen::new(width, height);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, tabs, &mut scratch, "", None, None);
+        let cursor = draw(&mut screen, tabs, &mut scratch, "", None, None, None);
         (screen, cursor)
     }
 
@@ -688,7 +794,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("ab"), View::default());
         let mut screen = Screen::new(12, 3);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "saved ab", None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "saved ab",
+            None,
+            None,
+            None,
+        );
         assert_eq!(row(&screen, 2), "saved ab    ");
     }
 
@@ -697,7 +811,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("ab"), View::default());
         let mut screen = Screen::new(12, 3);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, &tabs, &mut scratch, "open: sr", Some(8), None);
+        let cursor = draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "open: sr",
+            Some(8),
+            None,
+            None,
+        );
         assert_eq!(cursor, (8, 2));
 
         // The caret clips at the right edge rather than leaving the screen.
@@ -707,6 +829,7 @@ mod tests {
             &mut scratch,
             "open: src/main.rs",
             Some(17),
+            None,
             None,
         );
         assert_eq!(cursor, (11, 2));
@@ -724,6 +847,7 @@ mod tests {
             &mut scratch,
             "find: 日 · esc",
             Some(7),
+            None,
             None,
         );
         assert_eq!(cursor, (8, 2));
@@ -835,7 +959,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str(text), view);
         let mut screen = Screen::new(width, height);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, Some(search));
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Some(search),
+            None,
+        );
         screen
     }
 
@@ -955,7 +1087,7 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(100, 60);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
         draw_help(&mut screen, &mut scratch);
         let all = all_rows(&screen);
         assert!(all.contains(HELP_FOOTER));
@@ -985,9 +1117,9 @@ mod tests {
         let tabs = tabs_of(Document::from_str("some text\nmore text"), view);
         let mut scratch = String::new();
         let mut plain = Screen::new(80, 24);
-        draw(&mut plain, &tabs, &mut scratch, "", None, None);
+        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
         let mut screen = Screen::new(80, 24);
-        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
         draw_help(&mut screen, &mut scratch);
 
         assert_eq!(row(&screen, 0), row(&plain, 0));
@@ -1030,7 +1162,7 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(40, 14);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
         let mut picker = picker_of(PICK_PATHS, false);
         press(&mut picker, crossterm::event::KeyCode::Char('d'));
         let cursor = draw_picker(&mut screen, &picker, &mut scratch);
@@ -1051,7 +1183,7 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(40, 14);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
         let mut picker = picker_of(PICK_PATHS, true);
         press(&mut picker, crossterm::event::KeyCode::Down);
         draw_picker(&mut screen, &picker, &mut scratch);
@@ -1070,9 +1202,9 @@ mod tests {
         let tabs = tabs_of(Document::from_str("some text\nmore text"), view);
         let mut scratch = String::new();
         let mut plain = Screen::new(100, 24);
-        draw(&mut plain, &tabs, &mut scratch, "", None, None);
+        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
         let mut screen = Screen::new(100, 24);
-        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
         let picker = picker_of(PICK_PATHS, true);
         draw_picker(&mut screen, &picker, &mut scratch);
 
@@ -1092,7 +1224,7 @@ mod tests {
         let tabs = tabs_of(Document::from_str(""), View::default());
         let mut screen = Screen::new(20, 10);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
         let picker = picker_of(&["a/very/deep/nested/path/name.rs"], true);
         draw_picker(&mut screen, &picker, &mut scratch);
 
@@ -1100,6 +1232,192 @@ mod tests {
         assert!(listing.contains('…'), "no ellipsis: {listing}");
         assert!(listing.contains("name.rs"), "tail lost: {listing}");
         assert!(!listing.contains("a/very"), "head kept: {listing}");
+    }
+
+    fn tree_of(paths: &[&str], done: bool) -> Tree {
+        let mut tree = Tree::new(PathBuf::from("/r"), 1, Default::default());
+        tree.absorb(
+            crate::project::FileBatch {
+                generation: 1,
+                paths: paths.iter().map(|s| s.to_string()).collect(),
+                done,
+            },
+            10,
+        );
+        tree
+    }
+
+    const TREE_PATHS: &[&str] = &["src/main.rs", "README.md"];
+
+    #[test]
+    fn tree_sidebar_lists_entries_and_shifts_the_editor_right() {
+        let tabs = tabs_of(Document::from_str("hello"), View::default());
+        let mut screen = Screen::new(60, 5);
+        let mut scratch = String::new();
+        let tree = tree_of(TREE_PATHS, true);
+        let cursor = draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, false)),
+        );
+
+        let body = row(&screen, 1);
+        assert!(body.starts_with("▸ src"), "no dir glyph: {body}");
+        assert_eq!(body.chars().nth(29), Some('│'), "no border: {body}");
+        assert_eq!(body.chars().position(|c| c == '1'), Some(30));
+        assert!(body.contains("1 hello"), "text not shifted: {body}");
+        assert!(row(&screen, 2).starts_with("  README.md"));
+        // Unfocused, the cursor stays in the text area, past the sidebar.
+        assert_eq!(cursor, (32, 1));
+    }
+
+    #[test]
+    fn a_focused_tree_reverses_its_selection_and_the_cursor_stays_put() {
+        let tabs = tabs_of(Document::from_str("hello"), View::default());
+        let mut scratch = String::new();
+        let tree = tree_of(TREE_PATHS, true);
+
+        let mut unfocused = Screen::new(60, 5);
+        draw(
+            &mut unfocused,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, false)),
+        );
+        assert!(!sel_row(&unfocused, 1).contains('#'));
+
+        let mut focused = Screen::new(60, 5);
+        let cursor = draw(
+            &mut focused,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, true)),
+        );
+        let sel = sel_row(&focused, 1);
+        assert!(sel[..29].contains('#'), "selection not reversed: {sel}");
+        assert!(!sel_row(&focused, 2).contains('#'));
+        // The selection bar is the focus cue; the returned cursor stays in
+        // the text area, and the caller hides it while the tree is focused.
+        assert_eq!(cursor, (32, 1));
+    }
+
+    #[test]
+    fn the_edited_file_is_underlined_in_the_tree() {
+        let tabs = tabs_of(Document::from_str("hello"), View::default());
+        let mut screen = Screen::new(60, 5);
+        let mut scratch = String::new();
+        let mut tree = tree_of(TREE_PATHS, true);
+        tree.set_active(Some(std::path::Path::new("/r/README.md")));
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, false)),
+        );
+        assert!(!ul_row(&screen, 1).contains('_'));
+        assert!(ul_row(&screen, 2).contains('_'));
+    }
+
+    #[test]
+    fn tree_sidebar_spares_the_tab_bar_and_status_line() {
+        let tabs = tabs_of(named("f.rs", "hello"), View::default());
+        let mut scratch = String::new();
+        let mut plain = Screen::new(60, 5);
+        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
+        let mut screen = Screen::new(60, 5);
+        let tree = tree_of(TREE_PATHS, true);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, false)),
+        );
+        assert_eq!(row(&screen, 0), row(&plain, 0));
+        assert_eq!(row(&screen, 4), row(&plain, 4));
+    }
+
+    #[test]
+    fn a_narrow_terminal_hides_the_sidebar() {
+        assert_eq!(tree_width(true, 44), 0);
+        assert_eq!(tree_width(true, 45), 15);
+        assert_eq!(tree_width(true, 80), 30);
+        assert_eq!(tree_width(false, 80), 0);
+
+        let tabs = tabs_of(Document::from_str("hello"), View::default());
+        let mut scratch = String::new();
+        let mut plain = Screen::new(44, 5);
+        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
+        let mut screen = Screen::new(44, 5);
+        let tree = tree_of(TREE_PATHS, true);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, false)),
+        );
+        for y in 0..5 {
+            assert_eq!(row(&screen, y), row(&plain, y));
+        }
+    }
+
+    #[test]
+    fn the_tree_shows_an_ellipsis_while_the_walk_streams() {
+        let tabs = tabs_of(Document::from_str(""), View::default());
+        let mut screen = Screen::new(60, 6);
+        let mut scratch = String::new();
+        let tree = tree_of(&["a.rs"], false);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, false)),
+        );
+        assert!(row(&screen, 1).starts_with("  a.rs"));
+        assert!(row(&screen, 2).starts_with('…'));
+    }
+
+    #[test]
+    fn tree_names_truncate_keeping_their_head() {
+        let tabs = tabs_of(Document::from_str(""), View::default());
+        let mut screen = Screen::new(60, 5);
+        let mut scratch = String::new();
+        let tree = tree_of(&["a_very_long_file_name_that_overflows.rs"], true);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            None,
+            Some((&tree, false)),
+        );
+        let body = row(&screen, 1);
+        assert!(body.contains("a_very_long"), "head lost: {body}");
+        assert!(body.contains('…'), "no ellipsis: {body}");
+        assert!(!body.contains(".rs"), "tail kept: {body}");
+        assert_eq!(body.chars().nth(29), Some('│'), "border overrun: {body}");
     }
 
     #[test]
@@ -1130,6 +1448,25 @@ mod tests {
             ]);
             tabs.activate(2);
             render_tabs(&tabs, w, h);
+
+            let mut deep = tree_of(
+                &["日本/長いファイル名.rs", "a/b/c/d/e/f/g/h/i/deep.rs"],
+                false,
+            );
+            deep.set_active(Some(std::path::Path::new("/r/a/b/c/d/e/f/g/h/i/deep.rs")));
+            deep.reveal_active(10);
+            for focused in [false, true] {
+                let mut screen = Screen::new(w, h);
+                draw(
+                    &mut screen,
+                    &tabs,
+                    &mut scratch,
+                    "",
+                    None,
+                    None,
+                    Some((&deep, focused)),
+                );
+            }
 
             let starts = [0, 7, usize::MAX - 1];
             let search = Highlights {

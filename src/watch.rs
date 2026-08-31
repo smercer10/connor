@@ -97,6 +97,95 @@ impl Debounce {
     }
 }
 
+/// One save fires a burst; a build fires thousands. The tree refresh keeps
+/// no paths — any event under the root means one re-walk — and a longer
+/// window than the reload debounce keeps a busy build to at most a couple
+/// of background walks per second.
+const REFRESH_WINDOW: Duration = Duration::from_millis(500);
+
+/// Coalesces tree-refresh triggers. Like `Debounce`, the window is fixed
+/// from the first note, so a continuously writing agent cannot push the
+/// refresh out forever.
+#[derive(Default)]
+pub struct Refresh {
+    deadline: Option<Instant>,
+}
+
+impl Refresh {
+    pub fn note(&mut self, now: Instant) {
+        self.deadline.get_or_insert(now + REFRESH_WINDOW);
+    }
+
+    /// When the refresh falls due; `None` when nothing is pending.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Whether a refresh is due at `now`; a due one disarms.
+    pub fn take(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|t| t <= now) {
+            self.deadline = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// Watches the tree sidebar's directories, one by one and non-recursively,
+/// feeding the same `Fs` events the reload path consumes. The set mirrors
+/// the tree itself — the root plus every directory it derives — so ignored
+/// trees (`target/`, `.git`) are never watched at all: no setup crawl over
+/// directories the sidebar will never show, and no event storms from
+/// builds. A file landing in a brand-new directory chain still fires in
+/// its watched ancestor, and the refresh walk then derives the new
+/// directories for the next sync. Dropping the watcher unwatches.
+pub struct TreeWatcher {
+    inner: RecommendedWatcher,
+    dirs: HashSet<PathBuf>,
+}
+
+impl TreeWatcher {
+    pub fn new(tx: Sender<AppEvent>) -> notify::Result<TreeWatcher> {
+        let inner = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(ev) = res else { return };
+            if matches!(ev.kind, EventKind::Access(_)) {
+                return;
+            }
+            for path in ev.paths {
+                // Dotfiles are hidden from the tree, so their churn (swap
+                // files, lockfiles) can't change it; dropped off the main
+                // thread.
+                let hidden = path
+                    .file_name()
+                    .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."));
+                if !hidden && tx.send(AppEvent::Fs(path)).is_err() {
+                    return;
+                }
+            }
+        })?;
+        Ok(TreeWatcher {
+            inner,
+            dirs: HashSet::new(),
+        })
+    }
+
+    /// Reconciles the watched set with the tree's directories. Watch and
+    /// unwatch failures are ignored — a directory that can't be watched
+    /// (inotify limits, say) just gets no auto-refresh.
+    pub fn sync(&mut self, desired: HashSet<PathBuf>) {
+        if desired == self.dirs {
+            return;
+        }
+        for dir in self.dirs.difference(&desired) {
+            let _ = self.inner.unwatch(dir);
+        }
+        for dir in desired.difference(&self.dirs) {
+            let _ = self.inner.watch(dir, RecursiveMode::NonRecursive);
+        }
+        self.dirs = desired;
+    }
+}
+
 /// Watches the parent directories of open files, forwarding raw events
 /// into the main loop's channel. Directories rather than the files
 /// themselves: saves are temp-file-plus-rename, which replaces the inode a
@@ -194,6 +283,22 @@ mod tests {
         assert_eq!(debounce.deadline(), Some(start + WINDOW));
         debounce.note(PathBuf::from("b"), start + WINDOW / 2);
         assert_eq!(debounce.deadline(), Some(start + WINDOW));
+    }
+
+    #[test]
+    fn a_refresh_arms_on_the_first_note_and_a_due_take_disarms() {
+        let mut refresh = Refresh::default();
+        let start = Instant::now();
+        assert_eq!(refresh.deadline(), None);
+        assert!(!refresh.take(start));
+        refresh.note(start);
+        // Later notes never push the deadline out.
+        refresh.note(start + REFRESH_WINDOW / 2);
+        assert_eq!(refresh.deadline(), Some(start + REFRESH_WINDOW));
+        assert!(!refresh.take(start + REFRESH_WINDOW / 2));
+        assert!(refresh.take(start + REFRESH_WINDOW));
+        assert_eq!(refresh.deadline(), None);
+        assert!(!refresh.take(start + REFRESH_WINDOW));
     }
 
     #[test]

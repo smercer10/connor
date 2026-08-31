@@ -7,6 +7,10 @@ description = "A terminal text editor for working alongside a coding agent"
 
 [dependencies]
 crossterm = "0.29"
+# Line diffing the buffer against HEAD: the histogram algorithm with git's
+# own heuristics (gitoxide's and Helix's differ). Its unified-diff printer
+# is unused, so the default feature stays off.
+imara-diff = { version = "0.2", default-features = false }
 # Walks the project tree respecting .gitignore (ripgrep's walker).
 ignore = "0.4"
 notify = "8.2"

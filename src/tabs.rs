@@ -4,22 +4,25 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::diff::Diff;
 use crate::doc::Document;
 use crate::syntax::Syntax;
 use crate::view::View;
 
 /// One open file and the view looking at it, plus its syntax highlighter
-/// when a grammar covers the file.
+/// when a grammar covers the file and its standing against HEAD.
 pub struct Tab {
     pub doc: Document,
     pub view: View,
     pub syntax: Option<Syntax>,
+    pub diff: Diff,
 }
 
 impl Tab {
     fn of(mut doc: Document) -> Tab {
         Tab {
             syntax: Syntax::new(&mut doc),
+            diff: Diff::new(doc.path()),
             doc,
             view: View::default(),
         }

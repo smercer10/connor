@@ -26,6 +26,8 @@ pub enum AppEvent {
     Hits(crate::grep::HitBatch),
     /// A finished background parse from the syntax highlighter.
     Parsed(crate::syntax::ParseDone),
+    /// A finished HEAD lookup or line diff from the gutter marks.
+    Diffed(crate::diff::DiffDone),
     /// An external signal arrived; the loop decides whether to suspend,
     /// resync, or exit.
     #[cfg(unix)]
@@ -190,15 +192,26 @@ impl TreeWatcher {
     }
 }
 
+/// What one tab wants watched: the directory its file is saved into, and
+/// the git directory holding its HEAD once the diff has found it.
+#[derive(PartialEq, Eq)]
+struct Watched {
+    path: Option<PathBuf>,
+    git_dir: Option<PathBuf>,
+}
+
 /// Watches the parent directories of open files, forwarding raw events
 /// into the main loop's channel. Directories rather than the files
 /// themselves: saves are temp-file-plus-rename, which replaces the inode a
-/// file watch would stay bound to.
+/// file watch would stay bound to. It also watches each file's git
+/// directory: a commit or a branch switch touches no working-tree file, so
+/// that is the only place HEAD moving shows up.
 pub struct DirWatcher {
     inner: RecommendedWatcher,
     dirs: HashSet<PathBuf>,
-    /// Tab paths as of the last sync — the syscall-free change detector.
-    paths: Vec<Option<PathBuf>>,
+    /// What the tabs wanted at the last sync — the syscall-free change
+    /// detector.
+    watched: Vec<Watched>,
 }
 
 impl DirWatcher {
@@ -217,7 +230,7 @@ impl DirWatcher {
         Ok(DirWatcher {
             inner,
             dirs: HashSet::new(),
-            paths: Vec::new(),
+            watched: Vec::new(),
         })
     }
 
@@ -228,26 +241,28 @@ impl DirWatcher {
     /// unwatch failures are ignored — a directory that can't be watched
     /// just gets no reloads.
     pub fn sync(&mut self, tabs: &Tabs) {
-        if self.paths.len() == tabs.count()
-            && tabs
-                .all()
-                .iter()
-                .zip(&self.paths)
-                .all(|(tab, p)| tab.doc.path() == p.as_deref())
+        if self.watched.len() == tabs.count()
+            && tabs.all().iter().zip(&self.watched).all(|(tab, w)| {
+                tab.doc.path() == w.path.as_deref() && tab.diff.git_dir() == w.git_dir.as_deref()
+            })
         {
             return;
         }
-        self.paths = tabs
+        self.watched = tabs
             .all()
             .iter()
-            .map(|tab| tab.doc.path().map(Path::to_path_buf))
+            .map(|tab| Watched {
+                path: tab.doc.path().map(Path::to_path_buf),
+                git_dir: tab.diff.git_dir().map(Path::to_path_buf),
+            })
             .collect();
-        let desired: HashSet<PathBuf> = self
-            .paths
-            .iter()
-            .flatten()
-            .filter_map(|path| watch_dir(path))
-            .collect();
+        let mut desired: HashSet<PathBuf> = HashSet::new();
+        for w in &self.watched {
+            // The git directory is already absolute and is watched as it
+            // stands; only the file's own directory needs resolving.
+            desired.extend(w.path.as_deref().and_then(watch_dir));
+            desired.extend(w.git_dir.clone());
+        }
         for dir in self.dirs.difference(&desired) {
             let _ = self.inner.unwatch(dir);
         }

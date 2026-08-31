@@ -1,4 +1,5 @@
 mod clip;
+mod diff;
 mod doc;
 mod draw;
 mod grapheme;
@@ -540,8 +541,10 @@ fn save_as(
 ) -> (Option<Prompt>, bool) {
     let tab = tabs.active_mut();
     tab.doc.set_path(path);
-    // The new name can gain or lose a grammar; rebuild the highlighter.
+    // The new name can gain or lose a grammar and a repository; rebuild
+    // the highlighter and the comparison against HEAD.
     tab.syntax = syntax::Syntax::new(&mut tab.doc);
+    tab.diff = diff::Diff::new(tab.doc.path());
     let doc = &mut tab.doc;
     if !try_save(doc, notice) {
         // The name sticks, so a plain Ctrl+S can retry the same target.
@@ -613,6 +616,22 @@ fn absorb_parse(tabs: &mut Tabs, done: syntax::ParseDone, tx: &mpsc::Sender<AppE
     false
 }
 
+/// Routes a finished HEAD lookup or background diff to the tab waiting on
+/// it. Returns whether the screen changed — only when the result is current
+/// and its tab is the active one; a closed tab's or a superseded result is
+/// dropped.
+fn absorb_diff(tabs: &mut Tabs, done: diff::DiffDone, tx: &mpsc::Sender<AppEvent>) -> bool {
+    let active = tabs.active_index();
+    for index in 0..tabs.count() {
+        let Tab { doc, diff, .. } = tabs.get_mut(index);
+        if doc.id() == done.doc_id {
+            let changed = diff.absorb(done, doc, tx);
+            return changed && index == active;
+        }
+    }
+    false
+}
+
 /// Closing the last tab is quitting; returns whether to quit.
 fn close_active_or_quit(tabs: &mut Tabs) -> bool {
     if tabs.count() == 1 {
@@ -667,6 +686,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     let mut tree_focus = false;
     let mut tree_watch: Option<TreeWatcher> = None;
     let mut refresh = Refresh::default();
+    let mut head_refresh = Refresh::default();
     let mut redraw = true;
 
     loop {
@@ -677,11 +697,17 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             // document with an unmoved viewport is a cache hit.
             {
                 let text_h = draw::text_height(back.size().1);
-                let Tab { doc, view, syntax } = tabs.active_mut();
+                let Tab {
+                    doc,
+                    view,
+                    syntax,
+                    diff,
+                } = tabs.active_mut();
                 if let Some(syntax) = syntax {
                     syntax.pump(doc, &tx);
                     syntax.refresh(doc, view.scroll_line, text_h);
                 }
+                diff.pump(doc, &tx);
             }
             back.clear();
             let status_caret = match &prompt {
@@ -742,6 +768,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             debounce.deadline(),
             journal.deadline(),
             refresh.deadline(),
+            head_refresh.deadline(),
             grep_restart,
         ]
         .into_iter()
@@ -773,6 +800,18 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                         t.begin_refresh(walk_gen, cancel);
                     }
                 }
+                if head_refresh.take(now) {
+                    // HEAD may have moved under every buffer; a background
+                    // tab looks again when it next draws, and the active one
+                    // right now — spawning here rather than in the frame is
+                    // what keeps a busy repository from repainting the
+                    // screen for changes it may not even have.
+                    for index in 0..tabs.count() {
+                        tabs.get_mut(index).diff.mark_stale();
+                    }
+                    let Tab { doc, diff, .. } = tabs.active_mut();
+                    diff.pump(doc, &tx);
+                }
                 if fs_due {
                     reload_changed(tabs, &mut debounce);
                     // A reload may have shifted or removed matches; a stale
@@ -802,6 +841,15 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 let now = Instant::now();
                 if tree.is_some() && path.starts_with(&root) {
                     refresh.note(now);
+                }
+                // A commit or a branch switch touches no working-tree file,
+                // so the git directory is the only place it shows up.
+                if tabs
+                    .all()
+                    .iter()
+                    .any(|tab| tab.diff.git_dir().is_some_and(|dir| path.starts_with(dir)))
+                {
+                    head_refresh.note(now);
                 }
                 debounce.note(path, now);
                 // Noting changes nothing on screen; the expiries draw.
@@ -837,6 +885,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             Ok(AppEvent::Parsed(done)) => {
                 redraw = absorb_parse(tabs, done, &tx);
             }
+            Ok(AppEvent::Diffed(done)) => {
+                redraw = absorb_diff(tabs, done, &tx);
+            }
             Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 // A pending prompt owns the key; the loop tail still runs,
                 // because prompts are allowed to move the cursor.
@@ -869,7 +920,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 } else {
                     notice.clear();
                     if let Some(action) = keymap::lookup(&key) {
-                        let Tab { doc, view, .. } = tabs.active_mut();
+                        let Tab {
+                            doc, view, diff, ..
+                        } = tabs.active_mut();
                         if action.is_movement() {
                             // Shift extends a selection through any movement key;
                             // Char keys never map to movement, so shifted typing
@@ -936,6 +989,22 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             Action::GoToLine => {
                                 prompt =
                                     open_prompt(Prompt::GoTo(LinePrompt::new()), doc, &mut notice);
+                            }
+                            Action::PrevChange | Action::NextChange => {
+                                // Not classified as movement: a hunk jump has
+                                // no shift-extends-selection reading.
+                                doc.break_undo_group();
+                                view.begin_or_clear_selection(false);
+                                let from = view.line(doc);
+                                let to = if action == Action::NextChange {
+                                    diff.next_change(from)
+                                } else {
+                                    diff.prev_change(from)
+                                };
+                                // The loop tail scrolls the landing into view.
+                                if let Some(line) = to {
+                                    view.move_to_line(doc, line + 1);
+                                }
                             }
                             Action::CloseTab => {
                                 if doc.dirty() {
@@ -1147,9 +1216,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                 t.elapsed() <= DOUBLE_CLICK && (x, y) == (m.column, m.row)
                             });
                         last_click = Some((Instant::now(), m.column, m.row));
+                        let gutter_w = draw::gutter_width(tabs.active());
                         let Tab { doc, view, .. } = tabs.active_mut();
                         doc.break_undo_group();
-                        let gutter_w = draw::gutter_width(doc);
                         view.click(doc, tree_w + gutter_w, text_h, m.column, m.row, shift);
                         if double {
                             view.select_word(doc);
@@ -1169,8 +1238,8 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) if prompt.is_none() && !tree_focus => {
+                        let gutter_w = draw::gutter_width(tabs.active());
                         let Tab { doc, view, .. } = tabs.active_mut();
-                        let gutter_w = draw::gutter_width(doc);
                         view.drag(doc, tree_w + gutter_w, text_h, m.column, m.row);
                     }
                     _ => {}
@@ -1208,8 +1277,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
         if follow_cursor {
             let (width, height) = back.size();
             let tree_w = draw::tree_width(tree.is_some(), width);
+            let gutter_w = draw::gutter_width(tabs.active());
             let Tab { doc, view, .. } = tabs.active_mut();
-            let text_w = usize::from(width).saturating_sub(tree_w + draw::gutter_width(doc));
+            let text_w = usize::from(width).saturating_sub(tree_w + gutter_w);
             view.scroll_to_cursor(doc, text_w, draw::text_height(height));
         }
     }

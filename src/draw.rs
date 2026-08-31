@@ -5,7 +5,6 @@ use std::fmt::Write as _;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::doc::Document;
 use crate::grapheme::{self, RopeGraphemes};
 use crate::grep::{Grep, Row};
 use crate::keymap;
@@ -17,9 +16,12 @@ use crate::tabs::{Tab, Tabs};
 use crate::tree::Tree;
 
 /// The screen columns the text area starts at: the gutter holds every line
-/// number right-aligned plus one space.
-pub fn gutter_width(doc: &Document) -> usize {
-    digits(doc.line_count()) + 1
+/// number right-aligned plus one space, and — for a document inside a git
+/// project — one more column for its change mark. Every coordinate that
+/// crosses the gutter goes through here, so mouse mapping and cursor
+/// scrolling follow the mark column without knowing about it.
+pub fn gutter_width(tab: &Tab) -> usize {
+    digits(tab.doc.line_count()) + 1 + usize::from(tab.diff.in_repo())
 }
 
 /// Rows available to text: everything but the tab bar and the status line.
@@ -82,8 +84,10 @@ pub fn draw(
     let tree_w = tree_width(tree.is_some(), width);
     let width = usize::from(width);
     let text_h = text_height(height);
-    let Tab { doc, view, .. } = tabs.active();
-    let gutter_w = gutter_width(doc);
+    let tab = tabs.active();
+    let Tab { doc, view, .. } = tab;
+    let gutter_w = gutter_width(tab);
+    let mark_w = usize::from(tab.diff.in_repo());
     let text_w = width.saturating_sub(tree_w + gutter_w);
 
     if height > 1 {
@@ -96,6 +100,11 @@ pub fn draw(
     // ascends through char indices, so one advancing index serves every
     // visible line — O(1) amortised per cluster, no search.
     let mut span_i = 0;
+    // Hunks are sorted and non-overlapping too, but they span the whole
+    // document rather than the viewport, so the walk starts where the
+    // viewport does instead of scanning up to it.
+    let changes = tab.diff.hunks();
+    let mut hunk_i = changes.partition_point(|h| h.end <= view.scroll_line);
     for y in 0..text_h {
         let line = view.scroll_line + y;
         if line >= doc.line_count() {
@@ -103,8 +112,18 @@ pub fn draw(
         }
         let row = (y + 1) as u16;
         scratch.clear();
-        let _ = write!(scratch, "{:>w$} ", line + 1, w = gutter_w - 1);
+        let _ = write!(scratch, "{:>w$} ", line + 1, w = gutter_w - 1 - mark_w);
         screen.set_text(tree_w as u16, row, scratch);
+        while changes.get(hunk_i).is_some_and(|h| h.end <= line) {
+            hunk_i += 1;
+        }
+        if let Some(h) = changes.get(hunk_i)
+            && h.start <= line
+        {
+            let x = (tree_w + gutter_w - 1) as u16;
+            screen.set(x, row, h.kind.glyph());
+            screen.set_fg(x, row, h.kind.color());
+        }
         if text_w == 0 {
             continue;
         }
@@ -775,7 +794,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::doc::{Caret, EditKind};
+    use crate::diff::{Change, Diff, Hunk};
+    use crate::doc::{Caret, Document, EditKind};
     use crate::view::View;
 
     fn tabs_of(doc: Document, view: View) -> Tabs {
@@ -847,6 +867,138 @@ mod tests {
         assert_eq!(row(&screen, 1), " 1 a    ");
         assert_eq!(row(&screen, 10), "10 j    ");
         assert_eq!(cursor, (3, 1));
+    }
+
+    /// A document standing inside a repository at a fixed set of marks.
+    fn marked(text: &str, view: View, hunks: Vec<Hunk>) -> Tabs {
+        let mut tabs = tabs_of(Document::from_str(text), view);
+        tabs.active_mut().diff = Diff::test_marks(hunks);
+        tabs
+    }
+
+    fn hunk(start: usize, end: usize, kind: Change) -> Hunk {
+        Hunk { start, end, kind }
+    }
+
+    #[test]
+    fn the_mark_column_appears_only_inside_a_repository() {
+        // Outside one the gutter is what it always was, to the column.
+        let (plain, plain_cursor) = render("hello\nworld", 14, 5, View::default());
+        assert_eq!(row(&plain, 1), "1 hello       ");
+        assert_eq!(plain_cursor, (2, 1));
+
+        let (screen, cursor) =
+            render_tabs(&marked("hello\nworld", View::default(), Vec::new()), 14, 5);
+        assert_eq!(row(&screen, 1), "1  hello      ");
+        assert_eq!(row(&screen, 2), "2  world      ");
+        assert_eq!(cursor, (3, 1));
+    }
+
+    #[test]
+    fn each_change_marks_its_own_rows() {
+        let tabs = marked(
+            "a\nb\nc\nd",
+            View::default(),
+            vec![hunk(0, 1, Change::Added), hunk(2, 3, Change::Changed)],
+        );
+        let (screen, _) = render_tabs(&tabs, 8, 7);
+        assert_eq!(row(&screen, 1), "1 ▍a    ");
+        assert_eq!(row(&screen, 2), "2  b    ");
+        assert_eq!(row(&screen, 3), "3 ▍c    ");
+        assert_eq!(row(&screen, 4), "4  d    ");
+        // Green added, yellow changed, and the numbers stay plain.
+        assert_eq!(fg_row(&screen, 1), "  3     ");
+        assert_eq!(fg_row(&screen, 2), "        ");
+        assert_eq!(fg_row(&screen, 3), "  4     ");
+    }
+
+    #[test]
+    fn removal_marks_sit_on_the_edge_the_lines_left() {
+        let tabs = marked(
+            "a\nb\nc\nd",
+            View::default(),
+            vec![
+                hunk(1, 2, Change::RemovedAbove),
+                hunk(3, 4, Change::RemovedBelow),
+            ],
+        );
+        let (screen, _) = render_tabs(&tabs, 8, 7);
+        assert_eq!(row(&screen, 2), "2 ▔b    ");
+        assert_eq!(row(&screen, 4), "4 ▁d    ");
+        assert_eq!(fg_row(&screen, 2), "  2     ");
+        assert_eq!(fg_row(&screen, 4), "  2     ");
+    }
+
+    #[test]
+    fn a_multi_line_hunk_marks_every_row_it_covers() {
+        let tabs = marked(
+            "a\nb\nc\nd",
+            View::default(),
+            vec![hunk(1, 3, Change::Added)],
+        );
+        let (screen, _) = render_tabs(&tabs, 8, 7);
+        assert_eq!(row(&screen, 1), "1  a    ");
+        assert_eq!(row(&screen, 2), "2 ▍b    ");
+        assert_eq!(row(&screen, 3), "3 ▍c    ");
+        assert_eq!(row(&screen, 4), "4  d    ");
+    }
+
+    #[test]
+    fn marks_never_reach_past_the_last_line() {
+        // A hunk set the buffer has already outgrown; the rows below the
+        // document stay blank rather than sprouting marks.
+        let tabs = marked("a\nb", View::default(), vec![hunk(0, 9, Change::Added)]);
+        let (screen, _) = render_tabs(&tabs, 8, 7);
+        assert_eq!(row(&screen, 2), "2 ▍b    ");
+        assert_eq!(row(&screen, 3), "        ");
+        assert_eq!(row(&screen, 4), "        ");
+    }
+
+    #[test]
+    fn the_marks_hold_their_column_under_a_scroll_and_a_sidebar() {
+        let tabs = marked(
+            "abcdefghij\nx",
+            View::test_at(0, 0, 3),
+            vec![hunk(0, 1, Change::Added)],
+        );
+        let (screen, _) = render_tabs(&tabs, 8, 5);
+        assert_eq!(row(&screen, 1), "1 ▍defgh");
+
+        let tree = tree_of(TREE_PATHS, true);
+        let mut screen = Screen::new(60, 5);
+        let mut scratch = String::new();
+        draw(
+            &mut screen,
+            &marked("hello", View::default(), vec![hunk(0, 1, Change::Changed)]),
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            Some((&tree, false)),
+        );
+        let body = row(&screen, 1);
+        let border = body.chars().position(|c| c == '│').unwrap();
+        assert_eq!(
+            body.chars().skip(border + 1).take(4).collect::<String>(),
+            "1 ▍h"
+        );
+    }
+
+    #[test]
+    fn the_mark_column_widens_every_coordinate_that_crosses_the_gutter() {
+        let mut tabs = tabs_of(Document::from_str("hello"), View::default());
+        assert_eq!(gutter_width(tabs.active()), 2);
+        tabs.active_mut().diff = Diff::test_marks(Vec::new());
+        assert_eq!(gutter_width(tabs.active()), 3);
+        // The caret sits one column further right, and a click at that
+        // column still lands on the character under the pointer because
+        // `View::hit` subtracts the same width.
+        let gutter_w = gutter_width(tabs.active());
+        let (_, cursor) = render_tabs(&tabs, 12, 4);
+        assert_eq!(cursor, (3, 1));
+        let Tab { doc, view, .. } = tabs.active_mut();
+        view.click(doc, gutter_w, 2, 6, 1, false);
+        assert_eq!(view.cursor, 3); // the second 'l' of "hello"
     }
 
     #[test]

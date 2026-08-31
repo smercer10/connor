@@ -1,7 +1,7 @@
 use unicode_width::UnicodeWidthChar;
 
 /// One terminal cell: a grapheme cluster stored inline (no heap) plus its
-/// display width and whether it renders in reverse video or underlined. A
+/// display width and style — foreground colour, reverse video, underline. A
 /// two-column glyph occupies a leader cell followed by one `CONTINUATION`
 /// cell; emission skips continuations because the terminal advances two
 /// columns when the leader is written.
@@ -10,6 +10,7 @@ pub struct Cell {
     bytes: [u8; 14],
     len: u8,
     width: u8,
+    fg: u8,
     reversed: bool,
     underlined: bool,
 }
@@ -21,6 +22,7 @@ impl Cell {
         bytes: [0; 14],
         len: 0,
         width: 0,
+        fg: 0,
         reversed: false,
         underlined: false,
     };
@@ -29,6 +31,7 @@ impl Cell {
         bytes: [0xEF, 0xBF, 0xBD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         len: 3,
         width: 1,
+        fg: 0,
         reversed: false,
         underlined: false,
     };
@@ -40,6 +43,7 @@ impl Cell {
             bytes,
             len: 1,
             width: 1,
+            fg: 0,
             reversed: false,
             underlined: false,
         }
@@ -55,6 +59,7 @@ impl Cell {
             bytes,
             len: grapheme.len() as u8,
             width: width.max(1),
+            fg: 0,
             reversed: false,
             underlined: false,
         }
@@ -71,6 +76,12 @@ impl Cell {
 
     pub fn is_continuation(&self) -> bool {
         self.width == 0
+    }
+
+    /// 0 is the terminal's default foreground; 1..=16 name the ANSI palette
+    /// colours, offset by one.
+    pub fn fg(&self) -> u8 {
+        self.fg
     }
 
     pub fn reversed(&self) -> bool {
@@ -170,6 +181,16 @@ impl Screen {
         }
         let index = self.index(x, y);
         self.cells[index].reversed = on;
+    }
+
+    /// Sets one cell's foreground colour (`Cell::fg` encoding); the same
+    /// rationale as `set_reversed`.
+    pub fn set_fg(&mut self, x: u16, y: u16, fg: u8) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let index = self.index(x, y);
+        self.cells[index].fg = fg;
     }
 
     /// Flips one cell's underline flag; the same rationale as
@@ -438,6 +459,18 @@ mod tests {
         assert_eq!(runs(&screen, &blank), vec![(1, 0, " ".into())]);
         screen.clear();
         assert!(!screen.get(1, 0).unwrap().underlined());
+    }
+
+    #[test]
+    fn fg_sets_diffs_and_clears() {
+        let mut screen = Screen::new(4, 1);
+        screen.set_fg(1, 0, 3);
+        screen.set_fg(4, 0, 3); // out of bounds: ignored
+        assert_eq!(screen.get(1, 0).unwrap().fg(), 3);
+        let blank = Screen::new(4, 1);
+        assert_eq!(runs(&screen, &blank), vec![(1, 0, " ".into())]);
+        screen.clear();
+        assert_eq!(screen.get(1, 0).unwrap().fg(), 0);
     }
 
     #[test]

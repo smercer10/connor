@@ -16,6 +16,16 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+// `Cell::fg` codes to classic foreground SGRs (default, then the 16 ANSI
+// palette colours the terminal theme defines — no RGB assumptions). Raw
+// rather than crossterm's `SetForegroundColor`, which writes the longer
+// 256-colour form some plainer terminals lack.
+const FG_SGR: [&str; 17] = [
+    "\x1b[39m", "\x1b[30m", "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[34m", "\x1b[35m", "\x1b[36m",
+    "\x1b[37m", "\x1b[90m", "\x1b[91m", "\x1b[92m", "\x1b[93m", "\x1b[94m", "\x1b[95m", "\x1b[96m",
+    "\x1b[97m",
+];
+
 /// Puts the terminal back the way the shell expects it. Idempotent, so the
 /// panic hook, `Drop` and suspend can all call it without coordination, and
 /// it must never panic — hence `let _ =` on every write.
@@ -119,6 +129,7 @@ impl Terminal {
         }
         // Styles are toggled only when they change and always switched off
         // by frame end, so each frame starts from a known plain state.
+        let mut fg: u8 = 0;
         let mut reversed = false;
         let mut underlined = false;
         back.for_each_changed_run(front, |x, y, run| {
@@ -130,6 +141,10 @@ impl Terminal {
                 // The terminal advanced two columns at the leader; emitting
                 // anything for the continuation would shift the row.
                 if !cell.is_continuation() {
+                    if cell.fg() != fg {
+                        fg = cell.fg();
+                        scratch.push_str(FG_SGR[usize::from(fg).min(FG_SGR.len() - 1)]);
+                    }
                     if cell.reversed() != reversed {
                         reversed = cell.reversed();
                         let attr = if reversed {
@@ -152,6 +167,9 @@ impl Terminal {
                 }
             }
         });
+        if fg != 0 {
+            scratch.push_str(FG_SGR[0]);
+        }
         if reversed {
             let _ = SetAttribute(Attribute::NoReverse).write_ansi(scratch);
         }
@@ -198,9 +216,9 @@ impl Terminal {
 
     fn reserve_scratch(&mut self) {
         let (width, height) = self.front.size();
-        // 32 bytes per cell: the glyph plus cursor moves and the reverse and
-        // underline toggles that can appear inside runs.
-        let target = usize::from(width) * usize::from(height) * 32 + 1024;
+        // 40 bytes per cell: the glyph plus cursor moves and the colour,
+        // reverse and underline toggles that can appear inside runs.
+        let target = usize::from(width) * usize::from(height) * 40 + 1024;
         self.scratch
             .reserve(target.saturating_sub(self.scratch.len()));
     }

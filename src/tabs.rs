@@ -5,12 +5,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::doc::Document;
+use crate::syntax::Syntax;
 use crate::view::View;
 
-/// One open file and the view looking at it.
+/// One open file and the view looking at it, plus its syntax highlighter
+/// when a grammar covers the file.
 pub struct Tab {
     pub doc: Document,
     pub view: View,
+    pub syntax: Option<Syntax>,
+}
+
+impl Tab {
+    fn of(mut doc: Document) -> Tab {
+        Tab {
+            syntax: Syntax::new(&mut doc),
+            doc,
+            view: View::default(),
+        }
+    }
 }
 
 /// The tab strip. Never empty — closing the last tab means quitting, which
@@ -26,13 +39,7 @@ impl Tabs {
     pub fn new(docs: Vec<Document>) -> Tabs {
         debug_assert!(!docs.is_empty());
         Tabs {
-            tabs: docs
-                .into_iter()
-                .map(|doc| Tab {
-                    doc,
-                    view: View::default(),
-                })
-                .collect(),
+            tabs: docs.into_iter().map(Tab::of).collect(),
             active: 0,
         }
     }
@@ -77,10 +84,7 @@ impl Tabs {
 
     /// Appends a tab and activates it.
     pub fn push(&mut self, doc: Document) {
-        self.tabs.push(Tab {
-            doc,
-            view: View::default(),
-        });
+        self.tabs.push(Tab::of(doc));
         self.active = self.tabs.len() - 1;
     }
 

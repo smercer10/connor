@@ -12,6 +12,7 @@ use crate::keymap;
 use crate::picker::Picker;
 use crate::screen::Screen;
 use crate::search::Highlights;
+use crate::syntax::Span;
 use crate::tabs::{Tab, Tabs};
 use crate::tree::Tree;
 
@@ -45,6 +46,14 @@ pub fn tree_width(open: bool, screen_w: u16) -> usize {
     TREE_MAX_W.min(width - EDITOR_MIN_W)
 }
 
+/// Per-char decorations painted over the text area — search matches and
+/// syntax colour spans — borrowed from their owners for the frame.
+#[derive(Default)]
+pub struct Marks<'a> {
+    pub search: Option<Highlights<'a>>,
+    pub syntax: &'a [Span],
+}
+
 /// Draws one frame into a cleared screen and returns the cursor's screen
 /// cell. O(viewport): only visible lines are walked, and each only to the
 /// viewport's right edge. `scratch` is reused across frames so steady-state
@@ -52,17 +61,18 @@ pub fn tree_width(open: bool, screen_w: u16) -> usize {
 /// mini-prompt — takes over the status line until the next keypress,
 /// hiding its right-aligned help hint;
 /// `status_caret` parks the cursor after that many of the notice's chars
-/// while a prompt is editing there. `search` underlines every match and
-/// reverses the current one. An open `tree` sidebar shifts the gutter and
-/// text right; its focus is the selection bar — the caller hides the
-/// terminal cursor while the tree holds it.
+/// while a prompt is editing there. `marks.search` underlines every match
+/// and reverses the current one; `marks.syntax` colours the sorted,
+/// non-overlapping spans it holds — empty means plain text. An open `tree`
+/// sidebar shifts the gutter and text right; its focus is the selection
+/// bar — the caller hides the terminal cursor while the tree holds it.
 pub fn draw(
     screen: &mut Screen,
     tabs: &Tabs,
     scratch: &mut String,
     notice: &str,
     status_caret: Option<usize>,
-    search: Option<Highlights>,
+    marks: Marks,
     tree: Option<(&Tree, bool)>,
 ) -> (u16, u16) {
     let (width, height) = screen.size();
@@ -72,7 +82,7 @@ pub fn draw(
     let tree_w = tree_width(tree.is_some(), width);
     let width = usize::from(width);
     let text_h = text_height(height);
-    let Tab { doc, view } = tabs.active();
+    let Tab { doc, view, .. } = tabs.active();
     let gutter_w = gutter_width(doc);
     let text_w = width.saturating_sub(tree_w + gutter_w);
 
@@ -82,6 +92,10 @@ pub fn draw(
 
     let sel = view.selection();
     let mut buf = [0; 16];
+    // Spans are sorted and non-overlapping, and the viewport walk below
+    // ascends through char indices, so one advancing index serves every
+    // visible line — O(1) amortised per cluster, no search.
+    let mut span_i = 0;
     for y in 0..text_h {
         let line = view.scroll_line + y;
         if line >= doc.line_count() {
@@ -126,6 +140,18 @@ pub fn draw(
                         screen.set_grapheme(x, row, cluster, cluster_w as u8);
                     }
                 }
+                while marks.syntax.get(span_i).is_some_and(|s| s.end <= c_start) {
+                    span_i += 1;
+                }
+                if let Some(s) = marks.syntax.get(span_i)
+                    && s.start < c_end
+                    && c_start < s.end
+                {
+                    for c in col.max(view.scroll_col)..end.min(right) {
+                        let x = (tree_w + gutter_w + c - view.scroll_col) as u16;
+                        screen.set_fg(x, row, s.color);
+                    }
+                }
                 if selected {
                     for c in col.max(view.scroll_col)..end.min(right) {
                         let x = (tree_w + gutter_w + c - view.scroll_col) as u16;
@@ -136,7 +162,7 @@ pub fn draw(
                 // cluster is wholly in or out; binary search keeps the pass
                 // O(log matches) per visible cluster. A stale out-of-range
                 // start simply intersects nothing.
-                if let Some(h) = &search
+                if let Some(h) = &marks.search
                     && h.len > 0
                 {
                     let i = h
@@ -761,7 +787,15 @@ mod tests {
     fn render_tabs(tabs: &Tabs, width: u16, height: u16) -> (Screen, (u16, u16)) {
         let mut screen = Screen::new(width, height);
         let mut scratch = String::new();
-        let cursor = draw(&mut screen, tabs, &mut scratch, "", None, None, None);
+        let cursor = draw(
+            &mut screen,
+            tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         (screen, cursor)
     }
 
@@ -881,7 +915,7 @@ mod tests {
             &mut scratch,
             "saved ab",
             None,
-            None,
+            Marks::default(),
             None,
         );
         assert_eq!(row(&screen, 2), "saved ab    ");
@@ -898,7 +932,7 @@ mod tests {
             &mut scratch,
             "open: sr",
             Some(8),
-            None,
+            Marks::default(),
             None,
         );
         assert_eq!(cursor, (8, 2));
@@ -910,7 +944,7 @@ mod tests {
             &mut scratch,
             "open: src/main.rs",
             Some(17),
-            None,
+            Marks::default(),
             None,
         );
         assert_eq!(cursor, (11, 2));
@@ -928,7 +962,7 @@ mod tests {
             &mut scratch,
             "find: 日 · esc",
             Some(7),
-            None,
+            Marks::default(),
             None,
         );
         assert_eq!(cursor, (8, 2));
@@ -1046,7 +1080,10 @@ mod tests {
             &mut scratch,
             "",
             None,
-            Some(search),
+            Marks {
+                search: Some(search),
+                syntax: &[],
+            },
             None,
         );
         screen
@@ -1099,6 +1136,80 @@ mod tests {
         let screen = render_search("abcd", 8, 3, View::default(), search);
         assert_eq!(ul_row(&screen, 1), "    __  ");
         assert_eq!(sel_row(&screen, 1), "        ");
+    }
+
+    /// The fg codes of a row as digits, space for default.
+    fn fg_row(screen: &Screen, y: u16) -> String {
+        let (width, _) = screen.size();
+        (0..width)
+            .map(|x| match screen.get(x, y).unwrap().fg() {
+                0 => ' ',
+                fg => char::from_digit(u32::from(fg), 16).unwrap(),
+            })
+            .collect()
+    }
+
+    fn render_syntax(text: &str, width: u16, height: u16, view: View, syntax: &[Span]) -> Screen {
+        let tabs = tabs_of(Document::from_str(text), view);
+        let mut screen = Screen::new(width, height);
+        let mut scratch = String::new();
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks {
+                search: None,
+                syntax,
+            },
+            None,
+        );
+        screen
+    }
+
+    fn span(start: usize, end: usize, color: u8) -> Span {
+        Span { start, end, color }
+    }
+
+    #[test]
+    fn syntax_spans_colour_their_cells_and_nothing_else() {
+        let spans = [span(0, 3, 3), span(4, 5, 5)];
+        let screen = render_syntax("let x = 1;", 13, 3, View::default(), &spans);
+        assert_eq!(row(&screen, 1), "1 let x = 1; ");
+        assert_eq!(fg_row(&screen, 1), "  333 5      ");
+    }
+
+    #[test]
+    fn syntax_spans_carry_across_lines_and_empty_is_plain() {
+        // One span covering "ab\ncd" entirely: both lines colour.
+        let spans = [span(0, 5, 2)];
+        let screen = render_syntax("ab\ncd", 6, 4, View::default(), &spans);
+        assert_eq!(fg_row(&screen, 1), "  22  ");
+        assert_eq!(fg_row(&screen, 2), "  22  ");
+
+        let plain = render_syntax("ab\ncd", 6, 4, View::default(), &[]);
+        assert_eq!(fg_row(&plain, 1), "      ");
+    }
+
+    #[test]
+    fn syntax_spans_clip_to_the_viewport_and_span_wide_glyphs() {
+        // Columns 0-2 scrolled off: only "de" of the coloured "def" shows.
+        let spans = [span(3, 6, 4)];
+        let screen = render_syntax("abcdef", 4, 3, View::test_at(0, 0, 3), &spans);
+        assert_eq!(fg_row(&screen, 1), "  44");
+
+        // A wide glyph colours both of its columns.
+        let spans = [span(1, 2, 6)];
+        let screen = render_syntax("a日b", 8, 3, View::default(), &spans);
+        assert_eq!(fg_row(&screen, 1), "   66   ");
+    }
+
+    #[test]
+    fn stale_syntax_spans_past_the_text_colour_nothing() {
+        let spans = [span(2, 3, 3), span(90, 500, 5)];
+        let screen = render_syntax("abcd", 8, 3, View::default(), &spans);
+        assert_eq!(fg_row(&screen, 1), "    3   ");
     }
 
     #[test]
@@ -1168,7 +1279,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(100, 60);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         draw_help(&mut screen, &mut scratch);
         let all = all_rows(&screen);
         assert!(all.contains(HELP_FOOTER));
@@ -1198,9 +1317,25 @@ mod tests {
         let tabs = tabs_of(Document::from_str("some text\nmore text"), view);
         let mut scratch = String::new();
         let mut plain = Screen::new(80, 24);
-        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut plain,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut screen = Screen::new(80, 24);
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         draw_help(&mut screen, &mut scratch);
 
         assert_eq!(row(&screen, 0), row(&plain, 0));
@@ -1243,7 +1378,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(40, 14);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut picker = picker_of(PICK_PATHS, false);
         press(&mut picker, crossterm::event::KeyCode::Char('d'));
         let cursor = draw_picker(&mut screen, &picker, &mut scratch);
@@ -1264,7 +1407,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(40, 14);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut picker = picker_of(PICK_PATHS, true);
         press(&mut picker, crossterm::event::KeyCode::Down);
         draw_picker(&mut screen, &picker, &mut scratch);
@@ -1283,9 +1434,25 @@ mod tests {
         let tabs = tabs_of(Document::from_str("some text\nmore text"), view);
         let mut scratch = String::new();
         let mut plain = Screen::new(100, 24);
-        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut plain,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut screen = Screen::new(100, 24);
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let picker = picker_of(PICK_PATHS, true);
         draw_picker(&mut screen, &picker, &mut scratch);
 
@@ -1305,7 +1472,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str(""), View::default());
         let mut screen = Screen::new(20, 10);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let picker = picker_of(&["a/very/deep/nested/path/name.rs"], true);
         draw_picker(&mut screen, &picker, &mut scratch);
 
@@ -1359,7 +1534,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(40, 14);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let grep = grep_of(GREP_FILES, "se", false);
         let cursor = draw_grep(&mut screen, &grep, &mut scratch);
 
@@ -1381,7 +1564,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(40, 14);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut grep = grep_of(GREP_FILES, "se", false);
         grep.absorb(crate::grep::HitBatch {
             generation: 1,
@@ -1400,7 +1591,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("text"), View::default());
         let mut screen = Screen::new(40, 14);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut grep = grep_of(GREP_FILES, "se", true);
         grep.key(
             &crossterm::event::KeyEvent::new(
@@ -1423,7 +1622,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str(""), View::default());
         let mut screen = Screen::new(20, 10);
         let mut scratch = String::new();
-        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let files: &[(&str, &[(u32, &str)])] = &[(
             "a/very/deep/nested/path/name.rs",
             &[(12, "a preview far too long to fit")],
@@ -1467,7 +1674,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, false)),
         );
 
@@ -1494,7 +1701,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, false)),
         );
         assert!(!sel_row(&unfocused, 1).contains('#'));
@@ -1506,7 +1713,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, true)),
         );
         let sel = sel_row(&focused, 1);
@@ -1530,7 +1737,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, false)),
         );
         assert!(!ul_row(&screen, 1).contains('_'));
@@ -1542,7 +1749,15 @@ mod tests {
         let tabs = tabs_of(named("f.rs", "hello"), View::default());
         let mut scratch = String::new();
         let mut plain = Screen::new(60, 5);
-        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut plain,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut screen = Screen::new(60, 5);
         let tree = tree_of(TREE_PATHS, true);
         draw(
@@ -1551,7 +1766,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, false)),
         );
         assert_eq!(row(&screen, 0), row(&plain, 0));
@@ -1568,7 +1783,15 @@ mod tests {
         let tabs = tabs_of(Document::from_str("hello"), View::default());
         let mut scratch = String::new();
         let mut plain = Screen::new(44, 5);
-        draw(&mut plain, &tabs, &mut scratch, "", None, None, None);
+        draw(
+            &mut plain,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            None,
+        );
         let mut screen = Screen::new(44, 5);
         let tree = tree_of(TREE_PATHS, true);
         draw(
@@ -1577,7 +1800,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, false)),
         );
         for y in 0..5 {
@@ -1597,7 +1820,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, false)),
         );
         assert!(row(&screen, 1).starts_with("  a.rs"));
@@ -1616,7 +1839,7 @@ mod tests {
             &mut scratch,
             "",
             None,
-            None,
+            Marks::default(),
             Some((&tree, false)),
         );
         let body = row(&screen, 1);
@@ -1683,7 +1906,7 @@ mod tests {
                     &mut scratch,
                     "",
                     None,
-                    None,
+                    Marks::default(),
                     Some((&deep, focused)),
                 );
             }

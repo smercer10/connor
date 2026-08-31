@@ -17,9 +17,17 @@ use tree_sitter::{
     InputEdit, Language, Node, ParseOptions, ParseState, Parser, Point, Query, QueryCursor,
     StreamingIterator as _, Tree,
 };
+use tree_sitter_language::LanguageFn;
 
 use crate::doc::{Document, Splice};
 use crate::watch::AppEvent;
+
+// Vendored grammar (grammars/dockerfile), compiled by build.rs; the
+// crates.io crate pins an incompatible tree-sitter.
+unsafe extern "C" {
+    fn tree_sitter_dockerfile() -> *const ();
+}
+const DOCKERFILE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_dockerfile) };
 
 /// One coloured stretch of the document in char indices; spans are sorted
 /// and non-overlapping, so the draw pass consumes them with a single
@@ -43,7 +51,9 @@ const PALETTE: &[(&str, u8)] = &[
     ("function", 5), // dark blue
     ("type", 4),     // dark yellow
     ("constructor", 4),
-    ("constant", 2),  // dark red
+    ("constant", 2), // dark red
+    ("number", 2),
+    ("boolean", 2),
     ("attribute", 7), // dark cyan
     ("label", 7),
     ("text.title", 6),   // markdown headings
@@ -94,29 +104,215 @@ impl Lang {
     }
 }
 
-/// The grammar for a path, by extension. The full language set and richer
-/// detection (well-known names, shebangs) is #29.
-fn lang_for(path: &Path) -> Option<&'static Lang> {
-    static RUST: OnceLock<Lang> = OnceLock::new();
-    static MARKDOWN: OnceLock<Lang> = OnceLock::new();
-    match path.extension()?.to_str()? {
-        "rs" => Some(RUST.get_or_init(|| {
-            Lang::new(
-                tree_sitter_rust::LANGUAGE.into(),
-                tree_sitter_rust::HIGHLIGHTS_QUERY,
-            )
-        })),
-        // Block grammar only — headings, lists, quotes, fences. Inline
-        // emphasis needs the second grammar and injections; that lands
-        // with #29.
-        "md" | "markdown" => Some(MARKDOWN.get_or_init(|| {
-            Lang::new(
-                tree_sitter_md::LANGUAGE.into(),
-                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
-            )
-        })),
-        _ => None,
+/// One bundled language: how to recognise its files and how to build its
+/// `Lang`, which the `OnceLock` slot memoizes on first use so unopened
+/// languages never compile their query.
+struct LangSpec {
+    /// Identifies the language in test assertions and audit output.
+    #[cfg_attr(not(test), expect(dead_code))]
+    name: &'static str,
+    files: Files,
+    language: LanguageFn,
+    /// Query source parts, concatenated at init — C++ prepends C's query
+    /// because its grammar inherits C's nodes but its query doesn't.
+    query: &'static [&'static str],
+    lang: OnceLock<Lang>,
+}
+
+/// How a language's files are recognised; table entries spell only the
+/// rules they use via `..NO_FILES`.
+struct Files {
+    exts: &'static [&'static str],
+    filenames: &'static [&'static str],
+    filename_prefixes: &'static [&'static str],
+    shebangs: &'static [&'static str],
+}
+
+const NO_FILES: Files = Files {
+    exts: &[],
+    filenames: &[],
+    filename_prefixes: &[],
+    shebangs: &[],
+};
+
+static LANGS: [LangSpec; 12] = [
+    LangSpec {
+        name: "rust",
+        files: Files {
+            exts: &["rs"],
+            ..NO_FILES
+        },
+        language: tree_sitter_rust::LANGUAGE,
+        query: &[tree_sitter_rust::HIGHLIGHTS_QUERY],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "go",
+        files: Files {
+            exts: &["go"],
+            ..NO_FILES
+        },
+        language: tree_sitter_go::LANGUAGE,
+        query: &[tree_sitter_go::HIGHLIGHTS_QUERY],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "python",
+        files: Files {
+            exts: &["py", "pyi"],
+            shebangs: &["python"],
+            ..NO_FILES
+        },
+        language: tree_sitter_python::LANGUAGE,
+        query: &[tree_sitter_python::HIGHLIGHTS_QUERY],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "bash",
+        files: Files {
+            exts: &["sh", "bash"],
+            filenames: &[".bashrc", ".bash_profile", ".bash_aliases", ".profile"],
+            shebangs: &["sh", "bash", "dash", "zsh"],
+            ..NO_FILES
+        },
+        language: tree_sitter_bash::LANGUAGE,
+        query: &[tree_sitter_bash::HIGHLIGHT_QUERY],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "c",
+        files: Files {
+            exts: &["c", "h"],
+            ..NO_FILES
+        },
+        language: tree_sitter_c::LANGUAGE,
+        query: &[tree_sitter_c::HIGHLIGHT_QUERY],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "cpp",
+        files: Files {
+            exts: &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+            ..NO_FILES
+        },
+        language: tree_sitter_cpp::LANGUAGE,
+        query: &[
+            tree_sitter_c::HIGHLIGHT_QUERY,
+            "\n",
+            tree_sitter_cpp::HIGHLIGHT_QUERY,
+        ],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "yaml",
+        files: Files {
+            exts: &["yml", "yaml"],
+            ..NO_FILES
+        },
+        language: tree_sitter_yaml::LANGUAGE,
+        query: &[tree_sitter_yaml::HIGHLIGHTS_QUERY],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "hcl",
+        files: Files {
+            exts: &["hcl", "tf", "tfvars"],
+            ..NO_FILES
+        },
+        language: tree_sitter_hcl::LANGUAGE,
+        query: &[include_str!("../grammars/hcl/highlights.scm")],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "dockerfile",
+        files: Files {
+            exts: &["dockerfile"],
+            filenames: &["Dockerfile", "Containerfile"],
+            filename_prefixes: &["Dockerfile."],
+            ..NO_FILES
+        },
+        language: DOCKERFILE,
+        query: &[include_str!("../grammars/dockerfile/highlights.scm")],
+        lang: OnceLock::new(),
+    },
+    // Block grammar only — headings, lists, quotes, fences. Inline
+    // emphasis needs the bundled second grammar parsed over included
+    // ranges; that is #34.
+    LangSpec {
+        name: "markdown",
+        files: Files {
+            exts: &["md", "markdown"],
+            ..NO_FILES
+        },
+        language: tree_sitter_md::LANGUAGE,
+        query: &[tree_sitter_md::HIGHLIGHT_QUERY_BLOCK],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "toml",
+        files: Files {
+            exts: &["toml"],
+            filenames: &["Cargo.lock"],
+            ..NO_FILES
+        },
+        language: tree_sitter_toml_ng::LANGUAGE,
+        query: &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
+        lang: OnceLock::new(),
+    },
+    LangSpec {
+        name: "json",
+        files: Files {
+            exts: &["json"],
+            ..NO_FILES
+        },
+        language: tree_sitter_json::LANGUAGE,
+        query: &[tree_sitter_json::HIGHLIGHTS_QUERY],
+        lang: OnceLock::new(),
+    },
+];
+
+/// The grammar for a document: well-known filename first (including the
+/// `Dockerfile.*` family), then extension, then — only when the path
+/// decides nothing — the shebang line.
+fn lang_for(path: Option<&Path>, rope: &Rope) -> Option<&'static Lang> {
+    let spec = path
+        .and_then(spec_for_path)
+        .or_else(|| spec_for_shebang(rope))?;
+    Some(
+        spec.lang
+            .get_or_init(|| Lang::new(spec.language.into(), &spec.query.concat())),
+    )
+}
+
+fn spec_for_path(path: &Path) -> Option<&'static LangSpec> {
+    let name = path.file_name()?.to_str()?;
+    let by_name = LANGS.iter().find(|s| {
+        s.files.filenames.contains(&name)
+            || s.files
+                .filename_prefixes
+                .iter()
+                .any(|p| name.starts_with(p))
+    });
+    if by_name.is_some() {
+        return by_name;
     }
+    let ext = path.extension()?.to_str()?;
+    LANGS.iter().find(|s| s.files.exts.contains(&ext))
+}
+
+fn spec_for_shebang(rope: &Rope) -> Option<&'static LangSpec> {
+    let line: String = rope.line(0).chars().take(128).collect();
+    let mut words = line.strip_prefix("#!")?.split_whitespace();
+    let mut interp = words.next()?;
+    if interp.rsplit('/').next() == Some("env") {
+        interp = words.find(|w| !w.starts_with('-'))?;
+    }
+    // The basename, minus any version suffix: python3.12 detects as python.
+    let interp = interp
+        .rsplit('/')
+        .next()?
+        .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    LANGS.iter().find(|s| s.files.shebangs.contains(&interp))
 }
 
 /// Edits whose combined byte span stays under this reparse synchronously on
@@ -166,9 +362,10 @@ pub struct Syntax {
 
 impl Syntax {
     /// A highlighter for the document, or `None` when no grammar covers its
-    /// path. Starts the document's splice log; the first `pump` parses.
+    /// path or shebang. Starts the document's splice log; the first `pump`
+    /// parses.
     pub fn new(doc: &mut Document) -> Option<Syntax> {
-        let lang = lang_for(doc.path()?)?;
+        let lang = lang_for(doc.path(), doc.rope())?;
         let mut parser = Parser::new();
         parser.set_language(&lang.language).ok()?;
         doc.track_splices();
@@ -657,5 +854,122 @@ mod tests {
             }
         }
         assert!(syntax.tree.is_some());
+    }
+
+    fn detected(path: &str) -> Option<&'static str> {
+        spec_for_path(Path::new(path)).map(|s| s.name)
+    }
+
+    fn shebang(text: &str) -> Option<&'static str> {
+        spec_for_shebang(&Rope::from_str(text)).map(|s| s.name)
+    }
+
+    /// Doubles as the palette audit: `-- --nocapture` lists every capture
+    /// a bundled query defines that the palette leaves unmapped.
+    #[test]
+    fn every_language_query_compiles_and_reports_unmapped_captures() {
+        for spec in &LANGS {
+            let lang = spec
+                .lang
+                .get_or_init(|| Lang::new(spec.language.into(), &spec.query.concat()));
+            for name in lang.query.capture_names() {
+                if color_of(name) == UNMAPPED {
+                    println!("{}: unmapped @{name}", spec.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detection_by_extension_covers_every_language() {
+        let cases = [
+            ("t.rs", "rust"),
+            ("t.go", "go"),
+            ("t.py", "python"),
+            ("t.sh", "bash"),
+            ("t.c", "c"),
+            ("t.h", "c"),
+            ("t.cpp", "cpp"),
+            ("t.yaml", "yaml"),
+            ("t.tf", "hcl"),
+            ("t.dockerfile", "dockerfile"),
+            ("t.md", "markdown"),
+            ("t.toml", "toml"),
+            ("t.json", "json"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(detected(path), Some(want), "{path}");
+        }
+        assert_eq!(detected("t.txt"), None);
+        assert_eq!(detected("noext"), None);
+    }
+
+    #[test]
+    fn detection_by_well_known_filename() {
+        assert_eq!(detected("Dockerfile"), Some("dockerfile"));
+        assert_eq!(detected("/proj/sub/Dockerfile"), Some("dockerfile"));
+        assert_eq!(detected("Containerfile"), Some("dockerfile"));
+        assert_eq!(detected("Dockerfile.dev"), Some("dockerfile"));
+        assert_eq!(detected("Dockerfilex"), None);
+        assert_eq!(detected(".bashrc"), Some("bash"));
+        assert_eq!(detected(".profile"), Some("bash"));
+        assert_eq!(detected("Cargo.lock"), Some("toml"));
+    }
+
+    #[test]
+    fn detection_by_shebang() {
+        assert_eq!(shebang("#!/bin/bash\necho hi\n"), Some("bash"));
+        assert_eq!(shebang("#!/bin/sh\n"), Some("bash"));
+        assert_eq!(shebang("#!/usr/bin/env python3.12\n"), Some("python"));
+        assert_eq!(shebang("#!/usr/bin/env -S bash -x\n"), Some("bash"));
+        assert_eq!(shebang("echo no shebang\n"), None);
+        assert_eq!(shebang(""), None);
+    }
+
+    #[test]
+    fn a_path_match_beats_the_shebang() {
+        let rope = Rope::from_str("#!/bin/bash\nx = 1\n");
+        let lang = lang_for(Some(Path::new("t.py")), &rope).unwrap();
+        let python = spec_for_path(Path::new("t.py")).unwrap();
+        assert!(std::ptr::eq(lang, python.lang.get().unwrap()));
+    }
+
+    #[test]
+    fn pathless_doc_with_shebang_gets_a_highlighter() {
+        let mut doc = Document::from_str("#!/bin/sh\necho hi\n");
+        assert!(Syntax::new(&mut doc).is_some());
+    }
+
+    #[test]
+    fn every_new_language_colours_its_basics() {
+        // (file name, snippet, colours that must appear); loose on purpose
+        // so grammar version bumps don't shuffle exact spans out from
+        // under the assertions.
+        let cases: &[(&str, &str, &[u8])] = &[
+            ("t.go", "package main // c\n", &[6, 9]),
+            ("t.py", "def f():\n    return \"s\"  # c\n", &[6, 3, 9]),
+            ("t.sh", "if true; then echo hi; fi # c\n", &[6, 9]),
+            ("t.yaml", "key: \"value\" # c\n", &[3, 9]),
+            (
+                "t.tf",
+                "resource \"a\" \"b\" {\n  x = \"s\" # c\n}\n",
+                &[6, 3, 9],
+            ),
+            ("Dockerfile", "FROM alpine\n# c\nRUN echo hi\n", &[6, 9]),
+            ("t.c", "int x = 1; // c\n", &[4, 9]),
+            ("t.cpp", "class A {}; // c\n", &[6, 9]),
+            ("t.toml", "# c\nkey = \"value\"\n", &[9, 3]),
+            ("t.json", "{\"k\": \"v\", \"n\": 1}\n", &[3, 2]),
+        ];
+        for (name, text, expect) in cases {
+            let (mut doc, mut syntax) = doc_named(name, text);
+            let spans = spans_for(&mut doc, &mut syntax, 20);
+            for want in *expect {
+                assert!(
+                    spans.iter().any(|s| s.color == *want),
+                    "{name}: colour {want} missing in {spans:?}"
+                );
+            }
+        }
     }
 }

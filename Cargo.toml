@@ -18,11 +18,27 @@ ropey = { version = "1.6", default-features = false, features = ["simd"] }
 # Incremental parsing for syntax highlighting; grammars compile in
 # statically, so the binary stays self-contained.
 tree-sitter = "0.26"
+tree-sitter-bash = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-hcl = "1.1"
+tree-sitter-json = "0.24"
+# LanguageFn::from_raw for the vendored Dockerfile grammar.
+tree-sitter-language = "0.1"
 tree-sitter-md = "0.5"
+tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
 # Already in the tree via crossterm, so this adds no new crates.
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
+
+# Compiles the vendored Dockerfile grammar (grammars/dockerfile); already
+# in the build graph via every grammar crate.
+[build-dependencies]
+cc = "1"

@@ -97,6 +97,73 @@ impl Debounce {
     }
 }
 
+/// One save fires a burst; a build fires thousands. The tree refresh keeps
+/// no paths — any event under the root means one re-walk — and a longer
+/// window than the reload debounce keeps a busy build to at most a couple
+/// of background walks per second.
+const REFRESH_WINDOW: Duration = Duration::from_millis(500);
+
+/// Coalesces tree-refresh triggers. Like `Debounce`, the window is fixed
+/// from the first note, so a continuously writing agent cannot push the
+/// refresh out forever.
+#[derive(Default)]
+pub struct Refresh {
+    deadline: Option<Instant>,
+}
+
+impl Refresh {
+    pub fn note(&mut self, now: Instant) {
+        self.deadline.get_or_insert(now + REFRESH_WINDOW);
+    }
+
+    /// When the refresh falls due; `None` when nothing is pending.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Whether a refresh is due at `now`; a due one disarms.
+    pub fn take(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|t| t <= now) {
+            self.deadline = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// Watches the whole project root while the tree sidebar is open, feeding
+/// the same `Fs` events the reload path consumes. Dot-directories are
+/// dropped in the callback — `.git` churns on every git command, and that
+/// noise dies off the main thread. Events from ignored build directories
+/// still arrive; the refresh window absorbs them, and a re-walk that finds
+/// the same files changes nothing on screen. Dropping the watcher unwatches.
+pub struct RootWatcher {
+    _inner: RecommendedWatcher,
+}
+
+impl RootWatcher {
+    pub fn new(root: &Path, tx: Sender<AppEvent>) -> notify::Result<RootWatcher> {
+        let base = root.components().count();
+        let mut inner = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(ev) = res else { return };
+            if matches!(ev.kind, EventKind::Access(_)) {
+                return;
+            }
+            for path in ev.paths {
+                let hidden = path
+                    .components()
+                    .skip(base)
+                    .any(|c| c.as_os_str().as_encoded_bytes().starts_with(b"."));
+                if !hidden && tx.send(AppEvent::Fs(path)).is_err() {
+                    return;
+                }
+            }
+        })?;
+        inner.watch(root, RecursiveMode::Recursive)?;
+        Ok(RootWatcher { _inner: inner })
+    }
+}
+
 /// Watches the parent directories of open files, forwarding raw events
 /// into the main loop's channel. Directories rather than the files
 /// themselves: saves are temp-file-plus-rename, which replaces the inode a
@@ -194,6 +261,22 @@ mod tests {
         assert_eq!(debounce.deadline(), Some(start + WINDOW));
         debounce.note(PathBuf::from("b"), start + WINDOW / 2);
         assert_eq!(debounce.deadline(), Some(start + WINDOW));
+    }
+
+    #[test]
+    fn a_refresh_arms_on_the_first_note_and_a_due_take_disarms() {
+        let mut refresh = Refresh::default();
+        let start = Instant::now();
+        assert_eq!(refresh.deadline(), None);
+        assert!(!refresh.take(start));
+        refresh.note(start);
+        // Later notes never push the deadline out.
+        refresh.note(start + REFRESH_WINDOW / 2);
+        assert_eq!(refresh.deadline(), Some(start + REFRESH_WINDOW));
+        assert!(!refresh.take(start + REFRESH_WINDOW / 2));
+        assert!(refresh.take(start + REFRESH_WINDOW));
+        assert_eq!(refresh.deadline(), None);
+        assert!(!refresh.take(start + REFRESH_WINDOW));
     }
 
     #[test]

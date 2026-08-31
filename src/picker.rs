@@ -189,6 +189,10 @@ impl Picker {
     pub fn walking(&self) -> bool {
         self.walking
     }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ mod screen;
 mod search;
 mod tabs;
 mod term;
+mod tree;
 mod view;
 mod watch;
 
@@ -34,7 +35,8 @@ use screen::Screen;
 use search::SearchPrompt;
 use tabs::{Tab, Tabs};
 use term::Terminal;
-use watch::{AppEvent, Debounce, DirWatcher};
+use tree::Tree;
+use watch::{AppEvent, Debounce, DirWatcher, Refresh, RootWatcher};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
@@ -520,6 +522,22 @@ fn share_copy(
     Ok(())
 }
 
+/// Routes a walker batch to whichever consumer's walk produced it — the
+/// picker and the tree can both have one in flight, told apart by
+/// generation. Returns whether anything on screen changed; a chunk from a
+/// dead walk changes nothing.
+fn absorb_files(
+    prompt: &mut Option<Prompt>,
+    tree: &mut Option<Tree>,
+    batch: project::FileBatch,
+    text_h: usize,
+) -> bool {
+    match prompt {
+        Some(Prompt::Pick(edit)) if edit.generation() == batch.generation => edit.absorb(batch),
+        _ => tree.as_mut().is_some_and(|t| t.absorb(batch, text_h)),
+    }
+}
+
 /// Closing the last tab is quitting; returns whether to quit.
 fn close_active_or_quit(tabs: &mut Tabs) -> bool {
     if tabs.count() == 1 {
@@ -567,9 +585,15 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     let mut register = String::new();
     let in_tmux = std::env::var_os("TMUX").is_some();
     let root = project::root();
-    // Ties walk batches to the picker they were started for; a reopened
-    // picker must never absorb a dead walk's leftovers.
+    // Ties walk batches to the picker or tree they were started for; a
+    // reopened consumer must never absorb a dead walk's leftovers.
     let mut walk_gen: u64 = 0;
+    let mut tree: Option<Tree> = None;
+    let mut tree_focus = false;
+    // Never read — held only so dropping it stops the recursive watch when
+    // the sidebar closes.
+    let mut _root_watch: Option<RootWatcher> = None;
+    let mut refresh = Refresh::default();
     let mut redraw = true;
 
     loop {
@@ -587,8 +611,15 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 Some(Prompt::Search(edit)) => Some(edit.highlights()),
                 _ => None,
             };
-            let mut cursor =
-                draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret, search);
+            let mut cursor = draw::draw(
+                &mut back,
+                tabs,
+                &mut scratch,
+                &notice,
+                status_caret,
+                search,
+                tree.as_ref().map(|t| (t, tree_focus)),
+            );
             if matches!(prompt, Some(Prompt::Help)) {
                 draw::draw_help(&mut back, &mut scratch);
             }
@@ -605,7 +636,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
         // A pending debounce or journal snapshot turns the indefinite block
         // into a timed one; their expiries are the only wakes that aren't
         // channel messages.
-        let wake = [debounce.deadline(), journal.deadline()]
+        let wake = [debounce.deadline(), journal.deadline(), refresh.deadline()]
             .into_iter()
             .flatten()
             .min();
@@ -617,11 +648,23 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
                 let fs_due = debounce.deadline().is_some_and(|t| t <= now);
+                // A journal snapshot or a spawned refresh walk changes
+                // nothing on screen; drawing here would turn the timers
+                // into periodic repaints.
+                redraw = fs_due;
                 if journal.deadline().is_some_and(|t| t <= now) {
                     journal.flush(tabs);
-                    // A snapshot changes nothing on screen; drawing here
-                    // would turn the timer into a periodic repaint.
-                    redraw = fs_due;
+                }
+                if refresh.take(now)
+                    && let Some(t) = &mut tree
+                {
+                    if t.busy() {
+                        t.rerun = true;
+                    } else {
+                        walk_gen += 1;
+                        let cancel = project::spawn_walk(root.clone(), walk_gen, tx.clone());
+                        t.begin_refresh(walk_gen, cancel);
+                    }
                 }
                 if fs_due {
                     reload_changed(tabs, &mut debounce);
@@ -638,13 +681,27 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 return Err(io::Error::other("event channel closed"));
             }
             Ok(AppEvent::InputFailed(e)) => return Err(e),
-            Ok(AppEvent::Fs(path)) => debounce.note(path, Instant::now()),
-            Ok(AppEvent::Files(batch)) => match &mut prompt {
-                Some(Prompt::Pick(edit)) => redraw = edit.absorb(batch),
-                // The picker is gone; a chunk still in flight changes
-                // nothing on screen.
-                _ => redraw = false,
-            },
+            Ok(AppEvent::Fs(path)) => {
+                let now = Instant::now();
+                if tree.is_some() && path.starts_with(&root) {
+                    refresh.note(now);
+                }
+                debounce.note(path, now);
+                // Noting changes nothing on screen; the expiries draw.
+                redraw = false;
+            }
+            Ok(AppEvent::Files(batch)) => {
+                redraw = absorb_files(&mut prompt, &mut tree, batch, text_h);
+                // A change arrived mid-refresh; follow up now the tree idles.
+                if let Some(t) = &mut tree
+                    && t.rerun
+                    && !t.busy()
+                {
+                    walk_gen += 1;
+                    let cancel = project::spawn_walk(root.clone(), walk_gen, tx.clone());
+                    t.begin_refresh(walk_gen, cancel);
+                }
+            }
             Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 // A pending prompt owns the key; the loop tail still runs,
                 // because prompts are allowed to move the cursor.
@@ -653,6 +710,26 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     prompt = next;
                     if quit {
                         break;
+                    }
+                } else if let Some(t) = &mut tree
+                    && tree_focus
+                    // A terminal too narrow to show the sidebar must not
+                    // let it swallow keys invisibly.
+                    && draw::tree_width(true, back.size().0) > 0
+                    // Chords stay global: Ctrl+S, Ctrl+Q, tab switching and
+                    // the toggle itself all work from the tree.
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    notice.clear();
+                    match t.key(&key, text_h) {
+                        tree::Outcome::Pending => {}
+                        tree::Outcome::FocusEditor => tree_focus = false,
+                        tree::Outcome::Open(path) => {
+                            open_path(tabs, path, &mut notice);
+                            tree_focus = false;
+                        }
                     }
                 } else {
                     notice.clear();
@@ -730,6 +807,35 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             Action::Help => {
                                 prompt = open_prompt(Prompt::Help, doc, &mut notice);
                             }
+                            Action::ToggleTree => match tree.take() {
+                                Some(t) => {
+                                    t.dismiss();
+                                    _root_watch = None;
+                                    tree_focus = false;
+                                    refresh = Refresh::default();
+                                }
+                                None => {
+                                    walk_gen += 1;
+                                    let cancel =
+                                        project::spawn_walk(root.clone(), walk_gen, tx.clone());
+                                    let mut t = Tree::new(root.clone(), walk_gen, cancel);
+                                    t.set_active(tabs.active().doc.path());
+                                    tree = Some(t);
+                                    tree_focus = true;
+                                    // Losing the recursive watch (inotify
+                                    // limits, say) costs auto-refresh, not
+                                    // the tree.
+                                    match RootWatcher::new(&root, tx.clone()) {
+                                        Ok(w) => _root_watch = Some(w),
+                                        Err(e) => {
+                                            let _ = write!(
+                                                notice,
+                                                "tree auto-refresh unavailable: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            },
                             Action::PickFile => {
                                 walk_gen += 1;
                                 let cancel =
@@ -803,6 +909,10 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             Action::Backspace => view.backspace(doc),
                             Action::Delete => view.delete(doc),
                         }
+                        // A prompt owns the keys now; the tree yields.
+                        if prompt.is_some() {
+                            tree_focus = false;
+                        }
                     } else if let KeyCode::Char(ch) = key.code
                         // Alt-modified letters are terminal escape chords, not
                         // text to insert.
@@ -833,62 +943,93 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 }
                 _ => return Ok(Exit::Signal(sig)),
             },
-            Ok(AppEvent::Input(Event::Mouse(m))) => match m.kind {
-                // The wheel works during prompts too: it only moves the
-                // viewport, which the prompts don't own.
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    let delta = if m.kind == MouseEventKind::ScrollUp {
-                        -(WHEEL_LINES as isize)
-                    } else {
-                        WHEEL_LINES as isize
-                    };
-                    let Tab { doc, view } = tabs.active_mut();
-                    view.scroll_wheel(doc, delta);
-                    follow_cursor = false;
-                }
-                // A click while searching accepts the search — the viewport
-                // and cursor stay — then lands like any click. The other
-                // prompts keep the screen: a stray click must not dismiss a
-                // save confirmation.
-                MouseEventKind::Down(MouseButton::Left)
-                    if (1..=text_h).contains(&usize::from(m.row))
-                        && matches!(prompt, None | Some(Prompt::Search(_))) =>
-                {
-                    prompt = None;
-                    notice.clear();
-                    let shift = m.modifiers.contains(KeyModifiers::SHIFT);
-                    let double = !shift
-                        && last_click.is_some_and(|(t, x, y)| {
-                            t.elapsed() <= DOUBLE_CLICK && (x, y) == (m.column, m.row)
-                        });
-                    last_click = Some((Instant::now(), m.column, m.row));
-                    let Tab { doc, view } = tabs.active_mut();
-                    doc.break_undo_group();
-                    let gutter_w = draw::gutter_width(doc);
-                    view.click(doc, gutter_w, text_h, m.column, m.row, shift);
-                    if double {
-                        view.select_word(doc);
+            Ok(AppEvent::Input(Event::Mouse(m))) => {
+                let tree_w = draw::tree_width(tree.is_some(), back.size().0);
+                match m.kind {
+                    // The wheel works during prompts too: it only moves a
+                    // viewport, which the prompts don't own. Over the
+                    // sidebar it moves the tree's.
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let delta = if m.kind == MouseEventKind::ScrollUp {
+                            -(WHEEL_LINES as isize)
+                        } else {
+                            WHEEL_LINES as isize
+                        };
+                        if usize::from(m.column) < tree_w {
+                            if let Some(t) = &mut tree {
+                                t.scroll_by(delta, text_h);
+                            }
+                        } else {
+                            let Tab { doc, view } = tabs.active_mut();
+                            view.scroll_wheel(doc, delta);
+                        }
+                        follow_cursor = false;
                     }
-                }
-                // A click on a tab label activates it, accepting any open
-                // search on the way out.
-                MouseEventKind::Down(MouseButton::Left)
-                    if m.row == 0 && matches!(prompt, None | Some(Prompt::Search(_))) =>
-                {
-                    if let Some(i) = draw::tab_at(tabs, usize::from(back.size().0), m.column) {
+                    // A click in the sidebar focuses it and lands on its
+                    // row: a file opens, a directory toggles. Like a text
+                    // click it accepts an open search and nothing else.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if usize::from(m.column) < tree_w
+                            && (1..=text_h).contains(&usize::from(m.row))
+                            && matches!(prompt, None | Some(Prompt::Search(_))) =>
+                    {
                         prompt = None;
                         notice.clear();
-                        tabs.active_mut().doc.break_undo_group();
-                        tabs.activate(i);
+                        tree_focus = true;
+                        if let Some(t) = &mut tree
+                            && let tree::Outcome::Open(path) =
+                                t.click(usize::from(m.row) - 1, text_h)
+                        {
+                            open_path(tabs, path, &mut notice);
+                            tree_focus = false;
+                        }
                     }
+                    // A click while searching accepts the search — the
+                    // viewport and cursor stay — then lands like any click.
+                    // The other prompts keep the screen: a stray click must
+                    // not dismiss a save confirmation.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if (1..=text_h).contains(&usize::from(m.row))
+                            && matches!(prompt, None | Some(Prompt::Search(_))) =>
+                    {
+                        prompt = None;
+                        notice.clear();
+                        tree_focus = false;
+                        let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+                        let double = !shift
+                            && last_click.is_some_and(|(t, x, y)| {
+                                t.elapsed() <= DOUBLE_CLICK && (x, y) == (m.column, m.row)
+                            });
+                        last_click = Some((Instant::now(), m.column, m.row));
+                        let Tab { doc, view } = tabs.active_mut();
+                        doc.break_undo_group();
+                        let gutter_w = draw::gutter_width(doc);
+                        view.click(doc, tree_w + gutter_w, text_h, m.column, m.row, shift);
+                        if double {
+                            view.select_word(doc);
+                        }
+                    }
+                    // A click on a tab label activates it, accepting any
+                    // open search on the way out.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if m.row == 0 && matches!(prompt, None | Some(Prompt::Search(_))) =>
+                    {
+                        if let Some(i) = draw::tab_at(tabs, usize::from(back.size().0), m.column) {
+                            prompt = None;
+                            notice.clear();
+                            tree_focus = false;
+                            tabs.active_mut().doc.break_undo_group();
+                            tabs.activate(i);
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if prompt.is_none() && !tree_focus => {
+                        let Tab { doc, view } = tabs.active_mut();
+                        let gutter_w = draw::gutter_width(doc);
+                        view.drag(doc, tree_w + gutter_w, text_h, m.column, m.row);
+                    }
+                    _ => {}
                 }
-                MouseEventKind::Drag(MouseButton::Left) if prompt.is_none() => {
-                    let Tab { doc, view } = tabs.active_mut();
-                    let gutter_w = draw::gutter_width(doc);
-                    view.drag(doc, gutter_w, text_h, m.column, m.row);
-                }
-                _ => {}
-            },
+            }
             Ok(AppEvent::Input(Event::Paste(text))) => {
                 if let Some(pending) = &mut prompt {
                     prompt_paste(pending, &text, tabs, &mut notice);
@@ -904,6 +1045,11 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
         if let Some(watcher) = &mut watcher {
             watcher.sync(tabs);
         }
+        // One call site covers every way the edited file changes: open,
+        // close, switch, save-as.
+        if let Some(t) = &mut tree {
+            redraw |= t.set_active(tabs.active().doc.path());
+        }
         // One call site covers every way an entry goes stale: a save, an
         // undo back to clean, a discarded close. A failure notice appearing
         // here must reach the screen even on a wake that skips the draw.
@@ -915,8 +1061,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
         // opts out of the snap, or it would scroll straight back.
         if follow_cursor {
             let (width, height) = back.size();
+            let tree_w = draw::tree_width(tree.is_some(), width);
             let Tab { doc, view } = tabs.active_mut();
-            let text_w = usize::from(width).saturating_sub(draw::gutter_width(doc));
+            let text_w = usize::from(width).saturating_sub(tree_w + draw::gutter_width(doc));
             view.scroll_to_cursor(doc, text_w, draw::text_height(height));
         }
     }
@@ -1110,6 +1257,52 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn walker_batches_route_to_the_picker_or_the_tree_by_generation() {
+        let mut picker = Picker::new(PathBuf::from("/r"), 1, Default::default());
+        picker.absorb(project::FileBatch {
+            generation: 1,
+            paths: Vec::new(),
+            done: false,
+        });
+        let mut prompt = Some(Prompt::Pick(picker));
+        let mut tree = Some(Tree::new(PathBuf::from("/r"), 2, Default::default()));
+
+        let batch = |generation, path: &str| project::FileBatch {
+            generation,
+            paths: vec![path.to_string()],
+            done: true,
+        };
+        assert!(absorb_files(
+            &mut prompt,
+            &mut tree,
+            batch(1, "picked.rs"),
+            10
+        ));
+        assert!(absorb_files(
+            &mut prompt,
+            &mut tree,
+            batch(2, "treed.rs"),
+            10
+        ));
+        // A dead walk's chunk reaches neither.
+        assert!(!absorb_files(
+            &mut prompt,
+            &mut tree,
+            batch(9, "ghost.rs"),
+            10
+        ));
+
+        let Some(Prompt::Pick(picker)) = &prompt else {
+            unreachable!()
+        };
+        assert_eq!(picker.total(), 1);
+        assert_eq!(picker.shown(0), "picked.rs");
+        let tree = tree.unwrap();
+        assert_eq!(tree.visible_len(), 1);
+        assert_eq!(tree.row(0).name, "treed.rs");
     }
 
     #[test]

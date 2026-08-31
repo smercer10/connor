@@ -7,7 +7,11 @@ description = "A terminal text editor for working alongside a coding agent"
 
 [dependencies]
 crossterm = "0.29"
+# Walks the project tree respecting .gitignore (ripgrep's walker).
+ignore = "0.4"
 notify = "8.2"
+# Fuzzy matching for the file picker (Helix's matcher core).
+nucleo-matcher = "0.3"
 # Default features off: unicode_lines makes bare \r (and VT/FF/NEL/LS/PS)
 # break lines, but connor treats only \n and \r\n as terminators.
 ropey = { version = "1.6", default-features = false, features = ["simd"] }

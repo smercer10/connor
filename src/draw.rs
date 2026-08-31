@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::doc::Document;
 use crate::grapheme::{self, RopeGraphemes};
 use crate::keymap;
+use crate::picker::Picker;
 use crate::screen::Screen;
 use crate::search::Highlights;
 use crate::tabs::{Tab, Tabs};
@@ -303,6 +304,135 @@ fn help_row(screen: &mut Screen, g: &HelpGeom, i: usize, text: &str, underline: 
             screen.set_underlined(x, y, true);
         }
     }
+}
+
+/// Widest the picker box grows: deep paths still fit, and a wide terminal
+/// keeps its margins.
+const PICK_MAX_W: usize = 80;
+
+/// Result rows the picker shows at most. A fixed row count keeps the box
+/// still while the match count churns underneath it.
+const PICK_ROWS: usize = 16;
+
+/// Draws the file-picker overlay: a centered box over the text area, the
+/// query on its top row beside the match count, ranked results below with
+/// the selection in reverse video. Drawn after `draw`, straight over the
+/// text; the tab bar and status line stay visible. Returns the cursor cell
+/// at the query's caret. Every cell write bounds-checks, so a screen too
+/// small for the box clips it instead of panicking.
+pub fn draw_picker(screen: &mut Screen, picker: &Picker, scratch: &mut String) -> (u16, u16) {
+    let (width, height) = screen.size();
+    let width = usize::from(width);
+    let text_h = text_height(height);
+
+    let box_w = if width > PICK_MAX_W + 4 {
+        PICK_MAX_W
+    } else {
+        width
+    };
+    let visible = PICK_ROWS.min(text_h.saturating_sub(3));
+    let box_h = (visible + 3).min(text_h);
+    let x0 = (width - box_w) / 2;
+    let y0 = 1 + (text_h - box_h) / 2;
+
+    // A fresh cell per footprint position also clears the reverse and
+    // underline flags of whatever the box covers.
+    for y in y0..y0 + box_h {
+        for x in x0..x0 + box_w {
+            let edge_x = x == x0 || x == x0 + box_w - 1;
+            let edge_y = y == y0 || y == y0 + box_h - 1;
+            let ch = match (edge_x, edge_y) {
+                (true, true) => match (x == x0, y == y0) {
+                    (true, true) => '┌',
+                    (false, true) => '┐',
+                    (true, false) => '└',
+                    (false, false) => '┘',
+                },
+                (true, false) => '│',
+                (false, true) => '─',
+                (false, false) => ' ',
+            };
+            screen.set(x as u16, y as u16, ch);
+        }
+    }
+
+    let avail = box_w.saturating_sub(4);
+    let query_y = (y0 + 1) as u16;
+
+    // The match count sits at the interior's right edge, with a trailing
+    // ellipsis while the walk is still feeding files in.
+    scratch.clear();
+    let _ = write!(scratch, "{}/{}", picker.matched_len(), picker.total());
+    if picker.walking() {
+        scratch.push('…');
+    }
+    let count_w = scratch.chars().count();
+    let counted = box_h >= 3 && avail >= count_w + 5;
+    if counted {
+        screen.set_text((x0 + 2 + avail - count_w) as u16, query_y, scratch);
+    }
+
+    let mut caret = x0 + 2;
+    if box_h >= 3 {
+        screen.set_text(caret as u16, query_y, "> ");
+        caret += 2;
+        let budget = avail
+            .saturating_sub(2)
+            .saturating_sub(if counted { count_w + 1 } else { 0 });
+        caret += draw_tail(screen, caret, query_y, picker.query(), budget);
+    }
+
+    // Stateless scroll: the selection stays visible, pinned to the bottom
+    // edge once it runs past the box.
+    let top = if visible > 0 {
+        picker.selected().saturating_sub(visible - 1)
+    } else {
+        0
+    };
+    for k in 0..visible.min(picker.matched_len().saturating_sub(top)) {
+        let rank = top + k;
+        let y = (y0 + 2 + k) as u16;
+        draw_tail(screen, x0 + 2, y, picker.shown(rank), avail);
+        if rank == picker.selected() {
+            for x in x0 + 1..x0 + box_w.saturating_sub(1) {
+                screen.set_reversed(x as u16, y, true);
+            }
+        }
+    }
+
+    (caret.min(width.saturating_sub(1)) as u16, query_y)
+}
+
+/// Draws `text` within `avail` columns starting at `x`. One that doesn't
+/// fit keeps its tail — for a path, the filename — behind a leading
+/// ellipsis. Returns the columns drawn.
+fn draw_tail(screen: &mut Screen, x: usize, y: u16, text: &str, avail: usize) -> usize {
+    let total: usize = text.chars().map(char_cols).sum();
+    let mut drawn = 0;
+    let mut start = 0;
+    if total > avail {
+        if avail == 0 {
+            return 0;
+        }
+        screen.set(x as u16, y, '…');
+        drawn = 1;
+        let budget = avail - 1;
+        let mut cols = 0;
+        start = text.len();
+        for (i, ch) in text.char_indices().rev() {
+            let w = char_cols(ch);
+            if cols + w > budget {
+                break;
+            }
+            cols += w;
+            start = i;
+        }
+    }
+    for ch in text[start..].chars() {
+        screen.set((x + drawn) as u16, y, ch);
+        drawn += char_cols(ch);
+    }
+    drawn
 }
 
 /// Longest name a tab label shows before truncating with an ellipsis.
@@ -876,6 +1006,102 @@ mod tests {
         );
     }
 
+    fn picker_of(paths: &[&str], done: bool) -> Picker {
+        let mut picker = Picker::new(PathBuf::from("/r"), 1, Default::default());
+        picker.absorb(crate::project::FileBatch {
+            generation: 1,
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            done,
+        });
+        picker
+    }
+
+    fn press(picker: &mut Picker, code: crossterm::event::KeyCode) {
+        picker.key(&crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    const PICK_PATHS: &[&str] = &["src/main.rs", "src/draw.rs", "README.md"];
+
+    #[test]
+    fn picker_overlay_shows_query_count_and_ranked_results() {
+        let tabs = tabs_of(Document::from_str("text"), View::default());
+        let mut screen = Screen::new(40, 14);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        let mut picker = picker_of(PICK_PATHS, false);
+        press(&mut picker, crossterm::event::KeyCode::Char('d'));
+        let cursor = draw_picker(&mut screen, &picker, &mut scratch);
+
+        // Walk order first: 40 wide leaves no margin, so the box spans it.
+        let query = row(&screen, 2);
+        assert!(query.contains("> d"), "query missing: {query}");
+        assert!(query.contains("2/3…"), "count missing: {query}");
+        assert_eq!(cursor, (5, 2));
+        let all = all_rows(&screen);
+        assert!(all.contains("src/draw.rs"));
+        assert!(all.contains("README.md"));
+        assert!(!all.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn picker_overlay_reverses_the_selected_row_only() {
+        let tabs = tabs_of(Document::from_str("text"), View::default());
+        let mut screen = Screen::new(40, 14);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        let mut picker = picker_of(PICK_PATHS, true);
+        press(&mut picker, crossterm::event::KeyCode::Down);
+        draw_picker(&mut screen, &picker, &mut scratch);
+
+        assert!(row(&screen, 4).contains("src/draw.rs"));
+        assert!(!sel_row(&screen, 3).contains('#'));
+        assert!(sel_row(&screen, 4).contains('#'));
+        assert!(!sel_row(&screen, 5).contains('#'));
+    }
+
+    #[test]
+    fn picker_overlay_spares_the_chrome_and_clears_beneath() {
+        // 100 wide: the box takes its 80 columns centered, leaving editor
+        // content beside it. A selection reaching under it must not bleed.
+        let view = View::test_at(19, 0, 0).with_anchor(0);
+        let tabs = tabs_of(Document::from_str("some text\nmore text"), view);
+        let mut scratch = String::new();
+        let mut plain = Screen::new(100, 24);
+        draw(&mut plain, &tabs, &mut scratch, "", None, None);
+        let mut screen = Screen::new(100, 24);
+        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        let picker = picker_of(PICK_PATHS, true);
+        draw_picker(&mut screen, &picker, &mut scratch);
+
+        assert_eq!(row(&screen, 0), row(&plain, 0));
+        assert_eq!(row(&screen, 23), row(&plain, 23));
+        // Row 2 crosses the box's top border: reversed cells left of it
+        // survive, everything under the box is cleared.
+        let border = row(&screen, 2).chars().position(|c| c == '┌').unwrap();
+        let sel = sel_row(&screen, 2);
+        assert!(sel_row(&plain, 2)[border..].contains('#'));
+        assert!(sel[..border].contains('#'));
+        assert!(!sel[border..].contains('#'), "selection bleeds: {sel}");
+    }
+
+    #[test]
+    fn picker_overlay_truncates_long_paths_to_their_tail() {
+        let tabs = tabs_of(Document::from_str(""), View::default());
+        let mut screen = Screen::new(20, 10);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None);
+        let picker = picker_of(&["a/very/deep/nested/path/name.rs"], true);
+        draw_picker(&mut screen, &picker, &mut scratch);
+
+        let listing = row(&screen, 3);
+        assert!(listing.contains('…'), "no ellipsis: {listing}");
+        assert!(listing.contains("name.rs"), "tail lost: {listing}");
+        assert!(!listing.contains("a/very"), "head kept: {listing}");
+    }
+
     #[test]
     fn degenerate_sizes_do_not_panic() {
         for (w, h) in [
@@ -893,6 +1119,10 @@ mod tests {
             let (mut screen, _) = render("日本\ntext", w, h, View::default());
             let mut scratch = String::new();
             draw_help(&mut screen, &mut scratch);
+            draw_picker(&mut screen, &picker_of(&[], false), &mut scratch);
+            let mut full = picker_of(&["日本/長いファイル名.rs", "b.rs"], true);
+            press(&mut full, crossterm::event::KeyCode::Down);
+            draw_picker(&mut screen, &full, &mut scratch);
             let mut tabs = Tabs::new(vec![
                 named("aa.rs", "日本"),
                 dirtied(named("bb.rs", "text")),

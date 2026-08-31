@@ -20,6 +20,8 @@ pub enum AppEvent {
     InputFailed(io::Error),
     /// A path inside a watched directory was touched; raw and un-debounced.
     Fs(PathBuf),
+    /// A chunk of project files from the background walker.
+    Files(crate::project::FileBatch),
     /// An external signal arrived; the loop decides whether to suspend,
     /// resync, or exit.
     #[cfg(unix)]

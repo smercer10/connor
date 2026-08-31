@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Action {
     NewTab,
     Open,
+    PickFile,
     Save,
     CloseTab,
     Quit,
@@ -116,6 +117,11 @@ pub static KEYMAP: &[Section] = &[
         bindings: &[
             bind(&[ctrl(KeyCode::Char('n'))], Action::NewTab, "new tab"),
             bind(&[ctrl(KeyCode::Char('o'))], Action::Open, "open file"),
+            bind(
+                &[ctrl(KeyCode::Char('p'))],
+                Action::PickFile,
+                "open by name",
+            ),
             bind(&[ctrl(KeyCode::Char('s'))], Action::Save, "save"),
             bind(&[ctrl(KeyCode::Char('w'))], Action::CloseTab, "close tab"),
             bind(&[ctrl(KeyCode::Char('q'))], Action::Quit, "quit"),

@@ -4,6 +4,8 @@ mod draw;
 mod grapheme;
 mod journal;
 mod keymap;
+mod picker;
+mod project;
 mod prompt;
 mod screen;
 mod search;
@@ -26,6 +28,7 @@ use crossterm::event::{
 use doc::{Caret, DiskCheck, Document};
 use journal::{Journal, Recovered};
 use keymap::Action;
+use picker::Picker;
 use prompt::{LinePrompt, Outcome, PathPrompt};
 use screen::Screen;
 use search::SearchPrompt;
@@ -176,6 +179,8 @@ enum Prompt {
     Search(SearchPrompt),
     /// Ctrl+/ or F1: the keymap overlay.
     Help,
+    /// Ctrl+P: the fuzzy file picker over the project.
+    Pick(Picker),
 }
 
 fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Prompt> {
@@ -198,6 +203,7 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
         Prompt::GoTo(edit) => edit.render(notice),
         Prompt::Search(edit) => edit.render(notice),
         Prompt::Help => notice.push_str("(esc) close"),
+        Prompt::Pick(_) => notice.push_str("↑↓ select · enter open · esc"),
     }
     Some(prompt)
 }
@@ -242,6 +248,8 @@ fn prompt_paste(prompt: &mut Prompt, text: &str, tabs: &mut Tabs, notice: &mut S
             edit.paste(text);
             edit.render(notice);
         }
+        // The query lives in the overlay, so the notice stays untouched.
+        Prompt::Pick(edit) => edit.paste(text),
         Prompt::Quit | Prompt::Close | Prompt::LossySave { .. } | Prompt::Help => {}
     }
 }
@@ -273,6 +281,27 @@ fn prompt_key(
             prompt_paste(&mut prompt, register, tabs, notice);
         }
         return (Some(prompt), false);
+    }
+    // The picker consumes every key itself; a repeat of its opening chord
+    // dismisses it, like the help overlay.
+    if let Prompt::Pick(mut edit) = prompt {
+        if keymap::lookup(key) == Some(Action::PickFile) {
+            edit.dismiss();
+            notice.clear();
+            return (None, false);
+        }
+        return match edit.key(key) {
+            picker::Outcome::Pending => (Some(Prompt::Pick(edit)), false),
+            picker::Outcome::Cancel => {
+                notice.clear();
+                (None, false)
+            }
+            picker::Outcome::Open(path) => {
+                notice.clear();
+                open_path(tabs, path, notice);
+                (None, false)
+            }
+        };
     }
     // A search prompt consumes every key itself, and may move the cursor
     // and edit the document.
@@ -522,7 +551,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     }
     // Losing the watcher (inotify limits, say) costs reloads, not the
     // editor.
-    let mut watcher = match DirWatcher::new(tx) {
+    let mut watcher = match DirWatcher::new(tx.clone()) {
         Ok(watcher) => Some(watcher),
         Err(e) => {
             if notice.is_empty() {
@@ -537,6 +566,10 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     // large for OSC 52, and works in terminals that ignore OSC 52 entirely.
     let mut register = String::new();
     let in_tmux = std::env::var_os("TMUX").is_some();
+    let root = project::root();
+    // Ties walk batches to the picker they were started for; a reopened
+    // picker must never absorb a dead walk's leftovers.
+    let mut walk_gen: u64 = 0;
     let mut redraw = true;
 
     loop {
@@ -554,9 +587,13 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 Some(Prompt::Search(edit)) => Some(edit.highlights()),
                 _ => None,
             };
-            let cursor = draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret, search);
+            let mut cursor =
+                draw::draw(&mut back, tabs, &mut scratch, &notice, status_caret, search);
             if matches!(prompt, Some(Prompt::Help)) {
                 draw::draw_help(&mut back, &mut scratch);
+            }
+            if let Some(Prompt::Pick(edit)) = &prompt {
+                cursor = draw::draw_picker(&mut back, edit, &mut scratch);
             }
             terminal.present(&back, cursor)?;
         }
@@ -602,6 +639,12 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             }
             Ok(AppEvent::InputFailed(e)) => return Err(e),
             Ok(AppEvent::Fs(path)) => debounce.note(path, Instant::now()),
+            Ok(AppEvent::Files(batch)) => match &mut prompt {
+                Some(Prompt::Pick(edit)) => redraw = edit.absorb(batch),
+                // The picker is gone; a chunk still in flight changes
+                // nothing on screen.
+                _ => redraw = false,
+            },
             Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 // A pending prompt owns the key; the loop tail still runs,
                 // because prompts are allowed to move the cursor.
@@ -613,12 +656,6 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     }
                 } else {
                     notice.clear();
-                    #[cfg(debug_assertions)]
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('p')
-                    {
-                        panic!("deliberate panic (Ctrl+P)");
-                    }
                     if let Some(action) = keymap::lookup(&key) {
                         let Tab { doc, view } = tabs.active_mut();
                         if action.is_movement() {
@@ -692,6 +729,16 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             }
                             Action::Help => {
                                 prompt = open_prompt(Prompt::Help, doc, &mut notice);
+                            }
+                            Action::PickFile => {
+                                walk_gen += 1;
+                                let cancel =
+                                    project::spawn_walk(root.clone(), walk_gen, tx.clone());
+                                prompt = open_prompt(
+                                    Prompt::Pick(Picker::new(root.clone(), walk_gen, cancel)),
+                                    doc,
+                                    &mut notice,
+                                );
                             }
                             Action::Save => {
                                 if doc.path().is_none() {
@@ -1007,6 +1054,62 @@ mod tests {
             assert!(matches!(next, Some(Prompt::Help)), "{code:?} closed help");
             assert!(!quit);
         }
+    }
+
+    fn pick_prompt(root: PathBuf, paths: &[&str]) -> Prompt {
+        let mut picker = Picker::new(root, 1, Default::default());
+        picker.absorb(project::FileBatch {
+            generation: 1,
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            done: true,
+        });
+        Prompt::Pick(picker)
+    }
+
+    #[test]
+    fn pick_prompt_types_closes_on_its_chord_and_opens_on_enter() {
+        let dir = scratch_dir("pick-open");
+        std::fs::write(dir.join("f.txt"), "text\n").unwrap();
+        let mut tabs = Tabs::new(vec![Document::empty()]);
+        let mut notice = String::new();
+
+        // A typed character leaves the picker up.
+        let prompt = pick_prompt(dir.clone(), &["f.txt"]);
+        let key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+        let (next, quit) = prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+        assert!(matches!(next, Some(Prompt::Pick(_))));
+        assert!(!quit);
+
+        // Esc and a repeat Ctrl+P both dismiss without opening.
+        for (code, mods) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ] {
+            notice.push_str("↑↓ select · enter open · esc");
+            let prompt = pick_prompt(dir.clone(), &["f.txt"]);
+            let key = KeyEvent::new(code, mods);
+            let (next, quit) = prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+            assert!(next.is_none(), "{code:?} left the picker open");
+            assert!(!quit);
+            assert!(notice.is_empty());
+            assert_eq!(tabs.count(), 1);
+        }
+
+        // Enter opens the selection in a new tab; a second Enter on the
+        // same path activates that tab instead of duplicating it.
+        for _ in 0..2 {
+            let prompt = pick_prompt(dir.clone(), &["f.txt"]);
+            let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            let (next, quit) = prompt_key(prompt, &key, &mut tabs, "", &mut notice);
+            assert!(next.is_none());
+            assert!(!quit);
+            assert_eq!(tabs.count(), 2);
+            assert_eq!(
+                tabs.active_mut().doc.path(),
+                Some(dir.join("f.txt").as_path())
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

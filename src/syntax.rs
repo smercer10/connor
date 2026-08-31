@@ -2,10 +2,12 @@
 //! for one document: it drains the document's splice log to shift the tree,
 //! reparses in place when the damage is small and hands big parses to a
 //! worker thread, and turns the visible viewport into colour spans for the
-//! draw pass. Documents with no grammar never construct one, so plain text
-//! costs nothing.
+//! draw pass. Markdown carries a second, inline grammar: `refresh` parses a
+//! throwaway inline tree per visible paragraph — microseconds each — so the
+//! block tree alone is kept incremental. Documents with no grammar never
+//! construct a `Syntax`, so plain text costs nothing.
 
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -60,8 +62,10 @@ const PALETTE: &[(&str, u8)] = &[
     ("text.literal", 7), // markdown code blocks
     ("text.uri", 5),
     ("text.reference", 7),
+    ("text.emphasis", 4), // markdown italic — `Cell` has no italic attribute
+    ("text.strong", 2),   // markdown bold
     ("punctuation.special", 4), // markdown list and quote markers
-    ("none", 0),                // explicitly plain: punches a hole in an outer capture
+    ("none", 0),          // explicitly plain: punches a hole in an outer capture
 ];
 
 /// A capture with no palette entry — ignored entirely, so an enclosing
@@ -117,6 +121,30 @@ struct LangSpec {
     /// because its grammar inherits C's nodes but its query doesn't.
     query: &'static [&'static str],
     lang: OnceLock<Lang>,
+    /// A second grammar parsed over the block tree's inline nodes; only
+    /// markdown splits inline content out this way.
+    inline: Option<InlineSpec>,
+}
+
+impl LangSpec {
+    fn force(&'static self) -> &'static Lang {
+        self.lang
+            .get_or_init(|| Lang::new(self.language.into(), &self.query.concat()))
+    }
+}
+
+/// The inline half of a two-grammar language, memoized like `LangSpec`.
+struct InlineSpec {
+    language: LanguageFn,
+    query: &'static str,
+    lang: OnceLock<Lang>,
+}
+
+impl InlineSpec {
+    fn force(&'static self) -> &'static Lang {
+        self.lang
+            .get_or_init(|| Lang::new(self.language.into(), self.query))
+    }
 }
 
 /// How a language's files are recognised; table entries spell only the
@@ -145,6 +173,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_rust::LANGUAGE,
         query: &[tree_sitter_rust::HIGHLIGHTS_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "go",
@@ -155,6 +184,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_go::LANGUAGE,
         query: &[tree_sitter_go::HIGHLIGHTS_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "python",
@@ -166,6 +196,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_python::LANGUAGE,
         query: &[tree_sitter_python::HIGHLIGHTS_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "bash",
@@ -178,6 +209,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_bash::LANGUAGE,
         query: &[tree_sitter_bash::HIGHLIGHT_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "c",
@@ -188,6 +220,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_c::LANGUAGE,
         query: &[tree_sitter_c::HIGHLIGHT_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "cpp",
@@ -202,6 +235,7 @@ static LANGS: [LangSpec; 12] = [
             tree_sitter_cpp::HIGHLIGHT_QUERY,
         ],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "yaml",
@@ -212,6 +246,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_yaml::LANGUAGE,
         query: &[tree_sitter_yaml::HIGHLIGHTS_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "hcl",
@@ -222,6 +257,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_hcl::LANGUAGE,
         query: &[include_str!("../grammars/hcl/highlights.scm")],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "dockerfile",
@@ -234,10 +270,8 @@ static LANGS: [LangSpec; 12] = [
         language: DOCKERFILE,
         query: &[include_str!("../grammars/dockerfile/highlights.scm")],
         lang: OnceLock::new(),
+        inline: None,
     },
-    // Block grammar only — headings, lists, quotes, fences. Inline
-    // emphasis needs the bundled second grammar parsed over included
-    // ranges; that is #34.
     LangSpec {
         name: "markdown",
         files: Files {
@@ -247,6 +281,11 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_md::LANGUAGE,
         query: &[tree_sitter_md::HIGHLIGHT_QUERY_BLOCK],
         lang: OnceLock::new(),
+        inline: Some(InlineSpec {
+            language: tree_sitter_md::INLINE_LANGUAGE,
+            query: tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            lang: OnceLock::new(),
+        }),
     },
     LangSpec {
         name: "toml",
@@ -258,6 +297,7 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_toml_ng::LANGUAGE,
         query: &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
     LangSpec {
         name: "json",
@@ -268,20 +308,16 @@ static LANGS: [LangSpec; 12] = [
         language: tree_sitter_json::LANGUAGE,
         query: &[tree_sitter_json::HIGHLIGHTS_QUERY],
         lang: OnceLock::new(),
+        inline: None,
     },
 ];
 
-/// The grammar for a document: well-known filename first (including the
+/// The language for a document: well-known filename first (including the
 /// `Dockerfile.*` family), then extension, then — only when the path
 /// decides nothing — the shebang line.
-fn lang_for(path: Option<&Path>, rope: &Rope) -> Option<&'static Lang> {
-    let spec = path
-        .and_then(spec_for_path)
-        .or_else(|| spec_for_shebang(rope))?;
-    Some(
-        spec.lang
-            .get_or_init(|| Lang::new(spec.language.into(), &spec.query.concat())),
-    )
+fn spec_for(path: Option<&Path>, rope: &Rope) -> Option<&'static LangSpec> {
+    path.and_then(spec_for_path)
+        .or_else(|| spec_for_shebang(rope))
 }
 
 fn spec_for_path(path: &Path) -> Option<&'static LangSpec> {
@@ -322,6 +358,11 @@ fn spec_for_shebang(rope: &Rope) -> Option<&'static LangSpec> {
 /// measured ~8 MB/s.
 const SYNC_PARSE_LIMIT: usize = 128 * 1024;
 
+/// Inline nodes larger than this keep block colours only — a file that is
+/// one giant paragraph must not blow the frame budget on a per-refresh
+/// parse. Real prose paragraphs are a few hundred bytes.
+const INLINE_NODE_LIMIT: usize = 32 * 1024;
+
 /// A finished background parse on its way back to the main loop.
 pub struct ParseDone {
     pub doc_id: u64,
@@ -343,9 +384,18 @@ impl Drop for Inflight {
     }
 }
 
+/// The second grammar's state for languages that split inline content
+/// (markdown). The parser is dedicated to the inline grammar, so its
+/// included-range state can never contaminate block parses.
+struct InlineLayer {
+    lang: &'static Lang,
+    parser: Parser,
+}
+
 pub struct Syntax {
     lang: &'static Lang,
     parser: Parser,
+    inline: Option<InlineLayer>,
     tree: Option<Tree>,
     /// Bytes of edits applied to `tree` since it last reparsed — the cost
     /// an incremental reparse is proportional to.
@@ -365,13 +415,21 @@ impl Syntax {
     /// path or shebang. Starts the document's splice log; the first `pump`
     /// parses.
     pub fn new(doc: &mut Document) -> Option<Syntax> {
-        let lang = lang_for(doc.path(), doc.rope())?;
+        let spec = spec_for(doc.path(), doc.rope())?;
+        let lang = spec.force();
         let mut parser = Parser::new();
         parser.set_language(&lang.language).ok()?;
+        let inline = spec.inline.as_ref().and_then(|spec| {
+            let lang = spec.force();
+            let mut parser = Parser::new();
+            parser.set_language(&lang.language).ok()?;
+            Some(InlineLayer { lang, parser })
+        });
         doc.track_splices();
         Some(Syntax {
             lang,
             parser,
+            inline,
             tree: None,
             stale_damage: 0,
             parse_seq: 0,
@@ -478,8 +536,9 @@ impl Syntax {
     }
 
     /// Rebuilds the span cache for the visible lines unless document, tree
-    /// and viewport are all unchanged. Runs the highlight query over just
-    /// the viewport's byte range and flattens nested captures into sorted,
+    /// and viewport are all unchanged. Runs the highlight query — both
+    /// queries, for a language with an inline grammar — over just the
+    /// viewport's byte range and flattens nested captures into sorted,
     /// non-overlapping spans; never called from the draw pass itself.
     pub fn refresh(&mut self, doc: &Document, scroll_line: usize, text_h: usize) {
         let key = (doc.revision(), self.parse_seq, scroll_line, text_h);
@@ -497,15 +556,52 @@ impl Syntax {
         if start_byte >= end_byte {
             return;
         }
-        self.cursor.set_byte_range(start_byte..end_byte);
-        let provider = |node: Node| {
-            rope.byte_slice(node.byte_range())
-                .chunks()
-                .map(str::as_bytes)
-        };
-        let mut captures = self
-            .cursor
-            .captures(&self.lang.query, tree.root_node(), provider);
+        let mut caps: Vec<(usize, usize, u8)> = Vec::new();
+        collect_captures(
+            &mut self.cursor,
+            self.lang,
+            tree.root_node(),
+            rope,
+            start_byte..end_byte,
+            &mut caps,
+        );
+
+        // The inline grammar parses a small throwaway tree per visible
+        // inline node — a paragraph costs microseconds — rather than one
+        // tree over every node's ranges, where a stray delimiter in one
+        // paragraph would pair with a delimiter in another.
+        let mut icaps: Vec<(usize, usize, u8)> = Vec::new();
+        if let Some(inline) = &mut self.inline {
+            let cursor = &mut self.cursor;
+            let mut ranges: Vec<tree_sitter::Range> = Vec::new();
+            for_each_inline(tree.root_node(), start_byte, end_byte, &mut |node| {
+                inline_ranges(node, &mut ranges);
+                let len: usize = ranges.iter().map(|r| r.end_byte - r.start_byte).sum();
+                // An empty slice would reset the parser to whole-document
+                // mode, so a node with no ranges is skipped outright.
+                if ranges.is_empty()
+                    || len > INLINE_NODE_LIMIT
+                    || inline.parser.set_included_ranges(&ranges).is_err()
+                {
+                    return;
+                }
+                let itree = inline.parser.parse_with_options(
+                    &mut |byte, _| chunk_at(rope, byte),
+                    None,
+                    None,
+                );
+                if let Some(itree) = itree {
+                    collect_captures(
+                        cursor,
+                        inline.lang,
+                        itree.root_node(),
+                        rope,
+                        start_byte..end_byte,
+                        &mut icaps,
+                    );
+                }
+            });
+        }
 
         let spans = &mut self.spans;
         let mut emit = |from: usize, to: usize, color: u8| {
@@ -518,30 +614,40 @@ impl Syntax {
                 });
             }
         };
-        // Captures arrive sorted by start and properly nested (they are
-        // tree nodes), enclosing ones first. A small stack flattens them,
-        // splitting an outer capture around an inner one — plain last-wins
-        // would swallow a string's tail after its escape sequence — with
-        // the innermost capture owning each byte.
+        // Each list arrives sorted by start and properly nested (they are
+        // tree nodes), enclosing captures first; the merge keeps that
+        // order, and a tie takes the block capture first so an inline
+        // capture over the same node sits deeper. A small stack flattens
+        // the stream, splitting an outer capture around an inner one —
+        // plain last-wins would swallow a string's tail after its escape
+        // sequence — with the innermost capture owning each byte.
         let mut stack: Vec<(usize, u8)> = Vec::new();
         let mut pos = start_byte;
-        while let Some((m, ci)) = captures.next() {
-            let capture = m.captures[*ci];
-            let color = self.lang.colors[capture.index as usize];
-            if color == UNMAPPED {
-                continue;
-            }
-            let range = capture.node.byte_range();
-            while stack.last().is_some_and(|&(end, _)| end <= range.start) {
-                let (end, color) = stack.pop().unwrap();
-                emit(pos, end, color);
-                pos = pos.max(end);
+        let (mut b, mut i) = (0, 0);
+        loop {
+            let take_block = match (caps.get(b), icaps.get(i)) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(&(bs, be, _)), Some(&(is, ie, _))) => bs < is || (bs == is && be >= ie),
+            };
+            let (start, end, color) = if take_block {
+                b += 1;
+                caps[b - 1]
+            } else {
+                i += 1;
+                icaps[i - 1]
+            };
+            while stack.last().is_some_and(|&(e, _)| e <= start) {
+                let (e, color) = stack.pop().unwrap();
+                emit(pos, e, color);
+                pos = pos.max(e);
             }
             if let Some(&(_, outer)) = stack.last() {
-                emit(pos, range.start, outer);
+                emit(pos, start, outer);
             }
-            pos = pos.max(range.start);
-            stack.push((range.end, color));
+            pos = pos.max(start);
+            stack.push((end, color));
         }
         while let Some((end, color)) = stack.pop() {
             emit(pos, end, color);
@@ -551,6 +657,91 @@ impl Syntax {
 
     pub fn spans(&self) -> &[Span] {
         &self.spans
+    }
+}
+
+/// Appends `lang`'s query captures over `view` to `out` as
+/// `(start_byte, end_byte, colour)`, in arrival order. Unmapped captures
+/// are dropped; explicit colour-0 ones stay — they punch holes.
+fn collect_captures(
+    cursor: &mut QueryCursor,
+    lang: &Lang,
+    root: Node,
+    rope: &Rope,
+    view: Range<usize>,
+    out: &mut Vec<(usize, usize, u8)>,
+) {
+    cursor.set_byte_range(view);
+    let provider = |node: Node| {
+        rope.byte_slice(node.byte_range())
+            .chunks()
+            .map(str::as_bytes)
+    };
+    let mut captures = cursor.captures(&lang.query, root, provider);
+    while let Some((m, ci)) = captures.next() {
+        let capture = m.captures[*ci];
+        let color = lang.colors[capture.index as usize];
+        if color != UNMAPPED {
+            let range = capture.node.byte_range();
+            out.push((range.start, range.end, color));
+        }
+    }
+}
+
+/// Visits the block tree's inline-content nodes intersecting
+/// `[start, end)` in document order, pruning subtrees outside it.
+fn for_each_inline(root: Node, start: usize, end: usize, f: &mut dyn FnMut(Node)) {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        let intersects = node.start_byte() < end && node.end_byte() > start;
+        let is_inline = matches!(node.kind(), "inline" | "pipe_table_cell");
+        if intersects && is_inline {
+            f(node);
+        }
+        if !(intersects && !is_inline && cursor.goto_first_child()) {
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Refills `out` with the ranges the inline grammar should see for one
+/// inline node: its own range minus each named child — the block
+/// grammar's continuation markers on wrapped blockquote and list lines.
+fn inline_ranges(node: Node, out: &mut Vec<tree_sitter::Range>) {
+    out.clear();
+    let mut range = node.range();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.is_named() {
+                let child_range = child.range();
+                if range.start_byte < child_range.start_byte {
+                    out.push(tree_sitter::Range {
+                        start_byte: range.start_byte,
+                        start_point: range.start_point,
+                        end_byte: child_range.start_byte,
+                        end_point: child_range.start_point,
+                    });
+                }
+                range.start_byte = child_range.end_byte;
+                range.start_point = child_range.end_point;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    if range.start_byte < range.end_byte {
+        out.push(range);
     }
 }
 
@@ -723,6 +914,155 @@ mod tests {
     }
 
     #[test]
+    fn markdown_inline_emphasis_code_and_links_colour() {
+        let (mut doc, mut syntax) = doc_named("t.md", "a *i* **b** `c` [t](http://u)\n");
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        let covering = |c: usize| spans.iter().find(|s| s.start <= c && c < s.end);
+        assert_eq!(covering(3).map(|s| s.color), Some(4), "italic in {spans:?}");
+        assert_eq!(covering(8).map(|s| s.color), Some(2), "bold in {spans:?}");
+        assert_eq!(covering(13).map(|s| s.color), Some(7), "code in {spans:?}");
+        assert_eq!(
+            covering(17).map(|s| s.color),
+            Some(7),
+            "link text in {spans:?}"
+        );
+        assert_eq!(covering(22).map(|s| s.color), Some(5), "url in {spans:?}");
+    }
+
+    #[test]
+    fn inline_spans_split_their_enclosing_block_span() {
+        let (mut doc, mut syntax) = doc_named("t.md", "# a *b* c\n");
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        // The heading's title span splits around the emphasis, which owns
+        // its bytes as the innermost capture; the `#` marker keeps its own
+        // colour.
+        assert_eq!(
+            spans,
+            vec![span(0, 1, 4), span(2, 4, 6), span(4, 7, 4), span(7, 9, 6)]
+        );
+    }
+
+    #[test]
+    fn emphasis_does_not_pair_across_paragraphs() {
+        // Each paragraph parses alone: the stray `*`s must not pair up
+        // into one emphasis spanning both.
+        let (mut doc, mut syntax) = doc_named("t.md", "*a\n\nb*\n");
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        assert!(
+            !spans.iter().any(|s| s.color == 4),
+            "no emphasis expected in {spans:?}"
+        );
+    }
+
+    #[test]
+    fn fence_content_ignores_inline_syntax() {
+        let (mut doc, mut syntax) = doc_named("t.md", "```\n*not em*\n```\n");
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        assert!(
+            !spans
+                .iter()
+                .any(|s| s.start < 12 && 4 < s.end && s.color != 0),
+            "fence content must stay plain: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn blockquote_emphasis_spans_wrapped_lines() {
+        let (mut doc, mut syntax) = doc_named("t.md", "> **a\n> b**\n");
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        let covering = |c: usize| spans.iter().find(|s| s.start <= c && c < s.end);
+        // The emphasis crosses the wrapped line; the `> ` continuation
+        // marker inside it keeps the quote colour.
+        assert_eq!(covering(4).map(|s| s.color), Some(2), "line 1 in {spans:?}");
+        assert_eq!(covering(8).map(|s| s.color), Some(2), "line 2 in {spans:?}");
+        assert_eq!(covering(6).map(|s| s.color), Some(4), "marker in {spans:?}");
+    }
+
+    #[test]
+    fn edits_shift_inline_spans_incrementally() {
+        let (mut doc, mut syntax) = doc_named("t.md", "*i*\n");
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        assert!(spans.contains(&span(0, 3, 4)), "{spans:?}");
+        doc.edit(0..0, "# h\n", caret(0), EditKind::Other);
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        assert!(spans.contains(&span(4, 7, 4)), "{spans:?}");
+    }
+
+    #[test]
+    fn undo_and_redo_keep_inline_spans_correct() {
+        let (mut doc, mut syntax) = doc_named("t.md", "*i*\n");
+        let before = spans_for(&mut doc, &mut syntax, 10);
+        doc.edit(0..0, "# h\n", caret(0), EditKind::Other);
+        let edited = spans_for(&mut doc, &mut syntax, 10);
+        doc.undo();
+        assert_eq!(spans_for(&mut doc, &mut syntax, 10), before);
+        doc.redo();
+        assert_eq!(spans_for(&mut doc, &mut syntax, 10), edited);
+    }
+
+    #[test]
+    fn external_reload_keeps_inline_spans_correct() {
+        let dir = std::env::temp_dir().join(format!("connor-syn-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.md");
+        std::fs::write(&path, "*i*\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        let mut syntax = Syntax::new(&mut doc).unwrap();
+        spans_for(&mut doc, &mut syntax, 10);
+
+        std::fs::write(&path, "# t\n*i*\n").unwrap();
+        assert!(matches!(
+            doc.check_disk(caret(0)),
+            crate::doc::DiskCheck::Reloaded { .. }
+        ));
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        assert!(spans.contains(&span(4, 7, 4)), "{spans:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn big_markdown_parses_in_the_background_and_inline_colours_on_absorb() {
+        let mut text = "text\n".repeat(SYNC_PARSE_LIMIT / 5 + 1);
+        text.insert_str(0, "**bold**\n\n");
+        let (mut doc, mut syntax) = doc_named("t.md", &text);
+        let (tx, rx) = mpsc::channel();
+        syntax.pump(&mut doc, &tx);
+        syntax.refresh(&doc, 0, 5);
+        assert!(syntax.spans().is_empty());
+
+        let AppEvent::Parsed(done) = rx.recv().unwrap() else {
+            panic!("expected a parse result");
+        };
+        assert!(syntax.absorb(done, &doc, &tx));
+        syntax.refresh(&doc, 0, 5);
+        assert!(
+            syntax.spans().contains(&span(0, 8, 2)),
+            "{:?}",
+            syntax.spans()
+        );
+    }
+
+    #[test]
+    fn an_oversized_inline_node_keeps_block_colours_only() {
+        let text = format!("*x* {}\n", "a".repeat(INLINE_NODE_LIMIT));
+        let (mut doc, mut syntax) = doc_named("t.md", &text);
+        let spans = spans_for(&mut doc, &mut syntax, 10);
+        assert!(
+            !spans.iter().any(|s| s.color == 4),
+            "oversized paragraph must skip the inline parse"
+        );
+    }
+
+    #[test]
+    fn only_markdown_carries_the_inline_layer() {
+        let (_, syntax) = doc_named("t.rs", "fn main() {}");
+        assert!(syntax.inline.is_none());
+        let (_, syntax) = doc_named("t.md", "x\n");
+        assert!(syntax.inline.is_some());
+    }
+
+    #[test]
     fn edits_shift_spans_incrementally() {
         let (mut doc, mut syntax) = doc_named("t.rs", "fn main() {}");
         spans_for(&mut doc, &mut syntax, 10);
@@ -869,12 +1209,15 @@ mod tests {
     #[test]
     fn every_language_query_compiles_and_reports_unmapped_captures() {
         for spec in &LANGS {
-            let lang = spec
-                .lang
-                .get_or_init(|| Lang::new(spec.language.into(), &spec.query.concat()));
-            for name in lang.query.capture_names() {
+            for name in spec.force().query.capture_names() {
                 if color_of(name) == UNMAPPED {
                     println!("{}: unmapped @{name}", spec.name);
+                }
+            }
+            let Some(inline) = &spec.inline else { continue };
+            for name in inline.force().query.capture_names() {
+                if color_of(name) == UNMAPPED {
+                    println!("{} (inline): unmapped @{name}", spec.name);
                 }
             }
         }
@@ -929,9 +1272,8 @@ mod tests {
     #[test]
     fn a_path_match_beats_the_shebang() {
         let rope = Rope::from_str("#!/bin/bash\nx = 1\n");
-        let lang = lang_for(Some(Path::new("t.py")), &rope).unwrap();
-        let python = spec_for_path(Path::new("t.py")).unwrap();
-        assert!(std::ptr::eq(lang, python.lang.get().unwrap()));
+        let spec = spec_for(Some(Path::new("t.py")), &rope).unwrap();
+        assert_eq!(spec.name, "python");
     }
 
     #[test]

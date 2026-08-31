@@ -121,8 +121,10 @@ fn lang_for(path: &Path) -> Option<&'static Lang> {
 
 /// Edits whose combined byte span stays under this reparse synchronously on
 /// the event path; anything bigger — including a first parse of a larger
-/// file — goes to a worker thread so no frame blocks on it.
-const SYNC_PARSE_LIMIT: usize = 1024 * 1024;
+/// file — goes to a worker thread so no frame blocks on it. Sized so the
+/// worst sync parse stays well under a frame's budget at tree-sitter's
+/// measured ~8 MB/s.
+const SYNC_PARSE_LIMIT: usize = 128 * 1024;
 
 /// A finished background parse on its way back to the main loop.
 pub struct ParseDone {

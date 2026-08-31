@@ -30,12 +30,20 @@ pub fn root() -> PathBuf {
 }
 
 fn root_from(start: &Path) -> PathBuf {
-    // `.git` may be a directory or, in a worktree, a file.
-    start
-        .ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .unwrap_or(start)
-        .to_path_buf()
+    repo_of(start).unwrap_or(start).to_path_buf()
+}
+
+/// Whether the file sits inside a git project. The cheap ancestor walk, no
+/// subprocess: false is what keeps connor from ever running `git` for a
+/// buffer outside a repository.
+pub fn in_repo(path: &Path) -> bool {
+    path.parent().is_some_and(|dir| repo_of(dir).is_some())
+}
+
+/// The nearest ancestor holding `.git`, which may be a directory or, in a
+/// worktree, a file.
+fn repo_of(start: &Path) -> Option<&Path> {
+    start.ancestors().find(|dir| dir.join(".git").exists())
 }
 
 /// Walks `root` on its own thread, streaming batches into `tx`. Returns the
@@ -98,6 +106,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_repository_is_recognised_from_anywhere_beneath_it() {
+        let root = scratch_dir("in-repo");
+        touch(&root.join(".git/HEAD"));
+        touch(&root.join("src/deep/file.rs"));
+        assert!(in_repo(&root.join("src/deep/file.rs")));
+        assert!(in_repo(&root.join("top.rs")));
+        assert_eq!(root_from(&root.join("src/deep")), root);
+
+        // A worktree's `.git` is a file, and counts the same.
+        let linked = scratch_dir("in-worktree");
+        fs::write(linked.join(".git"), b"gitdir: /elsewhere").unwrap();
+        touch(&linked.join("a.rs"));
+        assert!(in_repo(&linked.join("a.rs")));
+
+        let loose = scratch_dir("no-repo");
+        assert!(!in_repo(&loose.join("a.rs")));
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&linked).unwrap();
+        fs::remove_dir_all(&loose).unwrap();
     }
 
     fn touch(path: &Path) {

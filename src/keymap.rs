@@ -32,6 +32,8 @@ pub enum Action {
     Find,
     FindProject,
     GoToLine,
+    PrevChange,
+    NextChange,
     Left,
     Right,
     Up,
@@ -177,6 +179,13 @@ pub static KEYMAP: &[Section] = &[
                 "find in project",
             ),
             bind(&[ctrl(KeyCode::Char('g'))], Action::GoToLine, "go to line"),
+        ],
+    },
+    Section {
+        title: "changes",
+        bindings: &[
+            bind(&[alt(KeyCode::Up)], Action::PrevChange, "previous change"),
+            bind(&[alt(KeyCode::Down)], Action::NextChange, "next change"),
         ],
     },
     Section {
@@ -332,6 +341,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_change_jumps_read_as_alt_arrows_and_are_not_movement() {
+        assert_eq!(label(Action::NextChange), "Alt+↓");
+        assert_eq!(label(Action::PrevChange), "Alt+↑");
+        assert_eq!(find(Action::NextChange).what, "next change");
+        // Movement means shift extends a selection through it; jumping
+        // between hunks has no such reading.
+        assert!(!Action::NextChange.is_movement());
+        assert!(!Action::PrevChange.is_movement());
     }
 
     #[test]

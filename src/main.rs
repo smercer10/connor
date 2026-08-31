@@ -10,6 +10,7 @@ mod project;
 mod prompt;
 mod screen;
 mod search;
+mod syntax;
 mod tabs;
 mod term;
 mod tree;
@@ -670,7 +671,10 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 &mut scratch,
                 &notice,
                 status_caret,
-                search,
+                draw::Marks {
+                    search,
+                    syntax: &[],
+                },
                 tree.as_ref().map(|t| (t, tree_focus)),
             );
             if matches!(prompt, Some(Prompt::Help)) {

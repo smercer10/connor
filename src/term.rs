@@ -2,7 +2,7 @@ use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
 use crossterm::{Command as _, cursor, execute, terminal};
 
 use crate::screen::Screen;
@@ -15,6 +15,28 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 // move. crossterm parses SGR reports regardless of how tracking was enabled.
 const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+// `Cell::fg` codes to named colours, which crossterm writes as the base
+// SGRs 30-37/90-97 the terminal theme defines — no RGB assumptions.
+const FG_COLORS: [Color; 17] = [
+    Color::Reset,
+    Color::Black,
+    Color::DarkRed,
+    Color::DarkGreen,
+    Color::DarkYellow,
+    Color::DarkBlue,
+    Color::DarkMagenta,
+    Color::DarkCyan,
+    Color::Grey,
+    Color::DarkGrey,
+    Color::Red,
+    Color::Green,
+    Color::Yellow,
+    Color::Blue,
+    Color::Magenta,
+    Color::Cyan,
+    Color::White,
+];
 
 /// Puts the terminal back the way the shell expects it. Idempotent, so the
 /// panic hook, `Drop` and suspend can all call it without coordination, and
@@ -119,6 +141,7 @@ impl Terminal {
         }
         // Styles are toggled only when they change and always switched off
         // by frame end, so each frame starts from a known plain state.
+        let mut fg: u8 = 0;
         let mut reversed = false;
         let mut underlined = false;
         back.for_each_changed_run(front, |x, y, run| {
@@ -130,6 +153,11 @@ impl Terminal {
                 // The terminal advanced two columns at the leader; emitting
                 // anything for the continuation would shift the row.
                 if !cell.is_continuation() {
+                    if cell.fg() != fg {
+                        fg = cell.fg();
+                        let color = FG_COLORS[usize::from(fg).min(FG_COLORS.len() - 1)];
+                        let _ = SetForegroundColor(color).write_ansi(scratch);
+                    }
                     if cell.reversed() != reversed {
                         reversed = cell.reversed();
                         let attr = if reversed {
@@ -152,6 +180,9 @@ impl Terminal {
                 }
             }
         });
+        if fg != 0 {
+            let _ = SetForegroundColor(Color::Reset).write_ansi(scratch);
+        }
         if reversed {
             let _ = SetAttribute(Attribute::NoReverse).write_ansi(scratch);
         }
@@ -198,9 +229,9 @@ impl Terminal {
 
     fn reserve_scratch(&mut self) {
         let (width, height) = self.front.size();
-        // 32 bytes per cell: the glyph plus cursor moves and the reverse and
-        // underline toggles that can appear inside runs.
-        let target = usize::from(width) * usize::from(height) * 32 + 1024;
+        // 40 bytes per cell: the glyph plus cursor moves and the colour,
+        // reverse and underline toggles that can appear inside runs.
+        let target = usize::from(width) * usize::from(height) * 40 + 1024;
         self.scratch
             .reserve(target.saturating_sub(self.scratch.len()));
     }

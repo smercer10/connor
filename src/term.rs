@@ -100,10 +100,11 @@ impl Terminal {
 
     /// Diffs `back` against what is on screen and writes only the changed
     /// runs, wrapped in a synchronized update and flushed as a single write,
-    /// leaving the terminal cursor visible at `cursor`. Allocation-free:
-    /// everything is formatted into the reusable scratch buffer, whose
-    /// capacity is provisioned at construction and resize.
-    pub fn present(&mut self, back: &Screen, cursor: (u16, u16)) -> io::Result<()> {
+    /// leaving the terminal cursor visible at `cursor` — or hidden when
+    /// `None`: a focused tree sidebar has a selection bar, not a caret.
+    /// Allocation-free: everything is formatted into the reusable scratch
+    /// buffer, whose capacity is provisioned at construction and resize.
+    pub fn present(&mut self, back: &Screen, cursor: Option<(u16, u16)>) -> io::Result<()> {
         let Self {
             front,
             scratch,
@@ -157,8 +158,10 @@ impl Terminal {
         if underlined {
             let _ = SetAttribute(Attribute::NoUnderline).write_ansi(scratch);
         }
-        let _ = cursor::MoveTo(cursor.0, cursor.1).write_ansi(scratch);
-        let _ = cursor::Show.write_ansi(scratch);
+        if let Some((cx, cy)) = cursor {
+            let _ = cursor::MoveTo(cx, cy).write_ansi(scratch);
+            let _ = cursor::Show.write_ansi(scratch);
+        }
         let _ = terminal::EndSynchronizedUpdate.write_ansi(scratch);
         let mut out = io::stdout().lock();
         out.write_all(scratch.as_bytes())?;

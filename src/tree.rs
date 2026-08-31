@@ -73,6 +73,58 @@ fn tree_cmp(a: &Entry, b: &Entry) -> Ordering {
     }
 }
 
+/// Builds a whole entry list from scratch — the refresh path, which needs
+/// the complete picture to tell whether anything changed at all.
+fn build(files: Vec<String>) -> (Vec<Entry>, HashSet<String>) {
+    let mut dirs: HashSet<String> = HashSet::new();
+    for f in &files {
+        for (i, b) in f.bytes().enumerate() {
+            if b == SEP_B && !dirs.contains(&f[..i]) {
+                dirs.insert(f[..i].to_string());
+            }
+        }
+    }
+    let mut entries = Vec::with_capacity(files.len() + dirs.len());
+    entries.extend(dirs.iter().map(|d| Entry::new(d.clone(), true)));
+    for f in files {
+        entries.push(Entry::new(f, false));
+    }
+    entries.sort_unstable_by(tree_cmp);
+    (entries, dirs)
+}
+
+/// Merges two lists already sorted by `tree_cmp` into one.
+fn merge(a: Vec<Entry>, b: Vec<Entry>) -> Vec<Entry> {
+    if b.is_empty() {
+        return a;
+    }
+    if a.is_empty() {
+        return b;
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut a = a.into_iter().peekable();
+    let mut b = b.into_iter().peekable();
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => {
+                if tree_cmp(x, y) != Ordering::Greater {
+                    out.push(a.next().unwrap());
+                } else {
+                    out.push(b.next().unwrap());
+                }
+            }
+            (Some(_), None) => {
+                out.extend(a);
+                return out;
+            }
+            (None, _) => {
+                out.extend(b);
+                return out;
+            }
+        }
+    }
+}
+
 /// One row's worth of data for drawing; everything borrows from the tree.
 pub struct Row<'a> {
     pub name: &'a str,
@@ -88,8 +140,8 @@ pub struct Tree {
     generation: u64,
     cancel: Arc<AtomicBool>,
     walking: bool,
-    /// Every walked file path backing `entries`.
-    files: Vec<String>,
+    /// Every derived directory path — the dedupe for incremental inserts.
+    dirs: HashSet<String>,
     /// A refresh walk accumulates here and swaps in on its done batch, so
     /// the tree never shrinks and regrows on screen mid-walk.
     pending: Vec<String>,
@@ -123,7 +175,7 @@ impl Tree {
             generation,
             cancel,
             walking: true,
-            files: Vec::new(),
+            dirs: HashSet::new(),
             pending: Vec::new(),
             refreshing: false,
             rerun: false,
@@ -151,13 +203,21 @@ impl Tree {
                 return false;
             }
             self.refreshing = false;
-            self.files = std::mem::take(&mut self.pending);
-            let old = self.rebuild(text_h);
-            return self.entries != old;
+            let (entries, dirs) = build(std::mem::take(&mut self.pending));
+            if entries == self.entries {
+                return false;
+            }
+            let sel = self.selected_entry().map(|e| e.path.clone());
+            self.entries = entries;
+            self.dirs = dirs;
+            self.expanded.retain(|p| self.dirs.contains(p));
+            self.recompute_visible();
+            self.select_path_or_clamp(sel.as_deref());
+            self.ensure_visible(text_h);
+            return true;
         }
         self.walking = !batch.done;
-        self.files.extend(batch.paths);
-        self.rebuild(text_h);
+        self.insert(batch.paths, text_h);
         if self.reveal_pending && (self.reveal_active(text_h) || !self.walking) {
             self.reveal_pending = false;
         }
@@ -337,33 +397,30 @@ impl Tree {
             .position(|&i| self.entries[i as usize].path == path)
     }
 
-    /// Rebuilds `entries` from `files` and restores expansion and selection
-    /// by path, returning the replaced entries so a refresh can tell whether
-    /// anything changed. State mutation — allocation is fine here.
-    fn rebuild(&mut self, text_h: usize) -> Vec<Entry> {
+    /// Folds one walked batch into the sorted entries: only the batch is
+    /// sorted, then merged in — a streaming walk costs each batch its own
+    /// size, not a rebuild of everything so far. State mutation —
+    /// allocation is fine here, unlike drawing.
+    fn insert(&mut self, paths: Vec<String>, text_h: usize) {
         let sel = self.selected_entry().map(|e| e.path.clone());
-        let mut dirs: HashSet<&str> = HashSet::new();
-        for f in &self.files {
+        let mut new = Vec::with_capacity(paths.len());
+        for f in &paths {
             for (i, b) in f.bytes().enumerate() {
-                if b == SEP_B {
-                    dirs.insert(&f[..i]);
+                if b == SEP_B && !self.dirs.contains(&f[..i]) {
+                    self.dirs.insert(f[..i].to_string());
+                    new.push(Entry::new(f[..i].to_string(), true));
                 }
             }
         }
-        let mut entries = Vec::with_capacity(self.files.len() + dirs.len());
-        for d in &dirs {
-            entries.push(Entry::new(d.to_string(), true));
+        for f in paths {
+            new.push(Entry::new(f, false));
         }
-        for f in &self.files {
-            entries.push(Entry::new(f.clone(), false));
-        }
-        entries.sort_unstable_by(tree_cmp);
-        self.expanded.retain(|p| dirs.contains(p.as_str()));
-        let old = std::mem::replace(&mut self.entries, entries);
+        new.sort_unstable_by(tree_cmp);
+        let old = std::mem::take(&mut self.entries);
+        self.entries = merge(old, new);
         self.recompute_visible();
         self.select_path_or_clamp(sel.as_deref());
         self.ensure_visible(text_h);
-        old
     }
 
     /// Descendants sit contiguously after their parent, so one linear scan
@@ -424,6 +481,15 @@ impl Tree {
         } else if self.selected >= self.scroll + text_h {
             self.scroll = self.selected + 1 - text_h;
         }
+    }
+
+    /// The directories the tree currently derives, root-relative — the set
+    /// the sidebar's watcher mirrors.
+    pub fn dir_paths(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter(|e| e.dir)
+            .map(|e| e.path.as_str())
     }
 
     pub fn visible_len(&self) -> usize {
@@ -589,6 +655,20 @@ mod tests {
             assert!(matches!(t.key(&press(code), H), Outcome::Pending));
         }
         assert_eq!(t.visible_len(), 0);
+    }
+
+    #[test]
+    fn later_batches_merge_into_place_and_the_selection_follows_its_path() {
+        let mut t = Tree::new(PathBuf::from("/r"), 1, Arc::new(AtomicBool::new(false)));
+        assert!(t.absorb(batch(1, &["src/z.rs", "b.txt"], false), H));
+        t.key(&press(KeyCode::Down), H);
+        assert_eq!(selected_name(&t), "b.txt");
+        assert!(t.absorb(batch(1, &["src/a.rs", "a.txt"], true), H));
+        assert_eq!(selected_name(&t), "b.txt");
+        t.key(&press(KeyCode::Up), H);
+        t.key(&press(KeyCode::Up), H);
+        t.key(&press(KeyCode::Enter), H);
+        assert_eq!(shown(&t), ["src/", "  a.rs", "  z.rs", "a.txt", "b.txt"]);
     }
 
     #[test]

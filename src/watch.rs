@@ -131,36 +131,58 @@ impl Refresh {
     }
 }
 
-/// Watches the whole project root while the tree sidebar is open, feeding
-/// the same `Fs` events the reload path consumes. Dot-directories are
-/// dropped in the callback — `.git` churns on every git command, and that
-/// noise dies off the main thread. Events from ignored build directories
-/// still arrive; the refresh window absorbs them, and a re-walk that finds
-/// the same files changes nothing on screen. Dropping the watcher unwatches.
-pub struct RootWatcher {
-    _inner: RecommendedWatcher,
+/// Watches the tree sidebar's directories, one by one and non-recursively,
+/// feeding the same `Fs` events the reload path consumes. The set mirrors
+/// the tree itself — the root plus every directory it derives — so ignored
+/// trees (`target/`, `.git`) are never watched at all: no setup crawl over
+/// directories the sidebar will never show, and no event storms from
+/// builds. A file landing in a brand-new directory chain still fires in
+/// its watched ancestor, and the refresh walk then derives the new
+/// directories for the next sync. Dropping the watcher unwatches.
+pub struct TreeWatcher {
+    inner: RecommendedWatcher,
+    dirs: HashSet<PathBuf>,
 }
 
-impl RootWatcher {
-    pub fn new(root: &Path, tx: Sender<AppEvent>) -> notify::Result<RootWatcher> {
-        let base = root.components().count();
-        let mut inner = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+impl TreeWatcher {
+    pub fn new(tx: Sender<AppEvent>) -> notify::Result<TreeWatcher> {
+        let inner = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             if matches!(ev.kind, EventKind::Access(_)) {
                 return;
             }
             for path in ev.paths {
+                // Dotfiles are hidden from the tree, so their churn (swap
+                // files, lockfiles) can't change it; dropped off the main
+                // thread.
                 let hidden = path
-                    .components()
-                    .skip(base)
-                    .any(|c| c.as_os_str().as_encoded_bytes().starts_with(b"."));
+                    .file_name()
+                    .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."));
                 if !hidden && tx.send(AppEvent::Fs(path)).is_err() {
                     return;
                 }
             }
         })?;
-        inner.watch(root, RecursiveMode::Recursive)?;
-        Ok(RootWatcher { _inner: inner })
+        Ok(TreeWatcher {
+            inner,
+            dirs: HashSet::new(),
+        })
+    }
+
+    /// Reconciles the watched set with the tree's directories. Watch and
+    /// unwatch failures are ignored — a directory that can't be watched
+    /// (inotify limits, say) just gets no auto-refresh.
+    pub fn sync(&mut self, desired: HashSet<PathBuf>) {
+        if desired == self.dirs {
+            return;
+        }
+        for dir in self.dirs.difference(&desired) {
+            let _ = self.inner.unwatch(dir);
+        }
+        for dir in desired.difference(&self.dirs) {
+            let _ = self.inner.watch(dir, RecursiveMode::NonRecursive);
+        }
+        self.dirs = desired;
     }
 }
 

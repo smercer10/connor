@@ -36,7 +36,7 @@ use search::SearchPrompt;
 use tabs::{Tab, Tabs};
 use term::Terminal;
 use tree::Tree;
-use watch::{AppEvent, Debounce, DirWatcher, Refresh, RootWatcher};
+use watch::{AppEvent, Debounce, DirWatcher, Refresh, TreeWatcher};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
@@ -590,9 +590,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     let mut walk_gen: u64 = 0;
     let mut tree: Option<Tree> = None;
     let mut tree_focus = false;
-    // Never read — held only so dropping it stops the recursive watch when
-    // the sidebar closes.
-    let mut _root_watch: Option<RootWatcher> = None;
+    let mut tree_watch: Option<TreeWatcher> = None;
     let mut refresh = Refresh::default();
     let mut redraw = true;
 
@@ -626,7 +624,11 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             if let Some(Prompt::Pick(edit)) = &prompt {
                 cursor = draw::draw_picker(&mut back, edit, &mut scratch);
             }
-            terminal.present(&back, cursor)?;
+            // A focused sidebar shows focus as its selection bar; a blinking
+            // caret there would promise typing the tree can't accept.
+            let caret = (!(tree_focus && draw::tree_width(tree.is_some(), back.size().0) > 0))
+                .then_some(cursor);
+            terminal.present(&back, caret)?;
         }
         redraw = true;
 
@@ -692,6 +694,18 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             }
             Ok(AppEvent::Files(batch)) => {
                 redraw = absorb_files(&mut prompt, &mut tree, batch, text_h);
+                // A finished walk settled the directory set; mirror it into
+                // the watcher.
+                if let Some(t) = &tree
+                    && let Some(w) = &mut tree_watch
+                    && !t.busy()
+                {
+                    w.sync(
+                        std::iter::once(root.clone())
+                            .chain(t.dir_paths().map(|d| root.join(d)))
+                            .collect(),
+                    );
+                }
                 // A change arrived mid-refresh; follow up now the tree idles.
                 if let Some(t) = &mut tree
                     && t.rerun
@@ -810,7 +824,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             Action::ToggleTree => match tree.take() {
                                 Some(t) => {
                                     t.dismiss();
-                                    _root_watch = None;
+                                    tree_watch = None;
                                     tree_focus = false;
                                     refresh = Refresh::default();
                                 }
@@ -822,11 +836,13 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                     t.set_active(tabs.active().doc.path());
                                     tree = Some(t);
                                     tree_focus = true;
-                                    // Losing the recursive watch (inotify
-                                    // limits, say) costs auto-refresh, not
-                                    // the tree.
-                                    match RootWatcher::new(&root, tx.clone()) {
-                                        Ok(w) => _root_watch = Some(w),
+                                    // Losing the watcher (inotify limits,
+                                    // say) costs auto-refresh, not the tree.
+                                    match TreeWatcher::new(tx.clone()) {
+                                        Ok(mut w) => {
+                                            w.sync(std::iter::once(root.clone()).collect());
+                                            tree_watch = Some(w);
+                                        }
                                         Err(e) => {
                                             let _ = write!(
                                                 notice,

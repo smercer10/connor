@@ -53,7 +53,8 @@ pub fn tree_width(open: bool, screen_w: u16) -> usize {
 /// `status_caret` parks the cursor after that many of the notice's chars
 /// while a prompt is editing there. `search` underlines every match and
 /// reverses the current one. An open `tree` sidebar shifts the gutter and
-/// text right; when it holds focus, the cursor parks on its selection.
+/// text right; its focus is the selection bar — the caller hides the
+/// terminal cursor while the tree holds it.
 pub fn draw(
     screen: &mut Screen,
     tabs: &Tabs,
@@ -201,11 +202,6 @@ pub fn draw(
         && let Some((tree, focused)) = tree
     {
         draw_tree(screen, tree, focused, tree_w);
-        // A focused tree parks the cursor on its selection; a mini-prompt
-        // editing in the status line still wins below.
-        if focused && status_caret.is_none() {
-            return tree_cursor(tree, tree_w, text_h, width, height);
-        }
     }
     if let Some(chars) = status_caret {
         let col: usize = notice.chars().take(chars).map(char_cols).sum();
@@ -263,21 +259,6 @@ fn draw_tree(screen: &mut Screen, tree: &Tree, focused: bool, tree_w: usize) {
             }
         }
     }
-}
-
-/// The screen cell a focused tree parks the cursor on: its selection's
-/// name, clamped inside the sidebar.
-fn tree_cursor(tree: &Tree, tree_w: usize, text_h: usize, width: usize, height: u16) -> (u16, u16) {
-    let scroll = tree.scroll().min(tree.visible_len().saturating_sub(1));
-    if tree.visible_len() == 0 || text_h == 0 {
-        return (0, 1.min(height - 1));
-    }
-    let i = tree.selected().min(tree.visible_len() - 1);
-    let inner = tree_w - 1;
-    let indent = (tree.row(i).depth * 2).min(inner.saturating_sub(8));
-    let cx = (indent + 2).min(width - 1) as u16;
-    let cy = (1 + i.saturating_sub(scroll).min(text_h - 1)).min(usize::from(height) - 1) as u16;
-    (cx, cy)
 }
 
 /// Draws `text` within `avail` columns starting at `x`. One that doesn't
@@ -1295,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_focused_tree_reverses_its_selection_and_parks_the_cursor() {
+    fn a_focused_tree_reverses_its_selection_and_the_cursor_stays_put() {
         let tabs = tabs_of(Document::from_str("hello"), View::default());
         let mut scratch = String::new();
         let tree = tree_of(TREE_PATHS, true);
@@ -1325,7 +1306,9 @@ mod tests {
         let sel = sel_row(&focused, 1);
         assert!(sel[..29].contains('#'), "selection not reversed: {sel}");
         assert!(!sel_row(&focused, 2).contains('#'));
-        assert_eq!(cursor, (2, 1));
+        // The selection bar is the focus cue; the returned cursor stays in
+        // the text area, and the caller hides it while the tree is focused.
+        assert_eq!(cursor, (32, 1));
     }
 
     #[test]

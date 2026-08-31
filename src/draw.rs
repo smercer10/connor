@@ -7,6 +7,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::doc::Document;
 use crate::grapheme::{self, RopeGraphemes};
+use crate::grep::{Grep, Row};
 use crate::keymap;
 use crate::picker::Picker;
 use crate::screen::Screen;
@@ -331,26 +332,7 @@ pub fn draw_help(screen: &mut Screen, scratch: &mut String) {
     let x0 = (width - box_w) / 2;
     let y0 = 1 + (text_h - box_h) / 2;
 
-    // A fresh cell per footprint position also clears the reverse and
-    // underline flags of whatever the box covers.
-    for y in y0..y0 + box_h {
-        for x in x0..x0 + box_w {
-            let edge_x = x == x0 || x == x0 + box_w - 1;
-            let edge_y = y == y0 || y == y0 + box_h - 1;
-            let ch = match (edge_x, edge_y) {
-                (true, true) => match (x == x0, y == y0) {
-                    (true, true) => '┌',
-                    (false, true) => '┐',
-                    (true, false) => '└',
-                    (false, false) => '┘',
-                },
-                (true, false) => '│',
-                (false, true) => '─',
-                (false, false) => ' ',
-            };
-            screen.set(x as u16, y as u16, ch);
-        }
-    }
+    overlay_box(screen, x0, y0, box_w, box_h);
 
     let geom = HelpGeom {
         x0,
@@ -412,6 +394,30 @@ fn help_row(screen: &mut Screen, g: &HelpGeom, i: usize, text: &str, underline: 
     }
 }
 
+/// Paints a centered overlay's border and blank interior. A fresh cell per
+/// footprint position also clears the reverse and underline flags of
+/// whatever the box covers.
+fn overlay_box(screen: &mut Screen, x0: usize, y0: usize, box_w: usize, box_h: usize) {
+    for y in y0..y0 + box_h {
+        for x in x0..x0 + box_w {
+            let edge_x = x == x0 || x == x0 + box_w - 1;
+            let edge_y = y == y0 || y == y0 + box_h - 1;
+            let ch = match (edge_x, edge_y) {
+                (true, true) => match (x == x0, y == y0) {
+                    (true, true) => '┌',
+                    (false, true) => '┐',
+                    (true, false) => '└',
+                    (false, false) => '┘',
+                },
+                (true, false) => '│',
+                (false, true) => '─',
+                (false, false) => ' ',
+            };
+            screen.set(x as u16, y as u16, ch);
+        }
+    }
+}
+
 /// Widest the picker box grows: deep paths still fit, and a wide terminal
 /// keeps its margins.
 const PICK_MAX_W: usize = 80;
@@ -441,26 +447,7 @@ pub fn draw_picker(screen: &mut Screen, picker: &Picker, scratch: &mut String) -
     let x0 = (width - box_w) / 2;
     let y0 = 1 + (text_h - box_h) / 2;
 
-    // A fresh cell per footprint position also clears the reverse and
-    // underline flags of whatever the box covers.
-    for y in y0..y0 + box_h {
-        for x in x0..x0 + box_w {
-            let edge_x = x == x0 || x == x0 + box_w - 1;
-            let edge_y = y == y0 || y == y0 + box_h - 1;
-            let ch = match (edge_x, edge_y) {
-                (true, true) => match (x == x0, y == y0) {
-                    (true, true) => '┌',
-                    (false, true) => '┐',
-                    (true, false) => '└',
-                    (false, false) => '┘',
-                },
-                (true, false) => '│',
-                (false, true) => '─',
-                (false, false) => ' ',
-            };
-            screen.set(x as u16, y as u16, ch);
-        }
-    }
+    overlay_box(screen, x0, y0, box_w, box_h);
 
     let avail = box_w.saturating_sub(4);
     let query_y = (y0 + 1) as u16;
@@ -502,6 +489,100 @@ pub fn draw_picker(screen: &mut Screen, picker: &Picker, scratch: &mut String) -
         if rank == picker.selected() {
             for x in x0 + 1..x0 + box_w.saturating_sub(1) {
                 screen.set_reversed(x as u16, y, true);
+            }
+        }
+    }
+
+    (caret.min(width.saturating_sub(1)) as u16, query_y)
+}
+
+/// Draws the project-search overlay: the picker's box with the query on its
+/// top row beside the hit count, hits below grouped under underlined file
+/// headers, the selected hit in reverse video. Drawn after `draw`, straight
+/// over the text; the tab bar and status line stay visible. Returns the
+/// cursor cell at the query's caret. Every cell write bounds-checks, so a
+/// screen too small for the box clips it instead of panicking.
+pub fn draw_grep(screen: &mut Screen, grep: &Grep, scratch: &mut String) -> (u16, u16) {
+    let (width, height) = screen.size();
+    let width = usize::from(width);
+    let text_h = text_height(height);
+
+    let box_w = if width > PICK_MAX_W + 4 {
+        PICK_MAX_W
+    } else {
+        width
+    };
+    let visible = PICK_ROWS.min(text_h.saturating_sub(3));
+    let box_h = (visible + 3).min(text_h);
+    let x0 = (width - box_w) / 2;
+    let y0 = 1 + (text_h - box_h) / 2;
+
+    overlay_box(screen, x0, y0, box_w, box_h);
+
+    let avail = box_w.saturating_sub(4);
+    let query_y = (y0 + 1) as u16;
+
+    // The hit count sits at the interior's right edge: `+` marks the cap
+    // ending the search early, a trailing ellipsis one still running.
+    scratch.clear();
+    let _ = write!(scratch, "{}", grep.hit_count());
+    if grep.truncated() {
+        scratch.push('+');
+    }
+    scratch.push_str(" hits");
+    if grep.searching() {
+        scratch.push('…');
+    }
+    let count_w = scratch.chars().count();
+    let counted = box_h >= 3 && avail >= count_w + 5;
+    if counted {
+        screen.set_text((x0 + 2 + avail - count_w) as u16, query_y, scratch);
+    }
+
+    let mut caret = x0 + 2;
+    if box_h >= 3 {
+        screen.set_text(caret as u16, query_y, "> ");
+        caret += 2;
+        let budget = avail
+            .saturating_sub(2)
+            .saturating_sub(if counted { count_w + 1 } else { 0 });
+        caret += draw_tail(screen, caret, query_y, grep.query(), budget);
+    }
+
+    // Stateless scroll: the selected hit stays visible, pinned to the
+    // bottom edge once it runs past the box.
+    let top = if visible > 0 && grep.hit_count() > 0 {
+        grep.selected_display_row().saturating_sub(visible - 1)
+    } else {
+        0
+    };
+    for k in 0..visible.min(grep.display_len().saturating_sub(top)) {
+        let y = (y0 + 2 + k) as u16;
+        match grep.row(top + k) {
+            Row::File(path) => {
+                let drawn = draw_tail(screen, x0 + 2, y, path, avail);
+                for c in 0..drawn {
+                    screen.set_underlined((x0 + 2 + c) as u16, y, true);
+                }
+            }
+            Row::Hit {
+                line,
+                preview,
+                selected,
+            } => {
+                scratch.clear();
+                let _ = write!(scratch, "  {line}: ");
+                // Every prefix glyph is one column wide.
+                let head = scratch.chars().count();
+                if head < avail {
+                    screen.set_text((x0 + 2) as u16, y, scratch);
+                    draw_head(screen, x0 + 2 + head, y, preview, avail - head);
+                }
+                if selected {
+                    for x in x0 + 1..x0 + box_w.saturating_sub(1) {
+                        screen.set_reversed(x as u16, y, true);
+                    }
+                }
             }
         }
     }
@@ -1234,6 +1315,131 @@ mod tests {
         assert!(!listing.contains("a/very"), "head kept: {listing}");
     }
 
+    fn grep_of(files: &[(&str, &[(u32, &str)])], query: &str, done: bool) -> Grep {
+        let mut grep = Grep::new(PathBuf::from("/r"));
+        for ch in query.chars() {
+            grep.key(
+                &crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(ch),
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                std::time::Instant::now(),
+            );
+        }
+        grep.begin(1, Default::default());
+        grep.absorb(crate::grep::HitBatch {
+            generation: 1,
+            files: files
+                .iter()
+                .map(|(path, hits)| crate::grep::FileHits {
+                    path: path.to_string(),
+                    hits: hits
+                        .iter()
+                        .map(|(line, text)| crate::grep::Hit {
+                            line: *line,
+                            col: 0,
+                            preview: text.to_string(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            done,
+            truncated: false,
+        });
+        grep
+    }
+
+    const GREP_FILES: &[(&str, &[(u32, &str)])] = &[
+        ("src/a.rs", &[(3, "let se = 1;"), (9, "se again")]),
+        ("b.rs", &[(1, "sea")]),
+    ];
+
+    #[test]
+    fn grep_overlay_shows_query_count_headers_and_hits() {
+        let tabs = tabs_of(Document::from_str("text"), View::default());
+        let mut screen = Screen::new(40, 14);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        let grep = grep_of(GREP_FILES, "se", false);
+        let cursor = draw_grep(&mut screen, &grep, &mut scratch);
+
+        let query = row(&screen, 2);
+        assert!(query.contains("> se"), "query missing: {query}");
+        assert!(query.contains("3 hits…"), "count missing: {query}");
+        assert_eq!(cursor, (6, 2));
+        assert!(row(&screen, 3).contains("src/a.rs"));
+        assert!(ul_row(&screen, 3).contains('_'), "header not underlined");
+        assert!(row(&screen, 4).contains("3: let se = 1;"));
+        assert!(row(&screen, 5).contains("9: se again"));
+        assert!(row(&screen, 6).contains("b.rs"));
+        assert!(row(&screen, 7).contains("1: sea"));
+        assert!(!ul_row(&screen, 4).contains('_'), "hit row underlined");
+    }
+
+    #[test]
+    fn grep_overlay_marks_a_capped_finished_search() {
+        let tabs = tabs_of(Document::from_str("text"), View::default());
+        let mut screen = Screen::new(40, 14);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        let mut grep = grep_of(GREP_FILES, "se", false);
+        grep.absorb(crate::grep::HitBatch {
+            generation: 1,
+            files: Vec::new(),
+            done: true,
+            truncated: true,
+        });
+        draw_grep(&mut screen, &grep, &mut scratch);
+        let query = row(&screen, 2);
+        assert!(query.contains("3+ hits"), "cap missing: {query}");
+        assert!(!query.contains('…'), "finished search still streaming");
+    }
+
+    #[test]
+    fn grep_overlay_reverses_only_the_selected_hit_row() {
+        let tabs = tabs_of(Document::from_str("text"), View::default());
+        let mut screen = Screen::new(40, 14);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        let mut grep = grep_of(GREP_FILES, "se", true);
+        grep.key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            std::time::Instant::now(),
+        );
+        draw_grep(&mut screen, &grep, &mut scratch);
+
+        // The second hit sits on row 5; headers never take the bar.
+        assert!(!sel_row(&screen, 3).contains('#'));
+        assert!(!sel_row(&screen, 4).contains('#'));
+        assert!(sel_row(&screen, 5).contains('#'));
+        assert!(!sel_row(&screen, 6).contains('#'));
+    }
+
+    #[test]
+    fn grep_overlay_truncates_paths_to_their_tail_and_previews_to_their_head() {
+        let tabs = tabs_of(Document::from_str(""), View::default());
+        let mut screen = Screen::new(20, 10);
+        let mut scratch = String::new();
+        draw(&mut screen, &tabs, &mut scratch, "", None, None, None);
+        let files: &[(&str, &[(u32, &str)])] = &[(
+            "a/very/deep/nested/path/name.rs",
+            &[(12, "a preview far too long to fit")],
+        )];
+        let grep = grep_of(files, "q", true);
+        draw_grep(&mut screen, &grep, &mut scratch);
+
+        let header = row(&screen, 3);
+        assert!(header.contains('…'), "no ellipsis: {header}");
+        assert!(header.contains("name.rs"), "tail lost: {header}");
+        let hit = row(&screen, 4);
+        assert!(hit.contains("12: a preview"), "head lost: {hit}");
+        assert!(hit.contains('…'), "no ellipsis: {hit}");
+        assert!(!hit.contains("fit"), "tail kept: {hit}");
+    }
+
     fn tree_of(paths: &[&str], done: bool) -> Tree {
         let mut tree = Tree::new(PathBuf::from("/r"), 1, Default::default());
         tree.absorb(
@@ -1441,6 +1647,20 @@ mod tests {
             let mut full = picker_of(&["日本/長いファイル名.rs", "b.rs"], true);
             press(&mut full, crossterm::event::KeyCode::Down);
             draw_picker(&mut screen, &full, &mut scratch);
+            draw_grep(&mut screen, &grep_of(&[], "", false), &mut scratch);
+            let wide: &[(&str, &[(u32, &str)])] = &[
+                ("日本/長いファイル名.rs", &[(1, "日本語のプレビュー")]),
+                ("b.rs", &[(2, "x")]),
+            ];
+            let mut gfull = grep_of(wide, "日本", true);
+            gfull.key(
+                &crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Down,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                std::time::Instant::now(),
+            );
+            draw_grep(&mut screen, &gfull, &mut scratch);
             let mut tabs = Tabs::new(vec![
                 named("aa.rs", "日本"),
                 dirtied(named("bb.rs", "text")),

@@ -1,4 +1,5 @@
 mod clip;
+mod compare;
 mod diff;
 mod doc;
 mod draw;
@@ -29,6 +30,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 
+use compare::Compare;
 use doc::{Caret, DiskCheck, Document};
 use grep::Grep;
 use journal::{Journal, Recovered};
@@ -684,13 +686,20 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     let mut walk_gen: u64 = 0;
     let mut tree: Option<Tree> = None;
     let mut tree_focus = false;
+    let mut compare: Option<Compare> = None;
+    // The last frame's answer to whether a pane cut a line off: what
+    // bounds scrolling the view right, since nothing else knows how wide a
+    // line is without walking it.
+    let mut compare_clipped = false;
     let mut tree_watch: Option<TreeWatcher> = None;
     let mut refresh = Refresh::default();
     let mut head_refresh = Refresh::default();
     let mut redraw = true;
 
     loop {
-        let mut follow_cursor = true;
+        // The view never moves the cursor, and snapping the hidden buffer
+        // to it is how closing would fail to land where it left.
+        let mut follow_cursor = compare.is_none();
         if redraw {
             // The highlighter catches the tree up with the document and the
             // final viewport before the scene reads its spans; a quiet
@@ -708,6 +717,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     syntax.refresh(doc, view.scroll_line, text_h);
                 }
                 diff.pump(doc, &tx);
+                if let Some(c) = &mut compare {
+                    c.sync(doc, diff, draw::compare_rows(text_h));
+                }
             }
             back.clear();
             let status_caret = match &prompt {
@@ -737,6 +749,10 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 },
                 tree.as_ref().map(|t| (t, tree_focus)),
             );
+            compare_clipped = match &compare {
+                Some(c) => draw::draw_compare(&mut back, c, &tabs.active().doc, &mut scratch),
+                None => false,
+            };
             if matches!(prompt, Some(Prompt::Help)) {
                 draw::draw_help(&mut back, &mut scratch);
             }
@@ -746,10 +762,12 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             if let Some(Prompt::Grep(edit)) = &prompt {
                 cursor = draw::draw_grep(&mut back, edit, &mut scratch);
             }
-            // A focused sidebar shows focus as its selection bar; a blinking
-            // caret there would promise typing the tree can't accept.
-            let caret = (!(tree_focus && draw::tree_width(tree.is_some(), back.size().0) > 0))
-                .then_some(cursor);
+            // A focused sidebar shows focus as its selection bar, and the
+            // diff view accepts no typing at all; a blinking caret in
+            // either would promise an edit that can't land.
+            let hidden = compare.is_some()
+                || (tree_focus && draw::tree_width(tree.is_some(), back.size().0) > 0);
+            let caret = (!hidden).then_some(cursor);
             terminal.present(&back, caret)?;
         }
         redraw = true;
@@ -887,6 +905,13 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             }
             Ok(AppEvent::Diffed(done)) => {
                 redraw = absorb_diff(tabs, done, &tx);
+                // The marks may be the same empty list they already were —
+                // a clean file's are — while the baseline the view stands
+                // the buffer against has only just arrived.
+                if let Some(c) = &compare {
+                    let Tab { doc, diff, .. } = tabs.active();
+                    redraw |= c.stale(doc, diff);
+                }
             }
             Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 // A pending prompt owns the key; the loop tail still runs,
@@ -896,6 +921,19 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     prompt = next;
                     if quit {
                         break;
+                    }
+                } else if let Some(c) = &mut compare
+                    // Chords stay global here too: save, quit and tab
+                    // switching all work with the view up, and so does the
+                    // toggle that closes it.
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    notice.clear();
+                    match c.key(&key, draw::compare_rows(text_h), compare_clipped) {
+                        compare::Outcome::Pending => {}
+                        compare::Outcome::Close => compare = None,
                     }
                 } else if let Some(t) = &mut tree
                     && tree_focus
@@ -990,6 +1028,18 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                 prompt =
                                     open_prompt(Prompt::GoTo(LinePrompt::new()), doc, &mut notice);
                             }
+                            // The view walks its own changes; there is no
+                            // cursor in it to carry the jump.
+                            Action::PrevChange | Action::NextChange if compare.is_some() => {
+                                let rows = draw::compare_rows(text_h);
+                                if let Some(c) = &mut compare {
+                                    if action == Action::NextChange {
+                                        c.next_change(rows);
+                                    } else {
+                                        c.prev_change(rows);
+                                    }
+                                }
+                            }
                             Action::PrevChange | Action::NextChange => {
                                 // Not classified as movement: a hunk jump has
                                 // no shift-extends-selection reading.
@@ -1019,6 +1069,26 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             }
                             Action::Help => {
                                 prompt = open_prompt(Prompt::Help, doc, &mut notice);
+                            }
+                            Action::ToggleDiff => {
+                                if compare.take().is_none() {
+                                    match compare::refusal(doc, diff) {
+                                        // A line in the status beats a
+                                        // full-screen view of nothing.
+                                        Some(why) => notice.push_str(why),
+                                        None => {
+                                            let line = view.line(doc);
+                                            doc.break_undo_group();
+                                            compare = Some(Compare::new(
+                                                doc,
+                                                diff,
+                                                line,
+                                                draw::compare_rows(text_h),
+                                            ));
+                                            tree_focus = false;
+                                        }
+                                    }
+                                }
                             }
                             Action::ToggleTree => match tree.take() {
                                 Some(t) => {
@@ -1124,9 +1194,12 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             Action::Backspace => view.backspace(doc),
                             Action::Delete => view.delete(doc),
                         }
-                        // A prompt owns the keys now; the tree yields.
+                        // A prompt owns the keys now; the tree yields, and
+                        // so does the view — it covers the body a search or
+                        // a confirmation needs to be read against.
                         if prompt.is_some() {
                             tree_focus = false;
+                            compare = None;
                         }
                     } else if let KeyCode::Char(ch) = key.code
                         // Alt-modified letters are terminal escape chords, not
@@ -1170,7 +1243,11 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                         } else {
                             WHEEL_LINES as isize
                         };
-                        if usize::from(m.column) < tree_w {
+                        if let Some(c) = &mut compare {
+                            // The view has one scroll position, so both
+                            // panes move together wherever the pointer is.
+                            c.scroll_by(delta, draw::compare_rows(text_h));
+                        } else if usize::from(m.column) < tree_w {
                             if let Some(t) = &mut tree {
                                 t.scroll_by(delta, text_h);
                             }
@@ -1184,7 +1261,8 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     // row: a file opens, a directory toggles. Like a text
                     // click it accepts an open search and nothing else.
                     MouseEventKind::Down(MouseButton::Left)
-                        if usize::from(m.column) < tree_w
+                        if compare.is_none()
+                            && usize::from(m.column) < tree_w
                             && (1..=text_h).contains(&usize::from(m.row))
                             && matches!(prompt, None | Some(Prompt::Search(_))) =>
                     {
@@ -1202,9 +1280,12 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     // A click while searching accepts the search — the
                     // viewport and cursor stay — then lands like any click.
                     // The other prompts keep the screen: a stray click must
-                    // not dismiss a save confirmation.
+                    // not dismiss a save confirmation. The diff view keeps
+                    // it too and eats the click: it shows, the buffer is
+                    // where you edit, and closing lands where it left.
                     MouseEventKind::Down(MouseButton::Left)
-                        if (1..=text_h).contains(&usize::from(m.row))
+                        if compare.is_none()
+                            && (1..=text_h).contains(&usize::from(m.row))
                             && matches!(prompt, None | Some(Prompt::Search(_))) =>
                     {
                         prompt = None;
@@ -1237,7 +1318,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             tabs.activate(i);
                         }
                     }
-                    MouseEventKind::Drag(MouseButton::Left) if prompt.is_none() && !tree_focus => {
+                    MouseEventKind::Drag(MouseButton::Left)
+                        if prompt.is_none() && !tree_focus && compare.is_none() =>
+                    {
                         let gutter_w = draw::gutter_width(tabs.active());
                         let Tab { doc, view, .. } = tabs.active_mut();
                         view.drag(doc, tree_w + gutter_w, text_h, m.column, m.row);

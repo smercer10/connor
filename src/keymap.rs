@@ -34,6 +34,7 @@ pub enum Action {
     GoToLine,
     PrevChange,
     NextChange,
+    ToggleDiff,
     Left,
     Right,
     Up,
@@ -186,6 +187,11 @@ pub static KEYMAP: &[Section] = &[
         bindings: &[
             bind(&[alt(KeyCode::Up)], Action::PrevChange, "previous change"),
             bind(&[alt(KeyCode::Down)], Action::NextChange, "next change"),
+            bind(
+                &[alt(KeyCode::Char('d'))],
+                Action::ToggleDiff,
+                "diff against HEAD",
+            ),
         ],
     },
     Section {
@@ -352,6 +358,20 @@ mod tests {
         // between hunks has no such reading.
         assert!(!Action::NextChange.is_movement());
         assert!(!Action::PrevChange.is_movement());
+    }
+
+    #[test]
+    fn the_diff_toggle_joins_the_change_family() {
+        assert_eq!(label(Action::ToggleDiff), "Alt+D");
+        assert_eq!(find(Action::ToggleDiff).what, "diff against HEAD");
+        // Its own section, beside the jumps that walk what it shows.
+        let section = KEYMAP
+            .iter()
+            .find(|s| s.bindings.iter().any(|b| b.action == Action::ToggleDiff))
+            .unwrap();
+        assert_eq!(section.title, "changes");
+        // Nothing to extend with shift, and no cursor to extend from.
+        assert!(!Action::ToggleDiff.is_movement());
     }
 
     #[test]

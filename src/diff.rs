@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::io::Read as _;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -22,7 +23,7 @@ use crate::watch::AppEvent;
 
 /// Buffers and HEAD blobs past this get no marks at all: a file this size
 /// is generated, not reviewed, and `grep` caps a searched file the same way.
-const MAX_LEN: usize = 4 << 20;
+pub const MAX_LEN: usize = 4 << 20;
 
 /// Buffers under this re-diff on the event path; bigger ones go to a worker
 /// so no frame blocks on one. Measured, not guessed: a histogram diff of
@@ -30,6 +31,10 @@ const MAX_LEN: usize = 4 << 20;
 /// release, so 256 KiB is ~4 ms — comfortably inside a frame that also has
 /// a reparse to pay for, and every keystroke pays it.
 const SYNC_DIFF_LIMIT: usize = 256 * 1024;
+
+/// The bar marking a row whose content differs — in the gutter's one
+/// column, and in each pane of the side-by-side view.
+pub const BAR: char = '▍';
 
 /// What a marked row says about HEAD.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,7 +53,7 @@ impl Change {
     /// removed lines left for content that isn't.
     pub fn glyph(self) -> char {
         match self {
-            Change::Added | Change::Changed => '▍',
+            Change::Added | Change::Changed => BAR,
             Change::RemovedAbove => '▔',
             Change::RemovedBelow => '▁',
         }
@@ -74,6 +79,25 @@ pub struct Hunk {
     pub start: usize,
     pub end: usize,
     pub kind: Change,
+    /// The HEAD lines this hunk replaced, empty for a pure insertion. The
+    /// gutter has one column and no use for them; `bands` needs them to
+    /// stand the two texts side by side.
+    pub head_start: usize,
+    pub head_end: usize,
+}
+
+impl Hunk {
+    /// The buffer lines the hunk actually covers. `start..end` is a mark
+    /// range, and for a removal it is a synthetic one-row marker on the
+    /// edge the lines left — the run itself is empty, at `start` when the
+    /// gap closed inside the buffer and past `end` when it ran off the end.
+    fn buffer(&self) -> Range<usize> {
+        match self.kind {
+            Change::Added | Change::Changed => self.start..self.end,
+            Change::RemovedAbove => self.start..self.start,
+            Change::RemovedBelow => self.end..self.end,
+        }
+    }
 }
 
 /// The lines of a rope without their terminators. Stripping them is what
@@ -108,7 +132,7 @@ impl<'a> TokenSource for Lines<'a> {
 
 /// The line without its `\n` or `\r\n`, the way `Document::line_end` bounds
 /// a line.
-fn strip_terminator(line: RopeSlice<'_>) -> RopeSlice<'_> {
+pub fn strip_terminator(line: RopeSlice<'_>) -> RopeSlice<'_> {
     let mut end = line.len_chars();
     if end > 0 && line.char(end - 1) == '\n' {
         end -= 1;
@@ -135,28 +159,107 @@ pub fn hunks(head: &Rope, buffer: &Rope) -> Vec<Hunk> {
     diff.hunks()
         .map(|hunk| {
             let (start, end) = (hunk.after.start as usize, hunk.after.end as usize);
-            if !hunk.after.is_empty() {
+            let (head_start, head_end) = (hunk.before.start as usize, hunk.before.end as usize);
+            let (start, end, kind) = if !hunk.after.is_empty() {
                 let kind = if hunk.before.is_empty() {
                     Change::Added
                 } else {
                     Change::Changed
                 };
-                Hunk { start, end, kind }
+                (start, end, kind)
             } else if start > last {
-                Hunk {
-                    start: last,
-                    end: last + 1,
-                    kind: Change::RemovedBelow,
-                }
+                (last, last + 1, Change::RemovedBelow)
             } else {
-                Hunk {
-                    start,
-                    end: start + 1,
-                    kind: Change::RemovedAbove,
-                }
+                (start, start + 1, Change::RemovedAbove)
+            };
+            Hunk {
+                start,
+                end,
+                kind,
+                head_start,
+                head_end,
             }
         })
         .collect()
+}
+
+/// One aligned band of a side-by-side view: the HEAD lines and the buffer
+/// lines that stand level with each other, starting at view row `row`.
+/// Bands are sorted, tile the view without gaps, and between them every
+/// line of each side appears exactly once. Either range may be empty — an
+/// insertion has no HEAD lines, a deletion no buffer lines — so a band is
+/// as tall as its longer side and the shorter one pads with blank rows.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Band {
+    pub row: usize,
+    pub head: Range<usize>,
+    pub buffer: Range<usize>,
+    /// Whether the two sides agree here: the context between changes.
+    pub same: bool,
+}
+
+impl Band {
+    pub fn height(&self) -> usize {
+        self.head.len().max(self.buffer.len())
+    }
+}
+
+/// The two texts stood side by side, from the marks the gutter already
+/// holds — no second diff, so opening the view costs one pass over the
+/// hunks however large the file. Line counts are `Rope::len_lines`, the
+/// same count the diff tokenized, so the trailing empty line each rope
+/// carries lands opposite its twin.
+pub fn bands(hunks: &[Hunk], head_lines: usize, buffer_lines: usize) -> Vec<Band> {
+    let mut bands = Vec::with_capacity(2 * hunks.len() + 1);
+    let mut row = 0;
+    let (mut h, mut b) = (0, 0);
+    for hunk in hunks {
+        let head = hunk.head_start.min(head_lines)..hunk.head_end.min(head_lines);
+        let buffer = hunk.buffer();
+        let buffer = buffer.start.min(buffer_lines)..buffer.end.min(buffer_lines);
+        // The run before the hunk is untouched, so it is the same length on
+        // both sides; the shorter one governs if a clamp above shortened it.
+        let context = head
+            .start
+            .saturating_sub(h)
+            .min(buffer.start.saturating_sub(b));
+        push(&mut bands, &mut row, h..h + context, b..b + context, true);
+        h += context;
+        b += context;
+        push(&mut bands, &mut row, head.clone(), buffer.clone(), false);
+        h = h.max(head.end);
+        b = b.max(buffer.end);
+    }
+    push(&mut bands, &mut row, h..head_lines, b..buffer_lines, true);
+    bands
+}
+
+/// Appends a band and advances the row cursor past it. An empty one — two
+/// empty ranges — is not a band at all and is dropped, so the list stays
+/// free of zero-height entries a row lookup would have to skip.
+fn push(
+    bands: &mut Vec<Band>,
+    row: &mut usize,
+    head: Range<usize>,
+    buffer: Range<usize>,
+    same: bool,
+) {
+    let band = Band {
+        row: *row,
+        head,
+        buffer,
+        same,
+    };
+    let height = band.height();
+    if height > 0 {
+        bands.push(band);
+        *row += height;
+    }
+}
+
+/// Rows the aligned view occupies.
+pub fn rows(bands: &[Band]) -> usize {
+    bands.last().map_or(0, |b| b.row + b.height())
 }
 
 /// What a finished job brought home.
@@ -191,6 +294,10 @@ pub struct Diff {
     /// HEAD's content; `None` before the first lookup finishes and when the
     /// file has none.
     head: Option<Rope>,
+    /// Bumped by every lookup that lands, so a view holding the baseline
+    /// knows to take it again. Zero means none has answered yet, which is
+    /// what tells "still reading" from "HEAD has never seen this file".
+    head_gen: u64,
     /// HEAD has never been looked up, or may have moved since it was.
     stale: bool,
     git_dir: Option<PathBuf>,
@@ -207,6 +314,7 @@ impl Diff {
         Diff {
             in_repo: path.is_some_and(project::in_repo),
             head: None,
+            head_gen: 0,
             stale: true,
             git_dir: None,
             hunks: Vec::new(),
@@ -226,6 +334,25 @@ impl Diff {
 
     pub fn hunks(&self) -> &[Hunk] {
         &self.hunks
+    }
+
+    /// HEAD's content, once a lookup has answered; `None` while one is in
+    /// flight and when HEAD has never seen this file. `head_gen` tells
+    /// those two apart.
+    pub fn head(&self) -> Option<&Rope> {
+        self.head.as_ref()
+    }
+
+    /// Which lookup the baseline came from; zero before the first answers.
+    pub fn head_gen(&self) -> u64 {
+        self.head_gen
+    }
+
+    /// The document revision `hunks` were computed from. With `head_gen` it
+    /// names the marks exactly, so a view can tell when they moved without
+    /// comparing the list.
+    pub fn hunk_rev(&self) -> Option<u64> {
+        self.hunk_rev
     }
 
     /// The directory holding this file's HEAD, once a lookup has found it —
@@ -313,6 +440,7 @@ impl Diff {
         self.inflight = false;
         if let Done::Head { head, git_dir } = done.kind {
             self.head = head;
+            self.head_gen += 1;
             if git_dir.is_some() {
                 self.git_dir = git_dir;
             }
@@ -322,6 +450,27 @@ impl Diff {
         self.hunk_rev = Some(done.revision);
         self.pump(doc, tx);
         changed
+    }
+
+    /// A comparison standing at a fixed baseline whose lookup has answered,
+    /// so a test can build the side-by-side view without a repository
+    /// behind it. `head` of `None` is a file HEAD has never seen.
+    #[cfg(test)]
+    pub fn test_baseline(head: Option<Rope>, hunks: Vec<Hunk>) -> Diff {
+        Diff {
+            in_repo: true,
+            head,
+            head_gen: 1,
+            hunks,
+            hunk_rev: Some(0),
+            ..Diff::new(None)
+        }
+    }
+
+    /// A lookup landed on a baseline that had moved.
+    #[cfg(test)]
+    pub fn bump_head_gen(&mut self) {
+        self.head_gen += 1;
     }
 
     /// A comparison standing at a fixed set of marks, so a test can draw or
@@ -486,8 +635,14 @@ mod tests {
         hunks(&Rope::from_str(head), &Rope::from_str(buffer))
     }
 
-    fn hunk(start: usize, end: usize, kind: Change) -> Hunk {
-        Hunk { start, end, kind }
+    fn hunk(start: usize, end: usize, kind: Change, head: Range<usize>) -> Hunk {
+        Hunk {
+            start,
+            end,
+            kind,
+            head_start: head.start,
+            head_end: head.end,
+        }
     }
 
     #[test]
@@ -498,14 +653,17 @@ mod tests {
 
     #[test]
     fn an_inserted_run_marks_the_lines_it_added() {
-        assert_eq!(marks("a\nb\n", "a\nx\ny\nb\n"), [hunk(1, 3, Change::Added)]);
+        assert_eq!(
+            marks("a\nb\n", "a\nx\ny\nb\n"),
+            [hunk(1, 3, Change::Added, 1..1)]
+        );
     }
 
     #[test]
     fn a_rewritten_line_marks_changed_not_added_and_removed() {
         assert_eq!(
             marks("a\nb\nc\n", "a\nB\nc\n"),
-            [hunk(1, 2, Change::Changed)]
+            [hunk(1, 2, Change::Changed, 1..2)]
         );
     }
 
@@ -515,7 +673,7 @@ mod tests {
         // the row that now follows the gap.
         assert_eq!(
             marks("a\nb\nc\nd\n", "a\nd\n"),
-            [hunk(1, 2, Change::RemovedAbove)]
+            [hunk(1, 2, Change::RemovedAbove, 1..3)]
         );
     }
 
@@ -523,12 +681,15 @@ mod tests {
     fn a_removal_running_off_the_end_marks_under_the_last_row() {
         // Nothing follows the gap, so the mark hangs below the last row
         // rather than over a row that no longer exists.
-        assert_eq!(marks("a\nb\n", "a"), [hunk(0, 1, Change::RemovedBelow)]);
+        assert_eq!(
+            marks("a\nb\n", "a"),
+            [hunk(0, 1, Change::RemovedBelow, 1..3)]
+        );
     }
 
     #[test]
     fn a_dropped_trailing_newline_reads_as_a_removal() {
-        assert_eq!(marks("a\n", "a"), [hunk(0, 1, Change::RemovedBelow)]);
+        assert_eq!(marks("a\n", "a"), [hunk(0, 1, Change::RemovedBelow, 1..2)]);
     }
 
     #[test]
@@ -537,17 +698,23 @@ mod tests {
         // terminators reaches the same answer without running the filters.
         assert_eq!(marks("a\nb\n", "a\r\nb\r\n"), []);
         assert_eq!(marks("a\r\nb\r\n", "a\nb\n"), []);
-        assert_eq!(marks("a\nb\n", "a\r\nB\r\n"), [hunk(1, 2, Change::Changed)]);
+        assert_eq!(
+            marks("a\nb\n", "a\r\nB\r\n"),
+            [hunk(1, 2, Change::Changed, 1..2)]
+        );
     }
 
     #[test]
     fn an_emptied_buffer_marks_the_removal_at_its_top() {
-        assert_eq!(marks("a\nb\n", ""), [hunk(0, 1, Change::RemovedAbove)]);
+        assert_eq!(
+            marks("a\nb\n", ""),
+            [hunk(0, 1, Change::RemovedAbove, 0..2)]
+        );
     }
 
     #[test]
     fn a_file_absent_from_head_is_added_whole() {
-        assert_eq!(marks("", "a\nb\n"), [hunk(0, 2, Change::Added)]);
+        assert_eq!(marks("", "a\nb\n"), [hunk(0, 2, Change::Added, 0..0)]);
     }
 
     #[test]
@@ -560,7 +727,10 @@ mod tests {
             .replace("line 27\n", "LINE 27\n");
         assert_eq!(
             marks(&head, &buffer),
-            [hunk(2, 3, Change::Changed), hunk(27, 28, Change::Changed),]
+            [
+                hunk(2, 3, Change::Changed, 2..3),
+                hunk(27, 28, Change::Changed, 27..28),
+            ]
         );
     }
 
@@ -580,11 +750,118 @@ mod tests {
         }
     }
 
+    fn aligned(head: &str, buffer: &str) -> Vec<Band> {
+        let (head, buffer) = (Rope::from_str(head), Rope::from_str(buffer));
+        bands(&hunks(&head, &buffer), head.len_lines(), buffer.len_lines())
+    }
+
+    fn band(row: usize, head: Range<usize>, buffer: Range<usize>, same: bool) -> Band {
+        Band {
+            row,
+            head,
+            buffer,
+            same,
+        }
+    }
+
+    #[test]
+    fn matching_texts_are_one_band_of_context() {
+        // Three lines each: the two written plus the empty one every rope
+        // carries past its last terminator.
+        assert_eq!(aligned("a\nb\n", "a\nb\n"), [band(0, 0..3, 0..3, true)]);
+    }
+
+    #[test]
+    fn an_insertion_pads_the_head_side() {
+        // Two new lines with nothing opposite them, so the band is two
+        // rows tall and HEAD contributes none of them.
+        let found = aligned("a\nb\n", "a\nx\ny\nb\n");
+        assert_eq!(
+            found,
+            [
+                band(0, 0..1, 0..1, true),
+                band(1, 1..1, 1..3, false),
+                band(3, 1..3, 3..5, true),
+            ]
+        );
+        assert_eq!(rows(&found), 5);
+    }
+
+    #[test]
+    fn a_deletion_pads_the_buffer_side() {
+        let found = aligned("a\nb\nc\nd\n", "a\nd\n");
+        assert_eq!(
+            found,
+            [
+                band(0, 0..1, 0..1, true),
+                band(1, 1..3, 1..1, false),
+                band(3, 3..5, 1..3, true),
+            ]
+        );
+        assert_eq!(rows(&found), 5);
+    }
+
+    #[test]
+    fn a_rewrite_stands_the_two_versions_level() {
+        assert_eq!(
+            aligned("a\nb\nc\n", "a\nB\nc\n"),
+            [
+                band(0, 0..1, 0..1, true),
+                band(1, 1..2, 1..2, false),
+                band(2, 2..4, 2..4, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_removal_off_the_end_sits_past_the_last_buffer_line() {
+        // The gutter collapses this to a marker row under the last line;
+        // the view wants the run itself, empty and at the very end.
+        assert_eq!(
+            aligned("a\nb\n", "a"),
+            [band(0, 0..1, 0..1, true), band(1, 1..3, 1..1, false)]
+        );
+    }
+
+    #[test]
+    fn a_file_absent_from_head_reads_as_added_whole() {
+        assert_eq!(
+            aligned("", "a\nb\n"),
+            [band(0, 0..0, 0..2, false), band(2, 0..1, 2..3, true)]
+        );
+    }
+
+    #[test]
+    fn bands_tile_the_view_and_spend_every_line_once() {
+        let head: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let mut buffer = head.replace("line 5\n", "");
+        buffer = buffer.replace("line 20\n", "LINE 20\nextra\n");
+        buffer.push_str("tail\n");
+        let (head_rope, buffer_rope) = (Rope::from_str(&head), Rope::from_str(&buffer));
+        let found = aligned(&head, &buffer);
+        let (mut row, mut h, mut b) = (0, 0, 0);
+        for band in &found {
+            assert_eq!(band.row, row, "{found:?}");
+            assert!(band.height() > 0, "{found:?}");
+            // Every line of each side, in order, exactly once.
+            assert_eq!(band.head.start, h, "{found:?}");
+            assert_eq!(band.buffer.start, b, "{found:?}");
+            row += band.height();
+            h = band.head.end;
+            b = band.buffer.end;
+        }
+        assert_eq!(h, head_rope.len_lines());
+        assert_eq!(b, buffer_rope.len_lines());
+        assert_eq!(rows(&found), row);
+        // The view is never shorter than either text: nothing is hidden.
+        assert!(row >= head_rope.len_lines().max(buffer_rope.len_lines()));
+    }
+
     #[test]
     fn next_change_walks_forward_and_wraps() {
         let diff = Diff::test_marks(vec![
-            hunk(2, 4, Change::Added),
-            hunk(10, 11, Change::Changed),
+            hunk(2, 4, Change::Added, 2..2),
+            hunk(10, 11, Change::Changed, 10..11),
         ]);
         assert_eq!(diff.next_change(0), Some(2));
         assert_eq!(diff.next_change(2), Some(10)); // inside a hunk: on to the next
@@ -596,8 +873,8 @@ mod tests {
     #[test]
     fn prev_change_walks_back_and_wraps() {
         let diff = Diff::test_marks(vec![
-            hunk(2, 4, Change::Added),
-            hunk(10, 11, Change::Changed),
+            hunk(2, 4, Change::Added, 2..2),
+            hunk(10, 11, Change::Changed, 10..11),
         ]);
         assert_eq!(diff.prev_change(99), Some(10));
         assert_eq!(diff.prev_change(10), Some(2));
@@ -635,7 +912,7 @@ mod tests {
     #[test]
     fn a_buffer_past_the_cap_drops_its_marks_and_spends_nothing() {
         let (tx, _rx) = mpsc::channel();
-        let mut diff = Diff::test_marks(vec![hunk(0, 1, Change::Added)]);
+        let mut diff = Diff::test_marks(vec![hunk(0, 1, Change::Added, 0..0)]);
         let mut doc = Document::from_str(&"x\n".repeat(MAX_LEN / 2 + 1));
         doc.set_path(PathBuf::from("huge.rs"));
         diff.pump(&doc, &tx);
@@ -657,11 +934,11 @@ mod tests {
     fn a_superseded_result_is_dropped() {
         let (tx, _rx) = mpsc::channel();
         let doc = Document::from_str("a\n");
-        let mut diff = Diff::test_marks(vec![hunk(0, 1, Change::Added)]);
+        let mut diff = Diff::test_marks(vec![hunk(0, 1, Change::Added, 0..0)]);
         diff.inflight = true;
         diff.generation = 2;
         assert!(!diff.absorb(done(1, 0, Vec::new()), &doc, &tx));
-        assert_eq!(diff.hunks(), [hunk(0, 1, Change::Added)]);
+        assert_eq!(diff.hunks(), [hunk(0, 1, Change::Added, 0..0)]);
         assert!(diff.inflight, "the awaited job is still out");
     }
 
@@ -669,7 +946,7 @@ mod tests {
     fn a_result_matching_the_marks_on_screen_costs_no_repaint() {
         let (tx, _rx) = mpsc::channel();
         let doc = Document::from_str("a\n");
-        let same = vec![hunk(0, 1, Change::Added)];
+        let same = vec![hunk(0, 1, Change::Added, 0..0)];
         let mut diff = Diff::test_marks(same.clone());
         diff.inflight = true;
         diff.generation = 1;
@@ -677,8 +954,12 @@ mod tests {
 
         diff.inflight = true;
         diff.generation = 2;
-        assert!(diff.absorb(done(2, 0, vec![hunk(4, 5, Change::Changed)]), &doc, &tx));
-        assert_eq!(diff.hunks(), [hunk(4, 5, Change::Changed)]);
+        assert!(diff.absorb(
+            done(2, 0, vec![hunk(4, 5, Change::Changed, 4..5)]),
+            &doc,
+            &tx
+        ));
+        assert_eq!(diff.hunks(), [hunk(4, 5, Change::Changed, 4..5)]);
     }
 
     #[test]
@@ -741,7 +1022,7 @@ mod tests {
         let buffer = Rope::from_str(&std::fs::read_to_string(&file).unwrap());
         assert_eq!(
             hunks(&head_blob(&file).unwrap(), &buffer),
-            [hunk(1, 3, Change::Changed)]
+            [hunk(1, 3, Change::Changed, 1..2)]
         );
         assert!(git_dir(&file).is_some_and(|d| d.ends_with(".git")));
         assert!(project::in_repo(&file));

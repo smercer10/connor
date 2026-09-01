@@ -15,6 +15,7 @@ use crate::keymap;
 use crate::picker::Picker;
 use crate::screen::Screen;
 use crate::search::Highlights;
+use crate::status::{self, Status};
 use crate::syntax::Span;
 use crate::tabs::{Tab, Tabs};
 use crate::tree::Tree;
@@ -60,6 +61,14 @@ pub struct Marks<'a> {
     pub syntax: &'a [Span],
 }
 
+/// The sidebar as one frame sees it: the tree, whether it holds focus, and
+/// the project's standing against HEAD that marks its rows.
+pub struct Sidebar<'a> {
+    pub tree: &'a Tree,
+    pub focused: bool,
+    pub status: &'a Status,
+}
+
 /// Draws one frame into a cleared screen and returns the cursor's screen
 /// cell. O(viewport): only visible lines are walked, and each only to the
 /// viewport's right edge. `scratch` is reused across frames so steady-state
@@ -69,9 +78,10 @@ pub struct Marks<'a> {
 /// `status_caret` parks the cursor after that many of the notice's chars
 /// while a prompt is editing there. `marks.search` underlines every match
 /// and reverses the current one; `marks.syntax` colours the sorted,
-/// non-overlapping spans it holds — empty means plain text. An open `tree`
-/// sidebar shifts the gutter and text right; its focus is the selection
-/// bar — the caller hides the terminal cursor while the tree holds it.
+/// non-overlapping spans it holds — empty means plain text. An open
+/// `sidebar` shifts the gutter and text right; its focus is the selection
+/// bar — the caller hides the terminal cursor while the tree holds it — and
+/// its rows carry the project's change marks, as the tab labels do.
 pub fn draw(
     screen: &mut Screen,
     tabs: &Tabs,
@@ -79,13 +89,13 @@ pub fn draw(
     notice: &str,
     status_caret: Option<usize>,
     marks: Marks,
-    tree: Option<(&Tree, bool)>,
+    sidebar: Option<Sidebar>,
 ) -> (u16, u16) {
     let (width, height) = screen.size();
     if width == 0 || height == 0 {
         return (0, 0);
     }
-    let tree_w = tree_width(tree.is_some(), width);
+    let tree_w = tree_width(sidebar.is_some(), width);
     let width = usize::from(width);
     let text_h = text_height(height);
     let tab = tabs.active();
@@ -249,9 +259,9 @@ pub fn draw(
     }
 
     if tree_w > 0
-        && let Some((tree, focused)) = tree
+        && let Some(sidebar) = sidebar
     {
-        draw_tree(screen, tree, focused, tree_w);
+        draw_tree(screen, &sidebar, tree_w);
     }
     if let Some(chars) = status_caret {
         let col: usize = notice.chars().take(chars).map(char_cols).sum();
@@ -270,10 +280,21 @@ pub fn draw(
 /// collapsed and expanded directories, the selection in reverse video
 /// while the tree holds focus, and the edited file's name underlined.
 /// Every cell write bounds-checks, so degenerate sizes clip, not panic.
-fn draw_tree(screen: &mut Screen, tree: &Tree, focused: bool, tree_w: usize) {
+///
+/// Inside a repository the last inner column is the change mark's, held for
+/// every row rather than only marked ones so a name never shifts sideways
+/// as marks come and go — the gutter's rule. Outside one the column is not
+/// reserved at all and the sidebar is exactly what it was before.
+fn draw_tree(screen: &mut Screen, sidebar: &Sidebar, tree_w: usize) {
+    let Sidebar {
+        tree,
+        focused,
+        status,
+    } = *sidebar;
     let (_, height) = screen.size();
     let text_h = text_height(height);
     let inner = tree_w - 1;
+    let mark_w = usize::from(status.in_repo());
     for k in 0..text_h {
         screen.set(inner as u16, (1 + k) as u16, '│');
     }
@@ -297,7 +318,22 @@ fn draw_tree(screen: &mut Screen, tree: &Tree, focused: bool, tree_w: usize) {
             screen.set(indent as u16, y, if r.expanded { '▾' } else { '▸' });
         }
         let name_x = indent + 2;
-        let drawn = draw_head(screen, name_x, y, r.name, inner.saturating_sub(name_x));
+        let drawn = draw_head(
+            screen,
+            name_x,
+            y,
+            r.name,
+            inner.saturating_sub(name_x + mark_w),
+        );
+        // A directory carries the mark of everything beneath it, so a
+        // change under a collapsed row is never invisible.
+        if mark_w > 0
+            && let Some(mark) = status.mark(r.path)
+        {
+            let x = (inner - mark_w) as u16;
+            screen.set(x, y, status::DOT);
+            screen.set_fg(x, y, mark.color());
+        }
         if r.active {
             for x in name_x..name_x + drawn {
                 screen.set_underlined(x as u16, y, true);
@@ -914,6 +950,9 @@ fn draw_tab_bar(screen: &mut Screen, tabs: &Tabs, scratch: &mut String, width: u
     for (i, tab) in all.iter().enumerate().skip(first_shown(tabs, width)) {
         scratch.clear();
         scratch.push(' ');
+        if tab.mark.is_some() {
+            scratch.push(status::DOT);
+        }
         push_shown_name(&tab.doc.name(), scratch);
         if tab.doc.dirty() {
             scratch.push('+');
@@ -923,6 +962,9 @@ fn draw_tab_bar(screen: &mut Screen, tabs: &Tabs, scratch: &mut String, width: u
         }
         scratch.push(' ');
         screen.set_text(x as u16, 0, scratch);
+        if let Some(mark) = tab.mark {
+            screen.set_fg((x + 1) as u16, 0, mark.color());
+        }
         let label_w = label_width(tab);
         if i == active {
             for col in x..(x + label_w).min(width) {
@@ -966,10 +1008,13 @@ pub fn tab_at(tabs: &Tabs, width: usize, x: u16) -> Option<usize> {
     None
 }
 
-/// The screen columns one tab's label occupies: padding, the shown name,
-/// and the dirty and conflict marks.
+/// The screen columns one tab's label occupies: padding, the change mark,
+/// the shown name, and the dirty and conflict marks. Click mapping and
+/// overflow both measure through here, so a label that gains a mark stays
+/// clickable where it is drawn.
 fn label_width(tab: &Tab) -> usize {
-    2 + shown_name_cols(&tab.doc.name())
+    2 + usize::from(tab.mark.is_some())
+        + shown_name_cols(&tab.doc.name())
         + usize::from(tab.doc.dirty())
         + usize::from(tab.doc.conflict())
 }
@@ -1032,6 +1077,7 @@ mod tests {
     use crate::compare::Compare;
     use crate::diff::{Change, Diff, Hunk};
     use crate::doc::{Caret, Document, EditKind};
+    use crate::status::Mark;
     use crate::view::View;
 
     fn tabs_of(doc: Document, view: View) -> Tabs {
@@ -1218,7 +1264,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
         let body = row(&screen, 1);
         let border = body.chars().position(|c| c == '│').unwrap();
@@ -1404,6 +1454,66 @@ mod tests {
         let (screen, _) = render_tabs(&tabs, 15, 3);
         assert_eq!(row(&screen, 0), " bb.rs  cc.rs  ");
         assert_eq!(sel_row(&screen, 0), "       ####### ");
+    }
+
+    /// The tabs, each carrying the project mark named for it.
+    fn tabs_marked(docs: Vec<Document>, marks: &[Option<Mark>]) -> Tabs {
+        let mut tabs = Tabs::new(docs);
+        for (index, mark) in marks.iter().enumerate() {
+            tabs.get_mut(index).mark = *mark;
+        }
+        tabs
+    }
+
+    #[test]
+    fn a_tab_label_carries_its_change_mark_beside_the_dirty_one() {
+        let tabs = tabs_marked(
+            vec![named("a.rs", ""), dirtied(named("b.rs", ""))],
+            &[Some(Mark::New), Some(Mark::Changed)],
+        );
+        let (screen, _) = render_tabs(&tabs, 20, 3);
+        assert_eq!(row(&screen, 0), " ●a.rs  ●b.rs+      ");
+        // Green for the new file, yellow for the changed one, and the mark
+        // is the only coloured cell in either label.
+        assert_eq!(fg_row(&screen, 0), " 3      4           ");
+        assert_eq!(sel_row(&screen, 0), "#######             ");
+    }
+
+    #[test]
+    fn a_tab_label_marks_a_change_a_conflict_and_a_dirty_buffer_at_once() {
+        let mut doc = dirtied(named("a.rs", ""));
+        doc.set_conflict(true);
+        let tabs = tabs_marked(vec![doc], &[Some(Mark::Changed)]);
+        let (screen, _) = render_tabs(&tabs, 16, 3);
+        assert_eq!(row(&screen, 0), " ●a.rs+!        ");
+    }
+
+    #[test]
+    fn tab_at_follows_the_labels_the_marks_widened() {
+        let tabs = tabs_marked(
+            vec![named("a.rs", ""), dirtied(named("b.rs", ""))],
+            &[Some(Mark::New), None],
+        );
+        // Drawn as " ●a.rs  b.rs+  ": the mark widens the first label to
+        // 0..7, pushing the second to 7..14.
+        assert_eq!(tab_at(&tabs, 16, 6), Some(0));
+        assert_eq!(tab_at(&tabs, 16, 7), Some(1));
+        assert_eq!(tab_at(&tabs, 16, 13), Some(1));
+        assert_eq!(tab_at(&tabs, 16, 14), None);
+    }
+
+    #[test]
+    fn overflow_keeps_a_marked_active_tab_whole() {
+        let mut tabs = tabs_marked(
+            vec![named("aa.rs", ""), named("bb.rs", ""), named("cc.rs", "")],
+            &[None, Some(Mark::Changed), Some(Mark::New)],
+        );
+        tabs.activate(2);
+        let (screen, _) = render_tabs(&tabs, 15, 3);
+        // Both marked labels are 8 columns, so only the active one fits.
+        assert_eq!(row(&screen, 0), " ●cc.rs        ");
+        assert_eq!(tab_at(&tabs, 15, 6), Some(2));
+        assert_eq!(tab_at(&tabs, 15, 8), None);
     }
 
     #[test]
@@ -2211,7 +2321,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
 
         let body = row(&screen, 1);
@@ -2238,7 +2352,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
         assert!(!sel_row(&unfocused, 1).contains('#'));
 
@@ -2250,7 +2368,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, true)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: true,
+                status: &Status::test_plain(),
+            }),
         );
         let sel = sel_row(&focused, 1);
         assert!(sel[..29].contains('#'), "selection not reversed: {sel}");
@@ -2274,10 +2396,121 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
         assert!(!ul_row(&screen, 1).contains('_'));
         assert!(ul_row(&screen, 2).contains('_'));
+    }
+
+    /// The sidebar drawn over a project standing at fixed marks.
+    fn render_tree(tree: &Tree, status: &Status, width: u16) -> Screen {
+        let tabs = tabs_of(Document::from_str("hello"), View::default());
+        let mut screen = Screen::new(width, 6);
+        let mut scratch = String::new();
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            "",
+            None,
+            Marks::default(),
+            Some(Sidebar {
+                tree,
+                focused: false,
+                status,
+            }),
+        );
+        screen
+    }
+
+    #[test]
+    fn the_sidebar_marks_changed_and_new_rows_in_their_own_column() {
+        let mut tree = tree_of(&["src/main.rs", "src/new.rs", "README.md"], true);
+        tree.key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Right,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            10,
+        );
+        let status = Status::test_marks(vec![
+            ("src", Mark::Changed),
+            ("src/main.rs", Mark::Changed),
+            ("src/new.rs", Mark::New),
+        ]);
+        let screen = render_tree(&tree, &status, 60);
+        // The mark holds the last inner column, clear of the border.
+        assert_eq!(
+            row(&screen, 1).trim_end(),
+            "▾ src                       ●│1 hello"
+        );
+        assert_eq!(row(&screen, 2).trim_end(), "    main.rs                 ●│");
+        assert_eq!(row(&screen, 3).trim_end(), "    new.rs                  ●│");
+        assert_eq!(row(&screen, 4).trim_end(), "  README.md                  │");
+        assert_eq!(
+            fg_row(&screen, 2).trim_end(),
+            "                            4"
+        );
+        assert_eq!(
+            fg_row(&screen, 3).trim_end(),
+            "                            3"
+        );
+        // An unmarked row spends nothing in the column it still reserves.
+        assert_eq!(fg_row(&screen, 4).trim_end(), "");
+    }
+
+    #[test]
+    fn a_collapsed_directory_carries_the_change_beneath_it() {
+        let tree = tree_of(&["src/deep/new.rs"], true);
+        let status = Status::test_marks(vec![
+            ("src", Mark::New),
+            ("src/deep", Mark::New),
+            ("src/deep/new.rs", Mark::New),
+        ]);
+        let screen = render_tree(&tree, &status, 60);
+        // `src` is collapsed: without the mark the change under it would be
+        // invisible.
+        assert_eq!(
+            row(&screen, 1).trim_end(),
+            "▸ src                       ●│1 hello"
+        );
+        assert_eq!(
+            fg_row(&screen, 1).trim_end(),
+            "                            3"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_mark_column_appears_only_inside_a_repository() {
+        let tree = tree_of(TREE_PATHS, true);
+        let plain = render_tree(&tree, &Status::test_plain(), 60);
+        // Outside a repository the sidebar is what it always was, to the
+        // column: the mark column is not reserved at all.
+        assert_eq!(
+            row(&plain, 1).trim_end(),
+            "▸ src                        │1 hello"
+        );
+        assert_eq!(row(&plain, 2).trim_end(), "  README.md                  │");
+        assert_eq!(fg_row(&plain, 1).trim_end(), "");
+    }
+
+    #[test]
+    fn a_reserved_mark_column_truncates_a_long_name_one_column_earlier() {
+        let paths = &["a_name_far_too_long_for_the_sidebar.rs"];
+        let plain = render_tree(&tree_of(paths, true), &Status::test_plain(), 60);
+        let marked = render_tree(&tree_of(paths, true), &Status::test_marks(Vec::new()), 60);
+        assert_eq!(
+            row(&plain, 1).trim_end(),
+            "  a_name_far_too_long_for_th…│1 hello"
+        );
+        assert_eq!(
+            row(&marked, 1).trim_end(),
+            "  a_name_far_too_long_for_t… │1 hello"
+        );
     }
 
     #[test]
@@ -2303,7 +2536,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
         assert_eq!(row(&screen, 0), row(&plain, 0));
         assert_eq!(row(&screen, 4), row(&plain, 4));
@@ -2337,7 +2574,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
         for y in 0..5 {
             assert_eq!(row(&screen, y), row(&plain, y));
@@ -2357,7 +2598,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
         assert!(row(&screen, 1).starts_with("  a.rs"));
         assert!(row(&screen, 2).starts_with('…'));
@@ -2376,7 +2621,11 @@ mod tests {
             "",
             None,
             Marks::default(),
-            Some((&tree, false)),
+            Some(Sidebar {
+                tree: &tree,
+                focused: false,
+                status: &Status::test_plain(),
+            }),
         );
         let body = row(&screen, 1);
         assert!(body.contains("a_very_long"), "head lost: {body}");
@@ -2443,7 +2692,11 @@ mod tests {
                     "",
                     None,
                     Marks::default(),
-                    Some((&deep, focused)),
+                    Some(Sidebar {
+                        tree: &deep,
+                        focused,
+                        status: &Status::test_plain(),
+                    }),
                 );
             }
 

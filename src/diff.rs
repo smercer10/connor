@@ -555,13 +555,13 @@ fn spawn_rediff(
     });
 }
 
-/// A `git` invocation rooted at the file's own directory, wired so nothing
-/// it does can reach a terminal in raw mode and nothing in the environment
-/// can point it at a different repository.
-fn git(path: &Path) -> Command {
+/// A `git` invocation rooted at `dir`, wired so nothing it does can reach a
+/// terminal in raw mode and nothing in the environment can point it at a
+/// different repository. The project-wide scan builds on this too.
+pub fn git(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
-        .arg(dir_of(path))
+        .arg(dir)
         // A connor launched from a hook inherits these, and they name
         // whatever repository the hook is running for.
         .env_remove("GIT_DIR")
@@ -589,7 +589,7 @@ fn head_blob(path: &Path) -> Option<Rope> {
     // an `OsString` keeps a name that isn't UTF-8 intact.
     let mut spec = OsString::from("HEAD:./");
     spec.push(path.file_name()?);
-    let mut child = git(path)
+    let mut child = git(dir_of(path))
         .args(["cat-file", "blob"])
         .arg(spec)
         .spawn()
@@ -613,7 +613,7 @@ fn head_blob(path: &Path) -> Option<Rope> {
 /// a linked worktree, not the `.git` file beside the checkout — so the
 /// watch that notices a commit sits on the right directory.
 fn git_dir(path: &Path) -> Option<PathBuf> {
-    let out = git(path)
+    let out = git(dir_of(path))
         .args(["rev-parse", "--absolute-git-dir"])
         .output()
         .ok()?;

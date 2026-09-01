@@ -128,6 +128,9 @@ fn merge(a: Vec<Entry>, b: Vec<Entry>) -> Vec<Entry> {
 /// One row's worth of data for drawing; everything borrows from the tree.
 pub struct Row<'a> {
     pub name: &'a str,
+    /// Root-relative, as the walk spells it — what the project-wide change
+    /// marks are keyed by.
+    pub path: &'a str,
     pub depth: usize,
     pub dir: bool,
     pub expanded: bool,
@@ -501,6 +504,7 @@ impl Tree {
         let e = &self.entries[self.visible[i] as usize];
         Row {
             name: &e.path[e.name_at as usize..],
+            path: &e.path,
             depth: usize::from(e.depth),
             dir: e.dir,
             expanded: e.dir && self.expanded.contains(&e.path),

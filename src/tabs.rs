@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::diff::Diff;
 use crate::doc::Document;
+use crate::status::Mark;
 use crate::syntax::Syntax;
 use crate::view::View;
 
@@ -16,6 +17,9 @@ pub struct Tab {
     pub view: View,
     pub syntax: Option<Syntax>,
     pub diff: Diff,
+    /// How the file stands against HEAD on disk, from the project-wide
+    /// scan; `Status::sync` owns it, and the label draws it.
+    pub mark: Option<Mark>,
 }
 
 impl Tab {
@@ -25,6 +29,7 @@ impl Tab {
             diff: Diff::new(doc.path()),
             doc,
             view: View::default(),
+            mark: None,
         }
     }
 }

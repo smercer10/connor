@@ -69,13 +69,26 @@ pub struct Sidebar<'a> {
     pub status: &'a Status,
 }
 
+/// What the status line carries: a message or mini-prompt taking it over,
+/// where a prompt editing there parks the cursor, and whether the editor is
+/// locked. Bundled because the three are one concern and `draw` is at the
+/// argument count past which it reads as a pile.
+#[derive(Default)]
+pub struct StatusLine<'a> {
+    /// A message or mini-prompt, or empty for the file summary.
+    pub line: &'a str,
+    /// Park the cursor after this many of `line`'s chars.
+    pub caret: Option<usize>,
+    /// Editing is locked; the right-aligned slot says so.
+    pub locked: bool,
+}
+
 /// Draws one frame into a cleared screen and returns the cursor's screen
 /// cell. O(viewport): only visible lines are walked, and each only to the
 /// viewport's right edge. `scratch` is reused across frames so steady-state
-/// drawing never heap-allocates. A non-empty `notice` — a message or a
-/// mini-prompt — takes over the status line until the next keypress,
-/// hiding its right-aligned help hint;
-/// `status_caret` parks the cursor after that many of the notice's chars
+/// drawing never heap-allocates. A non-empty `status.line` — a message or a
+/// mini-prompt — takes over the status line until the next keypress;
+/// `status.caret` parks the cursor after that many of its chars
 /// while a prompt is editing there. `marks.search` underlines every match
 /// and reverses the current one; `marks.syntax` colours the sorted,
 /// non-overlapping spans it holds — empty means plain text. An open
@@ -86,8 +99,7 @@ pub fn draw(
     screen: &mut Screen,
     tabs: &Tabs,
     scratch: &mut String,
-    notice: &str,
-    status_caret: Option<usize>,
+    status: StatusLine,
     marks: Marks,
     sidebar: Option<Sidebar>,
 ) -> (u16, u16) {
@@ -229,7 +241,7 @@ pub fn draw(
     let line = view.line(doc);
     let vcol = view.vcol(doc);
 
-    if notice.is_empty() {
+    let left: usize = if status.line.is_empty() {
         scratch.clear();
         let _ = write!(scratch, "{} · {}:{}", doc.name(), line + 1, vcol + 1);
         if doc.dirty() {
@@ -245,17 +257,27 @@ pub fn draw(
             scratch.push_str(" [recovered]");
         }
         screen.set_text(0, height - 1, scratch);
-        // The keymap's discoverability bootstrap: a right-aligned pointer
-        // at the overlay, yielding whenever the left content needs the room.
-        let left: usize = scratch.chars().map(char_cols).sum();
-        scratch.clear();
-        keymap::write_help_hint(scratch);
-        let hint = scratch.chars().count();
-        if hint > 0 && left + 2 + hint <= width {
-            screen.set_text((width - hint) as u16, height - 1, scratch);
-        }
+        scratch.chars().map(char_cols).sum()
     } else {
-        screen.set_text(0, height - 1, notice);
+        screen.set_text(0, height - 1, status.line);
+        status.line.chars().map(char_cols).sum()
+    };
+    // The right-aligned slot, yielding whenever the left content needs the
+    // room. Locked, it names the mode and the way out of it, and it is
+    // computed out here rather than beside the flags because a notice
+    // replaces that whole line — including every refusal the lock itself
+    // produces, which is the moment the indicator is most needed. Unlocked
+    // and quiet, it is the keymap's discoverability bootstrap.
+    scratch.clear();
+    if status.locked {
+        keymap::write_lock_chord(scratch);
+        scratch.push_str(" locked");
+    } else if status.line.is_empty() {
+        keymap::write_help_hint(scratch);
+    }
+    let hint = scratch.chars().count();
+    if hint > 0 && left + 2 + hint <= width {
+        screen.set_text((width - hint) as u16, height - 1, scratch);
     }
 
     if tree_w > 0
@@ -263,8 +285,8 @@ pub fn draw(
     {
         draw_tree(screen, &sidebar, tree_w);
     }
-    if let Some(chars) = status_caret {
-        let col: usize = notice.chars().take(chars).map(char_cols).sum();
+    if let Some(chars) = status.caret {
+        let col: usize = status.line.chars().take(chars).map(char_cols).sum();
         return (col.min(width - 1) as u16, height - 1);
     }
     let cx = (tree_w + gutter_w + vcol.saturating_sub(view.scroll_col)).min(width - 1) as u16;
@@ -1097,8 +1119,7 @@ mod tests {
             &mut screen,
             tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -1265,8 +1286,7 @@ mod tests {
             &mut screen,
             &marked("hello", View::default(), vec![hunk(0, 1, Change::Changed)]),
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -1354,6 +1374,97 @@ mod tests {
         assert_eq!(row(&screen, 2), "[No Name] · 1:1        ");
     }
 
+    fn render_locked(text: &str, width: u16, height: u16, line: &str) -> Screen {
+        let tabs = tabs_of(Document::from_str(text), View::default());
+        let mut screen = Screen::new(width, height);
+        let mut scratch = String::new();
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            StatusLine {
+                line,
+                caret: None,
+                locked: true,
+            },
+            Marks::default(),
+            None,
+        );
+        screen
+    }
+
+    #[test]
+    fn the_lock_indicator_takes_the_help_hint_s_place() {
+        let screen = render_locked("ab", 40, 3, "");
+        assert_eq!(row(&screen, 2), "[No Name] · 1:1             Alt+L locked");
+    }
+
+    #[test]
+    fn the_lock_indicator_outlives_a_notice() {
+        // The case a bracketed flag beside [+] cannot cover: a message owns
+        // the left of the line, and every refusal the lock makes is one.
+        let screen = render_locked("ab", 40, 3, "locked — Alt+L to unlock");
+        assert_eq!(row(&screen, 2), "locked — Alt+L to unlock    Alt+L locked");
+
+        // Unlocked, a notice leaves the slot empty rather than hinting.
+        let tabs = tabs_of(Document::from_str("ab"), View::default());
+        let mut screen = Screen::new(40, 3);
+        let mut scratch = String::new();
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            StatusLine {
+                line: "saved ab",
+                ..StatusLine::default()
+            },
+            Marks::default(),
+            None,
+        );
+        assert_eq!(row(&screen, 2), "saved ab                                ");
+    }
+
+    #[test]
+    fn the_lock_indicator_yields_to_a_cramped_status() {
+        // Same two-space gap rule as the help hint; it is wider, so it
+        // goes first, and the block caret is what still says "locked".
+        let screen = render_locked("ab", 29, 3, "");
+        assert_eq!(row(&screen, 2), "[No Name] · 1:1  Alt+L locked");
+        // One column short of the two-space gap: it disappears whole.
+        let screen = render_locked("ab", 28, 3, "");
+        assert_eq!(row(&screen, 2), "[No Name] · 1:1             ");
+    }
+
+    #[test]
+    fn locking_leaves_the_flags_and_the_body_alone() {
+        // The indicator is the whole of what the lock draws: it says the
+        // editor is locked, not that this buffer is different.
+        let mut doc = dirtied(named("a.rs", "x"));
+        doc.set_conflict(true);
+        let tabs = tabs_of(doc, View::default());
+        let (plain, _) = render_tabs(&tabs, 44, 4);
+        let mut screen = Screen::new(44, 4);
+        let mut scratch = String::new();
+        draw(
+            &mut screen,
+            &tabs,
+            &mut scratch,
+            StatusLine {
+                line: "",
+                caret: None,
+                locked: true,
+            },
+            Marks::default(),
+            None,
+        );
+        assert_eq!(row(&screen, 0), row(&plain, 0));
+        assert_eq!(row(&screen, 1), row(&plain, 1));
+        assert_eq!(
+            row(&screen, 3),
+            "a.rs · 1:1 [+] [disk changed]   Alt+L locked"
+        );
+    }
+
     #[test]
     fn a_notice_takes_over_the_status_line() {
         let tabs = tabs_of(Document::from_str("ab"), View::default());
@@ -1363,8 +1474,10 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "saved ab",
-            None,
+            StatusLine {
+                line: "saved ab",
+                ..StatusLine::default()
+            },
             Marks::default(),
             None,
         );
@@ -1380,8 +1493,11 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "open: sr",
-            Some(8),
+            StatusLine {
+                line: "open: sr",
+                caret: Some(8),
+                locked: false,
+            },
             Marks::default(),
             None,
         );
@@ -1392,8 +1508,11 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "open: src/main.rs",
-            Some(17),
+            StatusLine {
+                line: "open: src/main.rs",
+                caret: Some(17),
+                locked: false,
+            },
             Marks::default(),
             None,
         );
@@ -1410,8 +1529,11 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "find: 日 · esc",
-            Some(7),
+            StatusLine {
+                line: "find: 日 · esc",
+                caret: Some(7),
+                locked: false,
+            },
             Marks::default(),
             None,
         );
@@ -1588,8 +1710,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks {
                 search: Some(search),
                 syntax: &[],
@@ -1667,8 +1788,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks {
                 search: None,
                 syntax,
@@ -1811,8 +1931,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -1882,8 +2001,7 @@ mod tests {
             &mut plain,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -1953,8 +2071,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -1995,8 +2112,7 @@ mod tests {
             &mut plain,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2005,8 +2121,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2056,8 +2171,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2085,8 +2199,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2112,8 +2225,7 @@ mod tests {
             &mut plain,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2122,8 +2234,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2150,8 +2261,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2212,8 +2322,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2242,8 +2351,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2269,8 +2377,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2300,8 +2407,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2346,8 +2452,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2377,8 +2482,7 @@ mod tests {
             &mut unfocused,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2393,8 +2497,7 @@ mod tests {
             &mut focused,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2421,8 +2524,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2443,8 +2545,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree,
@@ -2550,8 +2651,7 @@ mod tests {
             &mut plain,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2561,8 +2661,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2588,8 +2687,7 @@ mod tests {
             &mut plain,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             None,
         );
@@ -2599,8 +2697,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2623,8 +2720,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2646,8 +2742,7 @@ mod tests {
             &mut screen,
             &tabs,
             &mut scratch,
-            "",
-            None,
+            StatusLine::default(),
             Marks::default(),
             Some(Sidebar {
                 tree: &tree,
@@ -2717,8 +2812,7 @@ mod tests {
                     &mut screen,
                     &tabs,
                     &mut scratch,
-                    "",
-                    None,
+                    StatusLine::default(),
                     Marks::default(),
                     Some(Sidebar {
                         tree: &deep,

@@ -27,6 +27,12 @@ pub const UNREADABLE: &str = "can't read the file on disk";
 /// are the view's, so nothing else has a place to say them.
 pub const RESOLVE_HINT: &str = "(k)eep yours · (t)ake disk · (esc) cancel";
 
+/// The same choice with the half the lock refuses left unsaid. Taking the
+/// disk version is one undoable edit, and undo is exactly what the lock
+/// holds — so offering it here would promise a way back that isn't there.
+/// Keeping yours touches neither the buffer nor the file, so it stays.
+pub const RESOLVE_HINT_LOCKED: &str = "(k)eep yours · (esc) cancel";
+
 /// Said in the pane while the first lookup is still out — a few
 /// milliseconds after open, and the one moment "no baseline yet" would
 /// otherwise read as "every line is new".

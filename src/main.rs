@@ -237,6 +237,15 @@ fn save_as_prompt(then: AfterSave) -> Prompt {
     }
 }
 
+/// What every blocked input says. One wording for all of them: the reason
+/// is the same each time, and the user knows which key they just pressed.
+fn refuse_locked(notice: &mut String) {
+    notice.clear();
+    notice.push_str("locked — ");
+    keymap::write_lock_chord(notice);
+    notice.push_str(" to unlock");
+}
+
 fn try_save(doc: &mut Document, notice: &mut String) -> bool {
     notice.clear();
     match doc.save() {
@@ -716,6 +725,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     let mut walk_gen: u64 = 0;
     let mut tree: Option<Tree> = None;
     let mut tree_focus = false;
+    // Editor-wide rather than per-document, which is what makes a file
+    // opened while locked locked too.
+    let mut locked = false;
     let mut compare: Option<Compare> = None;
     // The last frame's answer to whether a pane cut a line off: what
     // bounds scrolling the view right, since nothing else knows how wide a
@@ -775,7 +787,11 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             // gone the moment the view is.
             let resolving = compare.as_ref().is_some_and(|c| c.resolving().is_some());
             let status_line = if notice.is_empty() && resolving {
-                compare::RESOLVE_HINT
+                if locked {
+                    compare::RESOLVE_HINT_LOCKED
+                } else {
+                    compare::RESOLVE_HINT
+                }
             } else {
                 &notice
             };
@@ -783,8 +799,11 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 &mut back,
                 tabs,
                 &mut scratch,
-                status_line,
-                status_caret,
+                draw::StatusLine {
+                    line: status_line,
+                    caret: status_caret,
+                    locked,
+                },
                 draw::Marks {
                     search,
                     syntax: tabs
@@ -818,7 +837,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             let hidden = compare.is_some()
                 || (tree_focus && draw::tree_width(tree.is_some(), back.size().0) > 0);
             let caret = (!hidden).then_some(cursor);
-            terminal.present(&back, caret)?;
+            // Locked, the caret still marks where movement and selection
+            // stand — it just stops blinking like an invitation to type.
+            terminal.present(&back, caret, locked)?;
         }
         redraw = true;
 
@@ -1022,6 +1043,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                     .push_str("kept your version — the file on disk is untouched");
                             }
                         }
+                        compare::Outcome::TakeDisk if locked => refuse_locked(&mut notice),
                         compare::Outcome::TakeDisk => {
                             if let Some(disk) = compare.as_ref().and_then(Compare::resolving) {
                                 // The panes stay up behind the question: the
@@ -1058,7 +1080,13 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     }
                 } else {
                     notice.clear();
-                    if let Some(action) = keymap::lookup(&key) {
+                    let action = keymap::lookup(&key);
+                    // The lock's gate. Every bound write passes through
+                    // here; the two writes that aren't bound — typing and
+                    // bracketed paste — are guarded where they land.
+                    if locked && action.is_some_and(Action::writes) {
+                        refuse_locked(&mut notice);
+                    } else if let Some(action) = action {
                         let Tab {
                             doc, view, diff, ..
                         } = tabs.active_mut();
@@ -1109,7 +1137,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             }
                             Action::Find => {
                                 doc.break_undo_group();
-                                let edit = SearchPrompt::new(view);
+                                let edit = SearchPrompt::new(view, locked);
                                 // The current match renders in reverse video, which
                                 // must not fight a reverse-video selection; the
                                 // origin keeps the anchor for Esc to restore.
@@ -1206,6 +1234,31 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                         tree_focus = false;
                                     }
                                     compare = opened;
+                                }
+                            }
+                            Action::ToggleLock => {
+                                locked = !locked;
+                                if !locked {
+                                    notice.push_str("unlocked");
+                                } else {
+                                    notice.push_str("locked");
+                                    // Buffers dirty before the lock keep
+                                    // their edits, and stay the only ones
+                                    // an agent's write can still conflict
+                                    // with — so they are counted out loud
+                                    // on the way in.
+                                    let dirty = tabs.dirty_count();
+                                    if dirty > 0 {
+                                        let (plural, verb) = if dirty == 1 {
+                                            ("", "holds")
+                                        } else {
+                                            ("s", "hold")
+                                        };
+                                        let _ = write!(
+                                            notice,
+                                            " — {dirty} buffer{plural} {verb} unsaved work"
+                                        );
+                                    }
                                 }
                             }
                             Action::ToggleTree => match tree.take() {
@@ -1332,8 +1385,12 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     {
-                        let Tab { doc, view, .. } = tabs.active_mut();
-                        view.insert_char(doc, ch);
+                        if locked {
+                            refuse_locked(&mut notice);
+                        } else {
+                            let Tab { doc, view, .. } = tabs.active_mut();
+                            view.insert_char(doc, ch);
+                        }
                     }
                 }
             }
@@ -1455,6 +1512,8 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             Ok(AppEvent::Input(Event::Paste(text))) => {
                 if let Some(pending) = &mut prompt {
                     prompt_paste(pending, &text, tabs, &mut notice);
+                } else if locked {
+                    refuse_locked(&mut notice);
                 } else {
                     notice.clear();
                     let Tab { doc, view, .. } = tabs.active_mut();

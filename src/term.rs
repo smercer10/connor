@@ -1,6 +1,7 @@
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::{Command as _, cursor, execute, terminal};
@@ -39,6 +40,8 @@ fn restore() {
             DisableBracketedPaste,
             Print(DISABLE_MOUSE),
             terminal::LeaveAlternateScreen,
+            // The lock's block caret is ours, not the shell's.
+            SetCursorStyle::DefaultUserShape,
             cursor::Show
         );
         let _ = terminal::disable_raw_mode();
@@ -61,6 +64,9 @@ pub struct Terminal {
     front: Screen,
     scratch: String,
     needs_clear: bool,
+    /// Whether the terminal is currently showing the lock's block caret,
+    /// so the shape is emitted on change rather than every frame.
+    block_caret: bool,
 }
 
 impl Terminal {
@@ -70,6 +76,7 @@ impl Terminal {
             front: Screen::new(width, height),
             scratch: String::new(),
             needs_clear: true,
+            block_caret: false,
         };
         term.reserve_scratch();
         term.enter()?;
@@ -112,13 +119,22 @@ impl Terminal {
     /// runs, wrapped in a synchronized update and flushed as a single write,
     /// leaving the terminal cursor visible at `cursor` — or hidden when
     /// `None`: a focused tree sidebar has a selection bar, not a caret.
+    /// `block` draws that caret as a steady block rather than the terminal's
+    /// own shape, which is how the lock says a position is still a position
+    /// but no longer an invitation to type.
     /// Allocation-free: everything is formatted into the reusable scratch
     /// buffer, whose capacity is provisioned at construction and resize.
-    pub fn present(&mut self, back: &Screen, cursor: Option<(u16, u16)>) -> io::Result<()> {
+    pub fn present(
+        &mut self,
+        back: &Screen,
+        cursor: Option<(u16, u16)>,
+        block: bool,
+    ) -> io::Result<()> {
         let Self {
             front,
             scratch,
             needs_clear,
+            block_caret,
         } = self;
         scratch.clear();
         let _ = terminal::BeginSynchronizedUpdate.write_ansi(scratch);
@@ -176,6 +192,15 @@ impl Terminal {
         if underlined {
             let _ = SetAttribute(Attribute::NoUnderline).write_ansi(scratch);
         }
+        if block != *block_caret {
+            *block_caret = block;
+            let style = if block {
+                SetCursorStyle::SteadyBlock
+            } else {
+                SetCursorStyle::DefaultUserShape
+            };
+            let _ = style.write_ansi(scratch);
+        }
         if let Some((cx, cy)) = cursor {
             let _ = cursor::MoveTo(cx, cy).write_ansi(scratch);
             let _ = cursor::Show.write_ansi(scratch);
@@ -211,6 +236,9 @@ impl Terminal {
         )?;
         self.front.clear();
         self.needs_clear = true;
+        // `restore` put the shape back, so a resume while locked has to
+        // re-emit it rather than believe the flag.
+        self.block_caret = false;
         Ok(())
     }
 

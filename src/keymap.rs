@@ -35,6 +35,7 @@ pub enum Action {
     PrevChange,
     NextChange,
     ToggleDiff,
+    ToggleLock,
     Left,
     Right,
     Up,
@@ -51,6 +52,54 @@ pub enum Action {
 }
 
 impl Action {
+    /// Whether the lock refuses this action. Exhaustive on purpose — a new
+    /// action has to say which side it is on rather than defaulting to
+    /// allowed, the same bargain dispatch makes by matching without a
+    /// wildcard. `Save` is here despite changing no buffer text: it writes
+    /// the file, and the file is what the agent has its hands on.
+    pub fn writes(self) -> bool {
+        match self {
+            Action::Save
+            | Action::Undo
+            | Action::Redo
+            | Action::Cut
+            | Action::Paste
+            | Action::Newline
+            | Action::InsertTab
+            | Action::Backspace
+            | Action::Delete => true,
+            Action::NewTab
+            | Action::Open
+            | Action::PickFile
+            | Action::ToggleTree
+            | Action::CloseTab
+            | Action::Quit
+            | Action::PrevTab
+            | Action::NextTab
+            | Action::Copy
+            | Action::Find
+            | Action::FindProject
+            | Action::GoToLine
+            | Action::PrevChange
+            | Action::NextChange
+            | Action::ToggleDiff
+            | Action::ToggleLock
+            | Action::Left
+            | Action::Right
+            | Action::Up
+            | Action::Down
+            | Action::WordLeft
+            | Action::WordRight
+            | Action::Home
+            | Action::End
+            | Action::DocStart
+            | Action::DocEnd
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Help => false,
+        }
+    }
+
     /// Movement shares a prelude in dispatch: shift extends the selection,
     /// plain movement clears it, and the undo group breaks.
     pub fn is_movement(self) -> bool {
@@ -192,6 +241,11 @@ pub static KEYMAP: &[Section] = &[
                 Action::ToggleDiff,
                 "diff against HEAD or disk",
             ),
+            bind(
+                &[alt(KeyCode::Char('l'))],
+                Action::ToggleLock,
+                "lock editing",
+            ),
         ],
     },
     Section {
@@ -277,6 +331,19 @@ pub fn write_help_hint(out: &mut String) {
     if let Some(key) = key {
         push_key(out, key);
         out.push_str(" help");
+    }
+}
+
+/// Appends the lock toggle's chord, e.g. "Alt+L" — the status line's
+/// indicator and every refusal are built from it, so a rebinding follows
+/// into both rather than leaving a message quoting a dead key.
+pub fn write_lock_chord(out: &mut String) {
+    let binding = KEYMAP
+        .iter()
+        .flat_map(|s| s.bindings)
+        .find(|b| b.action == Action::ToggleLock);
+    if let Some(key) = binding.and_then(|b| b.keys.first()) {
+        push_key(out, key);
     }
 }
 
@@ -372,6 +439,84 @@ mod tests {
         assert_eq!(section.title, "changes");
         // Nothing to extend with shift, and no cursor to extend from.
         assert!(!Action::ToggleDiff.is_movement());
+    }
+
+    #[test]
+    fn the_lock_toggle_joins_the_change_family() {
+        assert_eq!(label(Action::ToggleLock), "Alt+L");
+        assert_eq!(find(Action::ToggleLock).what, "lock editing");
+        // Browsing while the agent writes is the review loop, so it sits
+        // with the jumps and the diff rather than in a section of its own.
+        let section = KEYMAP
+            .iter()
+            .find(|s| s.bindings.iter().any(|b| b.action == Action::ToggleLock))
+            .unwrap();
+        assert_eq!(section.title, "changes");
+        assert!(!Action::ToggleLock.is_movement());
+        // The way out of the lock can never be locked away.
+        assert!(!Action::ToggleLock.writes());
+    }
+
+    #[test]
+    fn the_lock_chord_names_the_toggle() {
+        let mut out = String::new();
+        write_lock_chord(&mut out);
+        assert_eq!(out, "Alt+L");
+    }
+
+    #[test]
+    fn writing_classification_matches_the_table() {
+        // The edit section is what the lock exists to stop, save for Copy,
+        // which only reads. Deriving the expectation from the table means a
+        // binding added there has to be classified rather than defaulting.
+        for section in KEYMAP {
+            for binding in section.bindings {
+                let expected = match section.title {
+                    "edit" => binding.action != Action::Copy,
+                    _ => binding.action == Action::Save,
+                };
+                assert_eq!(
+                    binding.action.writes(),
+                    expected,
+                    "{:?} in section {}",
+                    binding.action,
+                    section.title
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn browsing_survives_the_lock() {
+        // The bullet the feature is judged on: navigation, search,
+        // selection, copy, tabs, the tree and the diff all still work.
+        for action in [
+            Action::Copy,
+            Action::Find,
+            Action::FindProject,
+            Action::GoToLine,
+            Action::PrevChange,
+            Action::NextChange,
+            Action::ToggleDiff,
+            Action::ToggleTree,
+            Action::PickFile,
+            Action::Open,
+            Action::NewTab,
+            Action::PrevTab,
+            Action::NextTab,
+            Action::CloseTab,
+            Action::Quit,
+            Action::Help,
+        ] {
+            assert!(!action.writes(), "{action:?} is blocked by the lock");
+        }
+        for section in KEYMAP {
+            if section.title == "move" {
+                for binding in section.bindings {
+                    assert!(!binding.action.writes(), "{:?}", binding.action);
+                }
+            }
+        }
     }
 
     #[test]

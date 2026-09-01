@@ -57,10 +57,17 @@ pub struct SearchPrompt {
     qlen: usize,
     /// Index into `matches` of the match the cursor sits on.
     current: Option<usize>,
+    /// The editor was locked when the prompt opened. Captured rather than
+    /// passed per key because a pending prompt owns every keypress, so the
+    /// toggle cannot reach the editor while this one is up.
+    locked: bool,
+    /// A replace key was just refused; the next key clears it. Blocked
+    /// input has to say why rather than appear to do nothing.
+    refused: bool,
 }
 
 impl SearchPrompt {
-    pub fn new(view: &View) -> SearchPrompt {
+    pub fn new(view: &View, locked: bool) -> SearchPrompt {
         SearchPrompt {
             query: String::new(),
             replacement: String::new(),
@@ -73,6 +80,8 @@ impl SearchPrompt {
             matches: Vec::new(),
             qlen: 0,
             current: None,
+            locked,
+            refused: false,
         }
     }
 
@@ -80,15 +89,21 @@ impl SearchPrompt {
     /// keys edit the document. Unrecognized keys are ignored so a stray
     /// chord can't dismiss the prompt.
     pub fn key(&mut self, key: &KeyEvent, doc: &mut Document, view: &mut View) -> Outcome {
+        self.refused = false;
         match key.code {
             KeyCode::Enter => match self.focus {
                 Focus::Find => return Outcome::Accept,
+                // Unreachable while locked, since Tab never reaches the
+                // replace field — guarded anyway, so the refusal is a
+                // property of the edit rather than of the route to it.
+                Focus::Replace if self.locked => self.refused = true,
                 Focus::Replace => self.replace_one(doc, view),
             },
             KeyCode::Esc => {
                 self.restore_origin(doc, view);
                 return Outcome::Cancel;
             }
+            KeyCode::Tab if self.locked => self.refused = true,
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Find => Focus::Replace,
@@ -97,6 +112,11 @@ impl SearchPrompt {
             }
             KeyCode::Up => self.step(doc, view, self.matches.len().wrapping_sub(1)),
             KeyCode::Down => self.step(doc, view, 1),
+            KeyCode::Char('a' | 'A')
+                if key.modifiers.contains(KeyModifiers::ALT) && self.locked =>
+            {
+                self.refused = true;
+            }
             KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::ALT) => {
                 let n = self.replace_all(doc, view);
                 if n > 0 {
@@ -163,9 +183,18 @@ impl SearchPrompt {
         } else if !self.query.is_empty() {
             notice.push_str(" · no matches");
         }
-        notice.push_str(match self.focus {
-            Focus::Find => " · ↑↓ next/prev · tab replace · esc",
-            Focus::Replace => " · enter one · alt+a all · tab find · esc",
+        if self.refused {
+            notice.push_str(" · locked — ");
+            crate::keymap::write_lock_chord(notice);
+            notice.push_str(" to replace");
+            return;
+        }
+        notice.push_str(match (self.focus, self.locked) {
+            // Replace is unreachable while locked, so the hint stops
+            // offering the key that gets there.
+            (Focus::Find, true) => " · ↑↓ next/prev · esc",
+            (Focus::Find, false) => " · ↑↓ next/prev · tab replace · esc",
+            (Focus::Replace, _) => " · enter one · alt+a all · tab find · esc",
         });
     }
 
@@ -418,7 +447,7 @@ mod tests {
     fn typing_jumps_to_the_first_match_after_the_origin() {
         let mut doc = Document::from_str("ab ab ab");
         let mut view = View::test_at(4, 0, 0); // inside the second "ab"
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         assert_eq!(view.cursor, 6); // third "ab": first at/after origin 4
         assert_eq!(prompt.current, Some(2));
@@ -428,7 +457,7 @@ mod tests {
     fn paste_lands_in_the_focused_field_and_researches() {
         let mut doc = Document::from_str("hello world");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         prompt.paste("wor\nld", &mut doc, &mut view);
         assert_eq!(prompt.query, "world");
         assert_eq!(prompt.current, Some(0));
@@ -443,7 +472,7 @@ mod tests {
     fn extending_the_query_re_anchors_from_the_origin() {
         let mut doc = Document::from_str("ax ay ax");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ay");
         assert_eq!(view.cursor, 3);
         // Backspace to "a": jumps back to the first match, not onward.
@@ -455,7 +484,7 @@ mod tests {
     fn navigation_wraps_both_ways() {
         let mut doc = Document::from_str("ab ab ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         assert_eq!(view.cursor, 0);
         prompt.key(&press(KeyCode::Up), &mut doc, &mut view);
@@ -470,7 +499,7 @@ mod tests {
     fn a_miss_leaves_the_cursor_and_reports_no_matches() {
         let mut doc = Document::from_str("ab ab");
         let mut view = View::test_at(3, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         assert_eq!(view.cursor, 3);
         type_query(&mut prompt, &mut doc, &mut view, "z");
@@ -488,7 +517,7 @@ mod tests {
         let mut doc = Document::from_str("start\nab ab ab abable");
         let mut view = View::test_at(2, 1, 3);
         view.anchor = Some(4);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         view.anchor = None; // as the Ctrl+F handler does
         type_query(&mut prompt, &mut doc, &mut view, "able");
         assert_eq!(view.cursor, 17);
@@ -501,7 +530,7 @@ mod tests {
         assert_eq!((view.scroll_line, view.scroll_col), (1, 3));
 
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "able");
         assert!(matches!(
             prompt.key(&press(KeyCode::Enter), &mut doc, &mut view),
@@ -514,7 +543,7 @@ mod tests {
     fn render_shows_the_counter_and_caret_chars_track_the_query() {
         let mut doc = Document::from_str("ab ab ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         let mut notice = String::new();
         prompt.render(&mut notice);
         assert_eq!(notice, "find:  · ↑↓ next/prev · tab replace · esc");
@@ -529,7 +558,7 @@ mod tests {
     fn refresh_recomputes_matches_without_moving_the_cursor() {
         let mut doc = Document::from_str("ab ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         assert_eq!(prompt.matches, vec![0, 3]);
 
@@ -547,10 +576,46 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_prompt_finds_but_never_replaces() {
+        let mut doc = Document::from_str("ab cd ab");
+        let mut view = View::test_at(0, 0, 0);
+        let mut prompt = SearchPrompt::new(&view, true);
+        type_query(&mut prompt, &mut doc, &mut view, "ab");
+        // Finding is the half of the prompt the lock has no quarrel with.
+        assert_eq!(view.cursor, 0);
+        prompt.key(&press(KeyCode::Down), &mut doc, &mut view);
+        assert_eq!(view.cursor, 6);
+        let mut notice = String::new();
+        prompt.render(&mut notice);
+        assert_eq!(notice, "find: ab · 2/2 · ↑↓ next/prev · esc");
+
+        // Tab does not reach the replace field, and says so rather than
+        // appearing to do nothing.
+        prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
+        assert!(prompt.focus == Focus::Find);
+        prompt.render(&mut notice);
+        assert_eq!(notice, "find: ab · 2/2 · locked — Alt+L to replace");
+
+        // Alt+A is reachable from the find field, so it is refused there.
+        assert!(matches!(
+            prompt.key(&alt('a'), &mut doc, &mut view),
+            Outcome::Pending
+        ));
+        assert_eq!(doc.rope().to_string(), "ab cd ab");
+        prompt.render(&mut notice);
+        assert_eq!(notice, "find: ab · 2/2 · locked — Alt+L to replace");
+
+        // The refusal is about the last key, not a state to get stuck in.
+        prompt.key(&press(KeyCode::Down), &mut doc, &mut view);
+        prompt.render(&mut notice);
+        assert_eq!(notice, "find: ab · 1/2 · ↑↓ next/prev · esc");
+    }
+
+    #[test]
     fn tab_routes_typing_to_the_replace_field_and_back() {
         let mut doc = Document::from_str("ab ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
         type_query(&mut prompt, &mut doc, &mut view, "xy");
@@ -574,7 +639,7 @@ mod tests {
     fn replace_one_replaces_advances_and_wraps() {
         let mut doc = Document::from_str("ab cd ab ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
         type_query(&mut prompt, &mut doc, &mut view, "xyz");
@@ -600,7 +665,7 @@ mod tests {
     fn replacing_the_last_match_reports_no_matches_and_stays_open() {
         let mut doc = Document::from_str("ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
         // An empty replacement deletes.
@@ -621,7 +686,7 @@ mod tests {
     fn a_replacement_containing_the_query_cannot_loop() {
         let mut doc = Document::from_str("a b");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "a");
         prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
         type_query(&mut prompt, &mut doc, &mut view, "aa");
@@ -638,7 +703,7 @@ mod tests {
     fn replace_all_is_one_undo_step_and_reports_the_count() {
         let mut doc = Document::from_str("ab x ab y ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         prompt.key(&press(KeyCode::Down), &mut doc, &mut view); // current: 2nd
         prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
@@ -659,7 +724,7 @@ mod tests {
     fn replace_all_with_no_matches_is_a_quiet_no_op() {
         let mut doc = Document::from_str("cd");
         let mut view = View::test_at(1, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         assert!(matches!(
             prompt.key(&alt('a'), &mut doc, &mut view),
@@ -673,7 +738,7 @@ mod tests {
     fn esc_after_replacements_clamps_the_restored_caret() {
         let mut doc = Document::from_str("xx ab");
         let mut view = View::test_at(5, 0, 0); // at the document's end
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         type_query(&mut prompt, &mut doc, &mut view, "ab");
         prompt.key(&press(KeyCode::Tab), &mut doc, &mut view);
         prompt.key(&press(KeyCode::Enter), &mut doc, &mut view); // delete "ab"
@@ -685,7 +750,7 @@ mod tests {
     fn stray_chords_do_not_edit_the_query() {
         let mut doc = Document::from_str("ab");
         let mut view = View::test_at(0, 0, 0);
-        let mut prompt = SearchPrompt::new(&view);
+        let mut prompt = SearchPrompt::new(&view, false);
         prompt.key(
             &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
             &mut doc,

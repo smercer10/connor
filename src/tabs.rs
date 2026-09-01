@@ -109,6 +109,13 @@ impl Tabs {
         self.tabs.iter().any(|tab| tab.doc.dirty())
     }
 
+    /// How many tabs hold unsaved work. The lock says this on the way in:
+    /// a buffer already dirty keeps its edits, and stays the only kind an
+    /// agent's write can still conflict with.
+    pub fn dirty_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.doc.dirty()).count()
+    }
+
     /// Finds the tab holding `path`. Paths compare canonically where they
     /// resolve, so `./x` and `x` meet; one that doesn't exist yet falls
     /// back to lexical equality.
@@ -236,5 +243,23 @@ mod tests {
             EditKind::Insert,
         );
         assert!(tabs.any_dirty());
+    }
+
+    #[test]
+    fn dirty_count_totals_every_tab() {
+        use crate::doc::{Caret, EditKind};
+        let caret = Caret {
+            cursor: 0,
+            anchor: None,
+        };
+        let mut tabs = Tabs::new(vec![
+            Document::from_str("a"),
+            Document::from_str("b"),
+            Document::from_str("c"),
+        ]);
+        assert_eq!(tabs.dirty_count(), 0);
+        tabs.get_mut(0).doc.edit(0..0, "x", caret, EditKind::Insert);
+        tabs.get_mut(2).doc.edit(0..0, "y", caret, EditKind::Insert);
+        assert_eq!(tabs.dirty_count(), 2);
     }
 }

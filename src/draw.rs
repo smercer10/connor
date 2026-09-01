@@ -423,14 +423,18 @@ pub fn draw_compare(
         screen.set(left_w as u16, y as u16, '│');
     }
 
-    // Only once a lookup has answered is an empty pane HEAD's answer
-    // rather than the absence of one.
-    let baseline = if compare.tracked() || compare.note().is_some() {
+    // A disk view names the file itself, and its read is already done —
+    // only a HEAD view can be standing beside an empty pane it has no
+    // answer for yet, and only once a lookup has answered is an empty one
+    // HEAD's answer rather than the absence of one.
+    let left_label = if compare.resolving().is_some() {
+        "disk"
+    } else if compare.tracked() || compare.note().is_some() {
         "HEAD"
     } else {
         "not in HEAD"
     };
-    draw_head(screen, 0, 1, baseline, left_w);
+    draw_head(screen, 0, 1, left_label, left_w);
     scratch.clear();
     let _ = write!(scratch, "{}", doc.name());
     if doc.dirty() {
@@ -481,8 +485,8 @@ pub fn draw_compare(
     // starts where the viewport does instead of scanning up to it — the
     // gutter's rule for hunks.
     let mut band_i = bands.partition_point(|b| b.row + b.height() <= top);
-    let head = compare.head();
-    let left_g = digits(head.len_lines()) + 2;
+    let baseline = compare.baseline();
+    let left_g = digits(baseline.len_lines()) + 2;
     let right_g = digits(doc.line_count()) + 2;
     let mut clipped = false;
     for k in 0..rows {
@@ -509,7 +513,7 @@ pub fn draw_compare(
                     fg: if band.same { 0 } else { 2 },
                 },
                 y,
-                head,
+                baseline,
                 band.head.start + offset,
                 scroll_col,
                 scratch,
@@ -1785,6 +1789,19 @@ mod tests {
         (doc, compare)
     }
 
+    /// The same two panes, standing a dirty buffer against the file the
+    /// conflict is about.
+    fn resolving(disk: &str, buffer: &str, rows: usize) -> (Document, Compare) {
+        let doc = named("sample.rs", buffer);
+        let disk = crate::doc::Disk {
+            text: Rope::from_str(disk),
+            hash: 1,
+            lossy: false,
+        };
+        let compare = Compare::disk(&doc, disk, 0, rows);
+        (doc, compare)
+    }
+
     fn render_compare(compare: &Compare, doc: &Document, width: u16, height: u16) -> Screen {
         let mut screen = Screen::new(width, height);
         let mut scratch = String::new();
@@ -1801,6 +1818,17 @@ mod tests {
         );
         draw_compare(&mut screen, compare, doc, &mut scratch);
         screen
+    }
+
+    #[test]
+    fn a_conflict_view_names_the_file_rather_than_head() {
+        let (doc, compare) = resolving("a\nb\n", "a\nB\n", 6);
+        let screen = render_compare(&compare, &doc, 30, 9);
+        // The left pane is the file itself; the right is the buffer, and
+        // the change between them reads exactly as a HEAD diff does.
+        assert_eq!(row(&screen, 1), "disk          │sample.rs      ");
+        assert_eq!(row(&screen, 2), "1  a          │1  a           ");
+        assert_eq!(row(&screen, 3), "2 ▍b          │2 ▍B           ");
     }
 
     #[test]

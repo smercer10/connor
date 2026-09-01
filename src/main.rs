@@ -32,7 +32,7 @@ use crossterm::event::{
 };
 
 use compare::Compare;
-use doc::{Caret, DiskCheck, Document};
+use doc::{Caret, Disk, DiskCheck, Document};
 use grep::Grep;
 use journal::{Journal, Recovered};
 use keymap::Action;
@@ -178,6 +178,10 @@ enum Prompt {
     /// The file loaded lossily, so writing it back mangles the bytes the
     /// U+FFFD marks stand for — overwriting must be deliberate.
     LossySave { then: AfterSave },
+    /// `t` in a conflict view: the disk version replaces unsaved edits, so
+    /// it is asked for. Carries the very read the panes showed, so what was
+    /// on screen is what lands however long the question stands.
+    TakeDisk(Disk),
     /// A path being typed, for opening a file or naming a buffer.
     Path {
         edit: PathPrompt,
@@ -209,6 +213,11 @@ fn open_prompt(prompt: Prompt, doc: &Document, notice: &mut String) -> Option<Pr
                 notice,
                 "invalid UTF-8 was replaced on load — overwrite {}? (y)es · (esc) cancel",
                 doc.name()
+            );
+        }
+        Prompt::TakeDisk(_) => {
+            notice.push_str(
+                "discard your unsaved edits and take the disk version? (y)es · (esc) cancel",
             );
         }
         Prompt::Path { edit, .. } => edit.render(notice),
@@ -264,7 +273,11 @@ fn prompt_paste(prompt: &mut Prompt, text: &str, tabs: &mut Tabs, notice: &mut S
         // The query lives in the overlay, so the notice stays untouched.
         Prompt::Pick(edit) => edit.paste(text),
         Prompt::Grep(edit) => edit.paste(text, Instant::now()),
-        Prompt::Quit | Prompt::Close | Prompt::LossySave { .. } | Prompt::Help => {}
+        Prompt::Quit
+        | Prompt::Close
+        | Prompt::LossySave { .. }
+        | Prompt::TakeDisk(_)
+        | Prompt::Help => {}
     }
 }
 
@@ -449,6 +462,21 @@ fn prompt_key(
                 AfterSave::Quit => quit_saving(tabs, notice),
                 AfterSave::Close => (None, close_active_or_quit(tabs)),
             }
+        }
+        (Prompt::TakeDisk(disk), KeyCode::Char('y' | 'Y')) => {
+            let Tab { doc, view, .. } = tabs.active_mut();
+            let caret = Caret {
+                cursor: view.cursor,
+                anchor: view.anchor,
+            };
+            // One undoable edit, so the edits it replaces are a Ctrl+Z away
+            // — which is the whole of "the unchosen side is never lost".
+            if let DiskCheck::Reloaded { old, span } = doc.take_disk(&disk, caret) {
+                view.remap_after_reload(&old, doc.rope(), &span);
+            }
+            notice.clear();
+            notice.push_str("took the disk version — undo restores your edits");
+            (None, false)
         }
         (_, KeyCode::Esc) => {
             notice.clear();
@@ -742,11 +770,20 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 Some(Prompt::Search(edit)) => Some(edit.highlights()),
                 _ => None,
             };
+            // The resolutions live in the view, so the status line is where
+            // they are offered: yielding to anything with more to say, and
+            // gone the moment the view is.
+            let resolving = compare.as_ref().is_some_and(|c| c.resolving().is_some());
+            let status_line = if notice.is_empty() && resolving {
+                compare::RESOLVE_HINT
+            } else {
+                &notice
+            };
             let mut cursor = draw::draw(
                 &mut back,
                 tabs,
                 &mut scratch,
-                &notice,
+                status_line,
                 status_caret,
                 draw::Marks {
                     search,
@@ -854,6 +891,18 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                 }
                 if fs_due {
                     reload_changed(tabs, &mut debounce);
+                    // The file moved again under an open conflict view: the
+                    // panes must show what a resolution would now apply,
+                    // not what it would have a moment ago.
+                    let rows = draw::compare_rows(text_h);
+                    if let Some(c) = &mut compare
+                        && let Some(hash) = c.resolving().map(|disk| disk.hash)
+                        && let Some(path) = tabs.active().doc.path()
+                        && let Ok(disk) = doc::read_disk(path)
+                        && disk.hash != hash
+                    {
+                        c.refresh_disk(&tabs.active().doc, disk, rows);
+                    }
                     // A reload may have shifted or removed matches; a stale
                     // set must never reach navigation or a replace.
                     if let Some(Prompt::Search(edit)) = &mut prompt {
@@ -959,9 +1008,33 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 {
                     notice.clear();
-                    match c.key(&key, draw::compare_rows(text_h), compare_clipped) {
+                    let outcome = c.key(&key, draw::compare_rows(text_h), compare_clipped);
+                    // A resolution is the view's to offer and the document's
+                    // to carry out, so it is dispatched out here.
+                    match outcome {
                         compare::Outcome::Pending => {}
                         compare::Outcome::Close => compare = None,
+                        compare::Outcome::KeepMine => {
+                            if let Some(disk) = compare.as_ref().and_then(Compare::resolving) {
+                                let hash = disk.hash;
+                                tabs.active_mut().doc.keep_buffer(hash);
+                                notice
+                                    .push_str("kept your version — the file on disk is untouched");
+                            }
+                        }
+                        compare::Outcome::TakeDisk => {
+                            if let Some(disk) = compare.as_ref().and_then(Compare::resolving) {
+                                // The panes stay up behind the question: the
+                                // status line is not theirs to cover, and it
+                                // is what the answer is about.
+                                let disk = disk.clone();
+                                prompt = open_prompt(
+                                    Prompt::TakeDisk(disk),
+                                    &tabs.active().doc,
+                                    &mut notice,
+                                );
+                            }
+                        }
                     }
                 } else if let Some(t) = &mut tree
                     && tree_focus
@@ -1100,22 +1173,39 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                             }
                             Action::ToggleDiff => {
                                 if compare.take().is_none() {
-                                    match compare::refusal(doc, diff) {
-                                        // A line in the status beats a
-                                        // full-screen view of nothing.
-                                        Some(why) => notice.push_str(why),
-                                        None => {
-                                            let line = view.line(doc);
-                                            doc.break_undo_group();
-                                            compare = Some(Compare::new(
-                                                doc,
-                                                diff,
-                                                line,
-                                                draw::compare_rows(text_h),
-                                            ));
-                                            tree_focus = false;
+                                    let (line, rows) = (view.line(doc), draw::compare_rows(text_h));
+                                    // A conflicted buffer has something more
+                                    // pressing to stand against than HEAD:
+                                    // the file that changed underneath it.
+                                    // That view needs no repository and no
+                                    // lookup, so it opens where the other
+                                    // one would decline.
+                                    let opened = if doc.conflict() {
+                                        match doc.path().map(doc::read_disk) {
+                                            Some(Ok(disk)) => {
+                                                Some(Compare::disk(doc, disk, line, rows))
+                                            }
+                                            _ => {
+                                                notice.push_str(compare::UNREADABLE);
+                                                None
+                                            }
                                         }
+                                    } else {
+                                        match compare::refusal(doc, diff) {
+                                            // A line in the status beats a
+                                            // full-screen view of nothing.
+                                            Some(why) => {
+                                                notice.push_str(why);
+                                                None
+                                            }
+                                            None => Some(Compare::new(doc, diff, line, rows)),
+                                        }
+                                    };
+                                    if opened.is_some() {
+                                        doc.break_undo_group();
+                                        tree_focus = false;
                                     }
+                                    compare = opened;
                                 }
                             }
                             Action::ToggleTree => match tree.take() {
@@ -1374,6 +1464,24 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             Ok(AppEvent::Input(_)) => {}
         }
 
+        // A conflict view stands on one document's conflict, so it closes
+        // when that conflict does — by either resolution, by a save, or by
+        // the disk reverting on its own — and when another tab comes to the
+        // front. Nothing having spoken means it dissolved rather than being
+        // resolved, which the view vanishing does not say on its own.
+        if let Some(c) = &compare
+            && c.resolving().is_some()
+        {
+            let doc = &tabs.active().doc;
+            let same = c.doc_id() == doc.id();
+            if !same || !doc.conflict() {
+                if same && notice.is_empty() {
+                    notice.push_str("the disk conflict is gone");
+                }
+                compare = None;
+                redraw = true;
+            }
+        }
         if let Some(watcher) = &mut watcher {
             watcher.sync(tabs);
         }

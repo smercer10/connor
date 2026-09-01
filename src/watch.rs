@@ -28,6 +28,8 @@ pub enum AppEvent {
     Parsed(crate::syntax::ParseDone),
     /// A finished HEAD lookup or line diff from the gutter marks.
     Diffed(crate::diff::DiffDone),
+    /// A finished project-wide scan of the files that differ from HEAD.
+    Scanned(crate::status::ScanDone),
     /// An external signal arrived; the loop decides whether to suspend,
     /// resync, or exit.
     #[cfg(unix)]

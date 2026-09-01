@@ -55,6 +55,13 @@ pub fn in_repo(path: &Path) -> bool {
     fs::canonicalize(dir).is_ok_and(|dir| repo_of(&dir).is_some())
 }
 
+/// Whether a directory sits inside a git project: `in_repo` for a
+/// directory rather than a file, so no parent has to be resolved first.
+/// The project root is the answer for the session as a whole.
+pub fn is_repo(dir: &Path) -> bool {
+    repo_of(dir).is_some()
+}
+
 /// The nearest ancestor holding `.git`, which may be a directory or, in a
 /// worktree, a file.
 fn repo_of(start: &Path) -> Option<&Path> {
@@ -131,15 +138,19 @@ mod tests {
         assert!(in_repo(&root.join("src/deep/file.rs")));
         assert!(in_repo(&root.join("top.rs")));
         assert_eq!(root_from(&root.join("src/deep")), root);
+        assert!(is_repo(&root));
+        assert!(is_repo(&root.join("src/deep")));
 
         // A worktree's `.git` is a file, and counts the same.
         let linked = scratch_dir("in-worktree");
         fs::write(linked.join(".git"), b"gitdir: /elsewhere").unwrap();
         touch(&linked.join("a.rs"));
         assert!(in_repo(&linked.join("a.rs")));
+        assert!(is_repo(&linked));
 
         let loose = scratch_dir("no-repo");
         assert!(!in_repo(&loose.join("a.rs")));
+        assert!(!is_repo(&loose));
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&linked).unwrap();
         fs::remove_dir_all(&loose).unwrap();

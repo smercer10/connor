@@ -12,6 +12,7 @@ mod project;
 mod prompt;
 mod screen;
 mod search;
+mod status;
 mod syntax;
 mod tabs;
 mod term;
@@ -39,6 +40,7 @@ use picker::Picker;
 use prompt::{LinePrompt, Outcome, PathPrompt};
 use screen::Screen;
 use search::SearchPrompt;
+use status::Status;
 use tabs::{Tab, Tabs};
 use term::Terminal;
 use tree::Tree;
@@ -694,6 +696,12 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
     let mut tree_watch: Option<TreeWatcher> = None;
     let mut refresh = Refresh::default();
     let mut head_refresh = Refresh::default();
+    // The project's files against HEAD, for the tree rows and tab labels.
+    // The first scan starts here rather than in a frame, and every later
+    // one at a refresh expiry, so drawing never waits on `git`.
+    let mut status = Status::new(&root);
+    status.pump(&tx);
+    let mut status_refresh = Refresh::default();
     let mut redraw = true;
 
     loop {
@@ -711,6 +719,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     view,
                     syntax,
                     diff,
+                    ..
                 } = tabs.active_mut();
                 if let Some(syntax) = syntax {
                     syntax.pump(doc, &tx);
@@ -747,7 +756,11 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                         .as_ref()
                         .map_or(&[][..], syntax::Syntax::spans),
                 },
-                tree.as_ref().map(|t| (t, tree_focus)),
+                tree.as_ref().map(|t| draw::Sidebar {
+                    tree: t,
+                    focused: tree_focus,
+                    status: &status,
+                }),
             );
             compare_clipped = match &compare {
                 Some(c) => draw::draw_compare(&mut back, c, &tabs.active().doc, &mut scratch),
@@ -787,6 +800,7 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
             journal.deadline(),
             refresh.deadline(),
             head_refresh.deadline(),
+            status_refresh.deadline(),
             grep_restart,
         ]
         .into_iter()
@@ -830,6 +844,14 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     let Tab { doc, diff, .. } = tabs.active_mut();
                     diff.pump(doc, &tx);
                 }
+                if status_refresh.take(now) {
+                    // Anything the watchers see can move git's answer: a
+                    // save, a commit, a branch switch. Spawning here rather
+                    // than in a frame is what keeps a repository under a
+                    // build from repainting for changes it may not have.
+                    status.mark_stale();
+                    status.pump(&tx);
+                }
                 if fs_due {
                     reload_changed(tabs, &mut debounce);
                     // A reload may have shifted or removed matches; a stale
@@ -868,6 +890,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     .any(|tab| tab.diff.git_dir().is_some_and(|dir| path.starts_with(dir)))
                 {
                     head_refresh.note(now);
+                }
+                if status.in_repo() {
+                    status_refresh.note(now);
                 }
                 debounce.note(path, now);
                 // Noting changes nothing on screen; the expiries draw.
@@ -912,6 +937,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                     let Tab { doc, diff, .. } = tabs.active();
                     redraw |= c.stale(doc, diff);
                 }
+            }
+            Ok(AppEvent::Scanned(done)) => {
+                redraw = status.absorb(done, &tx);
             }
             Ok(AppEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 // A pending prompt owns the key; the loop tail still runs,
@@ -1101,6 +1129,12 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
                                     walk_gen += 1;
                                     let cancel =
                                         project::spawn_walk(root.clone(), walk_gen, tx.clone());
+                                    // The watchers only see directories one
+                                    // of the two trees is holding, so with
+                                    // the sidebar shut the marks can have
+                                    // aged; opening it asks again.
+                                    status.mark_stale();
+                                    status.pump(&tx);
                                     let mut t = Tree::new(root.clone(), walk_gen, cancel);
                                     t.set_active(tabs.active().doc.path());
                                     tree = Some(t);
@@ -1348,6 +1382,9 @@ fn run(tabs: &mut Tabs, journal: &mut Journal, notice: String) -> io::Result<Exi
         if let Some(t) = &mut tree {
             redraw |= t.set_active(tabs.active().doc.path());
         }
+        // Likewise for the labels' change marks, which follow the tabs
+        // themselves rather than the edited one.
+        redraw |= status.sync(tabs);
         // One call site covers every way an entry goes stale: a save, an
         // undo back to clean, a discarded close. A failure notice appearing
         // here must reach the screen even on a wake that skips the draw.

@@ -190,7 +190,7 @@ pub static KEYMAP: &[Section] = &[
             bind(
                 &[alt(KeyCode::Char('d'))],
                 Action::ToggleDiff,
-                "diff against HEAD",
+                "diff against HEAD or disk",
             ),
         ],
     },
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn the_diff_toggle_joins_the_change_family() {
         assert_eq!(label(Action::ToggleDiff), "Alt+D");
-        assert_eq!(find(Action::ToggleDiff).what, "diff against HEAD");
+        assert_eq!(find(Action::ToggleDiff).what, "diff against HEAD or disk");
         // Its own section, beside the jumps that walk what it shows.
         let section = KEYMAP
             .iter()

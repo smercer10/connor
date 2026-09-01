@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 
 use crate::grapheme;
 
@@ -152,6 +152,30 @@ pub enum DiskCheck {
     Reloaded { old: Rope, span: ChangeSpan },
     /// Dirty buffer kept its text; the conflict flag is up.
     Conflict,
+}
+
+/// The file as it stands: its text, the hash naming those exact bytes, and
+/// whether decoding replaced invalid UTF-8. Read once and handed on, so the
+/// version a conflict view showed is the version its resolution applies.
+/// Cloning one is a rope clone: copy-on-write, not a copy.
+#[derive(Clone)]
+pub struct Disk {
+    pub text: Rope,
+    pub hash: u64,
+    pub lossy: bool,
+}
+
+/// Reads the file the way the buffer was loaded: bytes hashed verbatim, and
+/// invalid UTF-8 replaced rather than refused.
+pub fn read_disk(path: &Path) -> io::Result<Disk> {
+    let bytes = fs::read(path)?;
+    let hash = fnv1a(std::iter::once(bytes.as_slice()));
+    let decoded = String::from_utf8_lossy(&bytes);
+    Ok(Disk {
+        lossy: matches!(decoded, Cow::Owned(_)),
+        text: Rope::from_str(&decoded),
+        hash,
+    })
 }
 
 /// The user gesture behind an edit — the hint coalescing uses to fold a
@@ -443,11 +467,10 @@ impl Document {
         let Some(path) = self.path.as_deref() else {
             return DiskCheck::Unchanged;
         };
-        let Ok(bytes) = fs::read(path) else {
+        let Ok(disk) = read_disk(path) else {
             return DiskCheck::Unchanged;
         };
-        let hash = fnv1a(std::iter::once(bytes.as_slice()));
-        if Some(hash) == self.disk_hash {
+        if Some(disk.hash) == self.disk_hash {
             self.conflict = false;
             return DiskCheck::Unchanged;
         }
@@ -455,15 +478,34 @@ impl Document {
             self.conflict = true;
             return DiskCheck::Conflict;
         }
-        let text = String::from_utf8_lossy(&bytes);
-        let lossy = matches!(text, Cow::Owned(_));
-        let span = change_span(&self.rope, &text);
+        self.adopt(&disk, caret)
+    }
+
+    /// Resolves a conflict the other way from `keep_buffer`: the disk
+    /// version wins. `disk` is the read the conflict view showed rather
+    /// than a fresh one, so what stood in the pane is what lands. The
+    /// buffer's own text goes nowhere silently — this is one undoable edit,
+    /// so undo brings the unsaved work back.
+    pub fn take_disk(&mut self, disk: &Disk, caret: Caret) -> DiskCheck {
+        self.adopt(disk, caret)
+    }
+
+    /// Resolves a conflict by keeping the buffer: the file is left exactly
+    /// as it is, and `hash` — the bytes the choice was made against —
+    /// becomes the content later events compare with, so watching is quiet
+    /// until the file changes *again*.
+    pub fn keep_buffer(&mut self, hash: u64) {
+        self.disk_hash = Some(hash);
+        self.conflict = false;
+    }
+
+    /// Swaps the buffer to the disk content as one undoable edit spanning
+    /// just the changed region, leaving the buffer clean and matching the
+    /// file. `old` is the text as it stood, for re-anchoring views.
+    fn adopt(&mut self, disk: &Disk, caret: Caret) -> DiskCheck {
+        let span = change_span(&self.rope, disk.text.slice(..));
         let old = self.rope.clone();
-        let middle: String = text
-            .chars()
-            .skip(span.prefix)
-            .take(span.new_suffix_start - span.prefix)
-            .collect();
+        let middle = String::from(disk.text.slice(span.prefix..span.new_suffix_start));
         // Distinct bytes can decode to identical chars (two lossy loads,
         // say); an empty edit would still open a no-op undo step.
         if span.prefix != span.old_suffix_start || !middle.is_empty() {
@@ -478,8 +520,8 @@ impl Document {
         }
         self.line_ending = detect_line_ending(&self.rope);
         self.indent = detect_indent(&self.rope);
-        self.lossy = lossy;
-        self.disk_hash = Some(hash);
+        self.lossy = disk.lossy;
+        self.disk_hash = Some(disk.hash);
         self.conflict = false;
         DiskCheck::Reloaded { old, span }
     }
@@ -490,12 +532,9 @@ impl Document {
     /// false when the journal already matches the buffer: nothing was
     /// unsaved after all, and the buffer stays clean and unmarked.
     pub fn restore_journal(&mut self, text: &str) -> bool {
-        let span = change_span(&self.rope, text);
-        let middle: String = text
-            .chars()
-            .skip(span.prefix)
-            .take(span.new_suffix_start - span.prefix)
-            .collect();
+        let text = Rope::from_str(text);
+        let span = change_span(&self.rope, text.slice(..));
+        let middle = String::from(text.slice(span.prefix..span.new_suffix_start));
         if span.prefix == span.old_suffix_start && middle.is_empty() {
             return false;
         }
@@ -685,9 +724,9 @@ fn fnv1a<'a>(chunks: impl Iterator<Item = &'a [u8]>) -> u64 {
 /// The common prefix and suffix between the buffer and freshly read text,
 /// as a `ChangeSpan` in chars. The suffix scan is capped so the regions
 /// never overlap when text was purely inserted or deleted.
-fn change_span(old: &Rope, new: &str) -> ChangeSpan {
+fn change_span(old: &Rope, new: RopeSlice<'_>) -> ChangeSpan {
     let old_len = old.len_chars();
-    let new_len = new.chars().count();
+    let new_len = new.len_chars();
     let mut prefix = 0;
     for (a, b) in old.chars().zip(new.chars()) {
         if a != b {
@@ -697,7 +736,11 @@ fn change_span(old: &Rope, new: &str) -> ChangeSpan {
     }
     let limit = old_len.min(new_len) - prefix;
     let mut suffix = 0;
-    for (a, b) in old.chars_at(old_len).reversed().zip(new.chars().rev()) {
+    for (a, b) in old
+        .chars_at(old_len)
+        .reversed()
+        .zip(new.chars_at(new_len).reversed())
+    {
         if a != b || suffix == limit {
             break;
         }
@@ -1163,7 +1206,7 @@ mod tests {
     }
 
     fn span(old: &str, new: &str) -> ChangeSpan {
-        change_span(&Rope::from_str(old), new)
+        change_span(&Rope::from_str(old), Rope::from_str(new).slice(..))
     }
 
     #[test]
@@ -1263,6 +1306,118 @@ mod tests {
         std::fs::write(&path, "base\n").unwrap();
         assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Unchanged));
         assert!(!doc.conflict());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn taking_the_disk_version_replaces_the_buffer_and_undo_brings_it_back() {
+        let dir = scratch_dir("resolve-take");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.edit(0..0, "mine ", caret(0), EditKind::Insert);
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(doc.check_disk(caret(5)), DiskCheck::Conflict));
+
+        let disk = read_disk(&path).unwrap();
+        assert!(matches!(
+            doc.take_disk(&disk, caret(5)),
+            DiskCheck::Reloaded { .. }
+        ));
+        assert_eq!(doc.rope().to_string(), "theirs\n");
+        // Clean and matching the file, so the watch event that follows finds
+        // nothing left to do.
+        assert!(!doc.dirty());
+        assert!(!doc.conflict());
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Unchanged));
+        // The side not chosen went to undo rather than nowhere.
+        assert!(doc.undo().is_some());
+        assert_eq!(doc.rope().to_string(), "mine base\n");
+        assert!(doc.dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn taking_the_disk_version_reports_the_changed_region_alone() {
+        let dir = scratch_dir("resolve-span");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "head\nmiddle\ntail\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.edit(5..5, "my ", caret(8), EditKind::Insert);
+        std::fs::write(&path, "head\nnew middle\ntail\n").unwrap();
+        assert!(matches!(doc.check_disk(caret(8)), DiskCheck::Conflict));
+
+        let disk = read_disk(&path).unwrap();
+        let DiskCheck::Reloaded { span, .. } = doc.take_disk(&disk, caret(8)) else {
+            panic!("the disk version replaces the buffer");
+        };
+        assert_eq!(doc.rope().to_string(), "head\nnew middle\ntail\n");
+        // The shared head and tail stand: a cursor past the change moves by
+        // the length delta rather than collapsing to the top of the file,
+        // which is what re-anchoring by content means.
+        assert_eq!(
+            span,
+            ChangeSpan {
+                prefix: 5,
+                old_suffix_start: 7,
+                new_suffix_start: 8
+            }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keeping_the_buffer_leaves_the_file_and_quiets_the_next_event() {
+        let dir = scratch_dir("resolve-keep");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.edit(0..0, "mine ", caret(0), EditKind::Insert);
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Conflict));
+
+        doc.keep_buffer(read_disk(&path).unwrap().hash);
+        assert!(!doc.conflict());
+        assert_eq!(doc.rope().to_string(), "mine base\n");
+        assert!(doc.dirty(), "the edits are still unsaved");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theirs\n",
+            "the file is untouched until a save"
+        );
+        // Quiet for the bytes the choice was made against...
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Unchanged));
+        assert!(!doc.conflict());
+        // ...and conflicting afresh the next time the file moves.
+        std::fs::write(&path, "theirs again\n").unwrap();
+        assert!(matches!(doc.check_disk(caret(0)), DiskCheck::Conflict));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_disk_names_the_bytes_and_carries_a_lossy_decode() {
+        let dir = scratch_dir("resolve-read");
+        let path = dir.join("f.txt");
+        assert!(read_disk(&path).is_err(), "nothing there to read");
+        std::fs::write(&path, b"ok\n").unwrap();
+        let plain = read_disk(&path).unwrap();
+        assert_eq!(plain.text.to_string(), "ok\n");
+        assert!(!plain.lossy);
+        assert_eq!(
+            read_disk(&path).unwrap().hash,
+            plain.hash,
+            "the same bytes name themselves the same way"
+        );
+
+        std::fs::write(&path, b"\xff\n").unwrap();
+        let bad = read_disk(&path).unwrap();
+        assert!(bad.lossy);
+        assert_ne!(bad.hash, plain.hash);
+        // Taking it hands the flag to the buffer, as a reload would.
+        let mut doc = Document::from_str("mine\n");
+        doc.edit(0..0, "x", caret(0), EditKind::Insert);
+        doc.take_disk(&bad, caret(0));
+        assert!(doc.lossy());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

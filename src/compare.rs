@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ropey::Rope;
 
 use crate::diff::{self, Band, Diff};
-use crate::doc::Document;
+use crate::doc::{Disk, Document};
 
 /// Nothing will ever stand beside this buffer: it is outside a repository,
 /// or has no path yet. Said in the status line when the toggle declines to
@@ -18,6 +18,14 @@ pub const NOTHING: &str = "nothing in HEAD to compare against";
 /// generated rather than reviewed, and saying so beats claiming HEAD has
 /// never seen it.
 pub const TOO_BIG: &str = "file too large to diff";
+
+/// The file a conflict is about could not be read: it was deleted, or its
+/// permissions changed, between the change landing and the view opening.
+pub const UNREADABLE: &str = "can't read the file on disk";
+
+/// The choice a conflict view offers, in the status line — the resolutions
+/// are the view's, so nothing else has a place to say them.
+pub const RESOLVE_HINT: &str = "(k)eep yours · (t)ake disk · (esc) cancel";
 
 /// Said in the pane while the first lookup is still out — a few
 /// milliseconds after open, and the one moment "no baseline yet" would
@@ -40,13 +48,22 @@ pub enum Outcome {
     Pending,
     /// Esc: the view closes and the buffer is exactly where it was.
     Close,
+    /// Keep the buffer: the file on disk is left untouched until a save.
+    KeepMine,
+    /// Take the disk version over the unsaved edits, once confirmed.
+    TakeDisk,
 }
 
 pub struct Compare {
-    /// The baseline, owned: a ropey clone is copy-on-write rather than a
-    /// copy, and holding it keeps this a view of two texts rather than of a
-    /// `Diff` — which is what will let #40 point it at the file on disk.
+    /// The baseline of a HEAD view, owned: a ropey clone is copy-on-write
+    /// rather than a copy, and holding it keeps this a view of two texts
+    /// rather than of a `Diff`. Empty in a disk view, where `disk` holds the
+    /// text the buffer stands against.
     head: Rope,
+    /// The file as it was read when a disk view opened: what the panes show
+    /// and, if the disk version is taken, exactly what lands in the buffer.
+    /// `None` in a HEAD view — and the only thing that tells the two apart.
+    disk: Option<Disk>,
     /// Whether the baseline is HEAD's content or the empty stand-in a file
     /// HEAD has never seen gets.
     tracked: bool,
@@ -70,11 +87,12 @@ pub struct Compare {
 }
 
 impl Compare {
-    /// Opens with `line` — the cursor's — at the top, so the view starts
-    /// where the reader already is.
-    pub fn new(doc: &Document, diff: &Diff, line: usize, rows: usize) -> Compare {
-        let mut compare = Compare {
+    /// The shell both openings start from: what fills it is the whole of
+    /// what tells a HEAD view from a disk one.
+    fn blank() -> Compare {
+        Compare {
             head: Rope::new(),
+            disk: None,
             tracked: false,
             bands: Vec::new(),
             changed: Vec::new(),
@@ -85,10 +103,37 @@ impl Compare {
             top: 0,
             scroll_col: 0,
             at: None,
-        };
+        }
+    }
+
+    /// Opens with `line` — the cursor's — at the top, so the view starts
+    /// where the reader already is.
+    pub fn new(doc: &Document, diff: &Diff, line: usize, rows: usize) -> Compare {
+        let mut compare = Compare::blank();
         compare.build(doc, diff);
         compare.top = compare.clamp(compare.row_of(line), rows);
         compare
+    }
+
+    /// Opens the buffer against the file on disk rather than HEAD: the
+    /// conflict a dirty buffer's file changing underneath it raises, stood
+    /// up so it can be resolved. Needs no repository and no lookup — the
+    /// read is already done — so it opens where a HEAD view could not.
+    pub fn disk(doc: &Document, disk: Disk, line: usize, rows: usize) -> Compare {
+        let mut compare = Compare::blank();
+        compare.build_disk(doc, disk);
+        compare.top = compare.clamp(compare.row_of(line), rows);
+        compare
+    }
+
+    /// Rebuilds a disk view against a fresh read: the file moved again while
+    /// the view was up, and a pane showing what is no longer there is one a
+    /// resolution cannot be made from. Keeps your place, like a moved
+    /// baseline does.
+    pub fn refresh_disk(&mut self, doc: &Document, disk: Disk, rows: usize) {
+        self.build_disk(doc, disk);
+        self.top = self.clamp(self.top, rows);
+        self.at = None;
     }
 
     /// Rebuilds when the marks moved: a new tab under the view, a baseline
@@ -98,7 +143,7 @@ impl Compare {
     /// arriving ahead of its diff shows through at once and only the
     /// alignment lags — the same bargain the gutter already makes.
     pub fn sync(&mut self, doc: &Document, diff: &Diff, rows: usize) {
-        if !self.stale(doc, diff) {
+        if self.disk.is_some() || !self.stale(doc, diff) {
             return;
         }
         let same_doc = self.doc_id == doc.id();
@@ -118,9 +163,10 @@ impl Compare {
     /// the marks it produced did not — a clean file's stay empty either
     /// way, and the gutter is right not to repaint for that.
     pub fn stale(&self, doc: &Document, diff: &Diff) -> bool {
-        self.doc_id != doc.id()
-            || self.head_gen != diff.head_gen()
-            || self.hunk_rev != diff.hunk_rev()
+        self.disk.is_none()
+            && (self.doc_id != doc.id()
+                || self.head_gen != diff.head_gen()
+                || self.hunk_rev != diff.hunk_rev())
     }
 
     fn build(&mut self, doc: &Document, diff: &Diff) {
@@ -151,8 +197,41 @@ impl Compare {
         }
     }
 
-    pub fn head(&self) -> &Rope {
-        &self.head
+    /// The two sides' own read of the file, for a disk view: no repository,
+    /// no lookup and no staleness tags, since nothing can move under it but
+    /// the file itself — and that arrives through `refresh_disk`.
+    fn build_disk(&mut self, doc: &Document, disk: Disk) {
+        self.doc_id = doc.id();
+        self.note = (doc.rope().len_bytes() > diff::MAX_LEN
+            || disk.text.len_bytes() > diff::MAX_LEN)
+            .then_some(TOO_BIG);
+        self.bands.clear();
+        self.changed.clear();
+        if self.note.is_none() {
+            let hunks = diff::hunks(&disk.text, doc.rope());
+            self.bands = diff::bands(&hunks, disk.text.len_lines(), doc.rope().len_lines());
+            self.changed
+                .extend(self.bands.iter().filter(|b| !b.same).map(|b| b.row));
+        }
+        self.disk = Some(disk);
+    }
+
+    /// The text in the left pane, whichever kind of view this is.
+    pub fn baseline(&self) -> &Rope {
+        match &self.disk {
+            Some(disk) => &disk.text,
+            None => &self.head,
+        }
+    }
+
+    /// The file this view stands the buffer against, when it is a conflict
+    /// being resolved rather than a diff being read.
+    pub fn resolving(&self) -> Option<&Disk> {
+        self.disk.as_ref()
+    }
+
+    pub fn doc_id(&self) -> u64 {
+        self.doc_id
     }
 
     pub fn tracked(&self) -> bool {
@@ -208,6 +287,13 @@ impl Compare {
     /// walking it, so that is what bounds scrolling right.
     pub fn key(&mut self, key: &KeyEvent, rows: usize, clipped: bool) -> Outcome {
         let page = rows.max(1) as isize;
+        if self.disk.is_some() {
+            match key.code {
+                KeyCode::Char('k' | 'K') => return Outcome::KeepMine,
+                KeyCode::Char('t' | 'T') => return Outcome::TakeDisk,
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => return Outcome::Close,
             KeyCode::Up => self.scroll_by(-1, rows),
@@ -288,6 +374,21 @@ mod tests {
         let diff = Diff::test_baseline(Some(baseline), found);
         let compare = Compare::new(&doc, &diff, line, rows);
         (doc, diff, compare)
+    }
+
+    /// A view of `buffer` against the file, as a conflict stands it up.
+    fn disk_view(disk: &str, buffer: &str, line: usize, rows: usize) -> (Document, Compare) {
+        let doc = Document::from_str(buffer);
+        let compare = Compare::disk(&doc, on_disk(disk, 1), line, rows);
+        (doc, compare)
+    }
+
+    fn on_disk(text: &str, hash: u64) -> Disk {
+        Disk {
+            text: Rope::from_str(text),
+            hash,
+            lossy: false,
+        }
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -510,6 +611,98 @@ mod tests {
         compare.sync(&other, &Diff::test_baseline(Some(baseline), found), 10);
         assert_eq!(compare.top(), 0);
         assert_eq!(compare.changes(), 1);
+    }
+
+    #[test]
+    fn a_disk_view_stands_the_buffer_against_the_file_it_read() {
+        let disk = lines(60);
+        let buffer = disk.replace("line 5\n", "LINE 5\n");
+        let (_, compare) = disk_view(&disk, &buffer, 0, 10);
+        // No repository, no lookup, no waiting: the read is the baseline.
+        assert_eq!(compare.note(), None);
+        assert_eq!(compare.changes(), 1);
+        assert_eq!(compare.baseline().to_string(), disk);
+        assert_eq!(compare.resolving().map(|d| d.hash), Some(1));
+    }
+
+    #[test]
+    fn a_disk_view_is_never_rebuilt_by_the_diff_behind_it() {
+        let disk = lines(20);
+        let (doc, mut compare) = disk_view(&disk, &disk, 0, 5);
+        compare.scroll_by(3, 5);
+        // A HEAD lookup landing underneath says nothing about the file.
+        let mut landed = Diff::test_baseline(Some(Rope::from_str("elsewhere\n")), Vec::new());
+        landed.bump_head_gen();
+        assert!(!compare.stale(&doc, &landed));
+        compare.sync(&doc, &landed, 5);
+        assert_eq!(compare.top(), 3);
+        assert_eq!(compare.baseline().to_string(), disk);
+    }
+
+    #[test]
+    fn the_resolutions_belong_to_the_disk_view_alone() {
+        let disk = lines(10);
+        let (_, mut compare) = disk_view(&disk, &disk, 0, 5);
+        assert!(matches!(
+            compare.key(&press(KeyCode::Char('k')), 5, false),
+            Outcome::KeepMine
+        ));
+        assert!(matches!(
+            compare.key(&press(KeyCode::Char('T')), 5, false),
+            Outcome::TakeDisk
+        ));
+        // Reading the view still works while the choice stands open.
+        compare.key(&press(KeyCode::Down), 5, false);
+        assert_eq!(compare.top(), 1);
+        assert!(matches!(
+            compare.key(&press(KeyCode::Esc), 5, false),
+            Outcome::Close
+        ));
+
+        // In a HEAD view they are typing, and typing is swallowed.
+        let (_, _, mut head) = view_of(&disk, &disk, 0, 5);
+        for code in [KeyCode::Char('k'), KeyCode::Char('t')] {
+            assert!(matches!(head.key(&press(code), 5, false), Outcome::Pending));
+        }
+    }
+
+    #[test]
+    fn a_file_that_moved_again_rebuilds_the_view_and_keeps_your_place() {
+        let disk = lines(60);
+        let (doc, mut compare) = disk_view(&disk, &disk, 0, 10);
+        compare.scroll_by(20, 10);
+        assert_eq!(compare.changes(), 0);
+
+        let moved = disk.replace("line 40\n", "LINE 40\n");
+        compare.refresh_disk(&doc, on_disk(&moved, 2), 10);
+        assert_eq!(compare.changes(), 1);
+        assert_eq!(compare.top(), 20, "the same file keeps its place");
+        assert_eq!(
+            compare.resolving().map(|d| d.hash),
+            Some(2),
+            "and a resolution would apply what the panes now show"
+        );
+    }
+
+    #[test]
+    fn either_side_past_the_cap_notes_but_still_resolves() {
+        let big = "x\n".repeat(diff::MAX_LEN);
+        let doc = Document::from_str("small\n");
+        let mut compare = Compare::disk(&doc, on_disk(&big, 1), 0, 10);
+        assert_eq!(compare.note(), Some(TOO_BIG));
+        assert!(compare.bands().is_empty());
+        // Refusing to open would leave the conflict with no way out, and
+        // the choice is whole-file either way.
+        assert!(matches!(
+            compare.key(&press(KeyCode::Char('t')), 10, false),
+            Outcome::TakeDisk
+        ));
+
+        let doc = Document::from_str(&big);
+        assert_eq!(
+            Compare::disk(&doc, on_disk("small\n", 1), 0, 10).note(),
+            Some(TOO_BIG)
+        );
     }
 
     #[test]
